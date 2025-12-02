@@ -1,0 +1,25 @@
+// ---------------------------------------------------------------------------
+//     Suspicious WSL Usage (Windows Subsystem for Linux)
+//     Author: Ala Dabat
+//    - WSL used to touch sensitive Linux paths or host paths (/mnt/c).
+//    - Good for dual-use admin vs attacker behaviour; expects low volume.
+//    Tactics: TA0002 (Execution), TA0003 (Persistence), TA0007 (Discovery)
+//    NOTE: For more detailed hunt see "Advanced Threat Hunting Pack"
+// ---------------------------------------------------------------------------
+;
+let TimeFrame = 30d;
+let WSLHostSuspiciousList = dynamic(["curl", "/etc/shadow", "/etc/passwd", "cat", "/mnt/c/", "--exec", "bash"]);
+DeviceProcessEvents
+| where Timestamp >= ago(TimeFrame)
+| where InitiatingProcessFileName =~ "wsl.exe"
+| where ProcessCommandLine has_any (WSLHostSuspiciousList)
+| project
+    Timestamp,
+    DeviceId,
+    DeviceName,
+    FileName,
+    FolderPath,
+    ProcessId,
+    ProcessCommandLine,
+    AccountDomain,
+    AccountName
