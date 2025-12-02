@@ -1,0 +1,125 @@
+// ============================================================================
+// Unauthorized RMM Activity + Suspicious File Drops
+// Author: Ala Dabat
+// Version: 2025-12
+// Core Threat Hunt 
+// ============================================================================
+
+let lookback = 7d;
+
+// --------------------------------------------
+// Known RMM Tools (legit but high abuse rate)
+// --------------------------------------------
+let RmmTools = dynamic([
+    "AnyDesk.exe","TeamViewer.exe","LogMeIn.exe","RemotePC.exe",
+    "ScreenConnect.Client.exe","chrome_remote_desktop.exe",
+    "Splashtop.exe","DWRCC.exe","Bomgar.exe","GoToAssist.exe",
+    "ZohoAssist.exe","Ammyy_Admin.exe","ShowMyPC.exe","UltraVNC.exe",
+    "RealVNC.exe","Radmin.exe","TightVNC.exe","ParallelsAccess.exe",
+    "AnyplaceControl.exe","winbox.exe","KaseyaVSA.exe","psexec.exe"
+]);
+
+// --------------------------------------------
+// Risky file types attackers push during RMM abuse
+// --------------------------------------------
+let RiskExt = dynamic([".exe",".dll",".ps1",".bat",".cmd",".vbs",".hta",".jse",".js",".cpl"]);
+
+// --------------------------------------------
+// 1) Observe RMM execution
+// --------------------------------------------
+let RmmExec =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (RmmTools)
+| extend RmmProc = tolower(FileName)
+| project RmmTime = Timestamp,
+          DeviceId, DeviceName,
+          RmmProc,
+          RmmCmd = ProcessCommandLine,
+          RmmParent = InitiatingProcessFileName,
+          RmmAccount = strcat(AccountDomain, "\\", AccountName);
+
+// --------------------------------------------
+// 2) Suspicious file creation following RMM activity
+// --------------------------------------------
+let FileDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified")
+| extend FileExt = tolower(strcat(".", split(FileName, ".")[-1]))
+| where FileExt in~ (RiskExt)
+| project FileTime = Timestamp,
+          DeviceId,
+          FileName,
+          FileExt,
+          FilePath = FolderPath,
+          DropProc = InitiatingProcessFileName,
+          DropCmd  = InitiatingProcessCommandLine;
+
+// --------------------------------------------
+// 3) Join RMM activity → file drop within 10 minutes
+// --------------------------------------------
+let Correlated =
+RmmExec
+| join kind=inner (
+    FileDrops
+    | where FileTime >= ago(lookback)
+) on DeviceId
+| where FileTime between (RmmTime .. RmmTime + 10m)
+| summarize
+    FirstSeen = min(RmmTime),
+    LastSeen  = max(FileTime),
+    DeviceName = any(DeviceName),
+    RmmToolsUsed = make_set(RmmProc),
+    RmmCommands = make_set(RmmCmd),
+    DroppedFiles = make_set(FileName),
+    DroppedExt   = make_set(FileExt),
+    DropLocations = make_set(FilePath),
+    Accounts = make_set(RmmAccount),
+    Parents = make_set(RmmParent)
+  by DeviceId;
+
+// --------------------------------------------
+// 4) Org Prevalence — suppress legitimate RMM installs
+// --------------------------------------------
+let OrgRmmPrevalence =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (RmmTools)
+| summarize OrgSeen = dcount(DeviceId) by FileName;
+
+// --------------------------------------------
+// 5) Apply scoring
+// --------------------------------------------
+Correlated
+| extend Score =
+        0
+      + iif(array_length(RmmToolsUsed) >= 1, 3, 0)         // RMM usage
+      + iif(array_length(DroppedFiles) >= 1, 4, 0)         // suspicious file drop
+      + iif(array_length(Accounts) >= 2, 1, 0)             // multiple accounts
+      + iif(array_length(Parents) >= 1 and Parents !contains "explorer.exe", 2, 0)
+| join kind=leftouter OrgRmmPrevalence on $left.RmmToolsUsed[0] == $right.FileName
+| extend AdjustedScore = Score - case(
+        OrgSeen >= 10, 3,   // heavily used tool internally → reduce false positives
+        OrgSeen >= 3, 1,
+        0
+    )
+
+// --------------------------------------------
+// 6) Hunter Directives
+// --------------------------------------------
+| extend HunterDirective = case(
+        AdjustedScore >= 7,
+        "CRITICAL: RMM tool followed by file-write activity to risky locations. Possible hands-on-keyboard intrusion. Isolate host, verify operator identity, and inspect lateral movement.",
+        AdjustedScore >= 5,
+        "HIGH: RMM tool executed with suspicious parent process or unusual operator account. Validate operator and check for unauthorized remote access.",
+        AdjustedScore >= 3,
+        "MEDIUM: RMM tool present. Validate if this machine is approved for RMM operations.",
+        "LOW: RMM execution observed but consistent with org prevalence."
+    )
+| project FirstSeen, LastSeen, DeviceName,
+          RmmToolsUsed, DroppedFiles, DropLocations,
+          Accounts, Parents,
+          Score, AdjustedScore,
+          HunterDirective
+| order by AdjustedScore desc;
