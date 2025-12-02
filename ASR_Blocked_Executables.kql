@@ -1,0 +1,32 @@
+// ---------------------------------------------------------------------------
+//    Blocked / Audited Untrusted Executables (ASR)
+//    - Focus on low-prevalence binaries blocked or audited by ASR.
+//    - Very strong surface for early-stage malware / tools dropped on disk.
+//    Tactics: TA0002 (Execution), TA0005 (Defense Evasion)
+// ---------------------------------------------------------------------------
+;
+DeviceEvents
+| where Timestamp >= ago(30d)
+| where ActionType in ("AsrUntrustedExecutableAudited","AsrUntrustedExecutableBlocked")
+| summarize FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp),
+            LocalPrevalence = dcount(DeviceId),
+            Devices = make_set(DeviceName)
+        by SHA1, FileName
+| where LastSeen >= ago(1d)
+| where LocalPrevalence <= 5
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | where Timestamp >= ago(30d)
+    | summarize arg_max(Timestamp, *) by SHA1
+) on SHA1
+| invoke FileProfile(SHA1, 1000)
+| project
+    LastSeen,
+    FileName,
+    SHA1,
+    LocalPrevalence,
+    GlobalPrevalence,
+    IsTrusted,
+    Signer = Publisher,
+    Devices
