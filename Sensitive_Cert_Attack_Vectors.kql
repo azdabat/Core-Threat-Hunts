@@ -1,0 +1,33 @@
+// ---------------------------------------------------------------------------
+//     Sensitive Certificate Files Discovery (.pfx / .p12 / .pfn)
+//     Author: Ala Dabat
+//    - Flags reads/writes of cert containers often used for credential theft.
+//    Tactics: TA0006 (Credential Access), TA0030 (Exfiltration to Cloud/Email)
+// ---------------------------------------------------------------------------
+let lookback = 7d; // Define your desired lookback period
+let sensitive_extensions = dynamic([".pfx", ".p12", ".pfn"]);
+let noise_processes = dynamic(["svchost.exe", "audiodg.exe", "MsMpEng.exe", "SearchIndexer.exe", "certreq.exe"]);
+let noise_paths = dynamic(["C:\\Windows\\System32\\config\\systemprofile", "C:\\ProgramData\\Microsoft\\Crypto", "C:\\Program Files", "C:\\Windows\\Temp"]);
+
+// 1. File Access/Movement Hunt
+let FileAccessEvents = DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith_any(sensitive_extensions)
+| where ActionType in ("FileCreated", "FileWritten", "FileAccessed", "FileRenamed") // Focus on high-value actions
+| where InitiatingProcessFileName !in (noise_processes) // Exclude known system noise
+| where not(FolderPath startswith_any(noise_paths)) // Exclude known system paths
+| where AccountName !startswith "NT AUTHORITY" // Focus on User/Service Accounts, not core SYSTEM
+| extend EventType = "File Access/Movement"
+| project Timestamp, EventType, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName;
+
+// 2. Certificate Export Command Line Hunt
+let ExportProcessEvents = DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in ("certutil.exe", "powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("-exportpfx", "-privatekey") // Specific export command flags
+| extend EventType = "Certificate Export Process"
+| project Timestamp, EventType, DeviceName, FileName=InitiatingProcessFileName, FolderPath=InitiatingProcessFolderPath, ActionType="Process Execution", InitiatingProcessFileName=FileName, InitiatingProcessCommandLine=ProcessCommandLine, AccountName;
+
+// Combine and sort results
+union FileAccessEvents, ExportProcessEvents
+| order by Timestamp desc
