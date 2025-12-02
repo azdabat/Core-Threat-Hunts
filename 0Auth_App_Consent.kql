@@ -1,0 +1,61 @@
+//  Suspicious OAuth Application Consents
+// Author: Ala Dabat
+
+let KnownSafeApps = dynamic([
+    "Microsoft Office 365 Portal", "Microsoft Teams", "SharePoint Online",
+    "OneDrive", "Outlook Web App", "Microsoft Intune"
+]);
+
+AuditLogs
+| where OperationName == "Consent to application"
+| where Result == "success"
+| extend Target = TargetResources[0]
+| extend
+    AppId          = tostring(Target.id),
+    AppDisplayName = tostring(Target.displayName),
+    ModifiedProps  = Target.modifiedProperties,
+    Initiator      = tostring(InitiatedBy.user.userPrincipalName),
+    IPAddress      = tostring(InitiatedBy.user.ipAddress),
+    UserAgent      = tostring(InitiatedBy.user.userAgent)
+| mv-expand Prop = ModifiedProps
+| extend
+    PropName  = tostring(Prop.displayName),
+    PropValue = tostring(Prop.newValue)
+| summarize
+    IsAppOnly      = any(iff(PropName == "ConsentContext.IsAppOnly",       PropValue, "")),
+    OnBehalfOfAll  = any(iff(PropName == "ConsentContext.OnBehalfOfAll",   PropValue, "")),
+    PublisherInfo  = any(iff(PropName == "TargetId.ServicePrincipalNames", PropValue, "")),
+    TimeGenerated  = any(TimeGenerated),
+    UserAgent      = any(UserAgent),
+    IPAddress      = any(IPAddress),
+    Initiator      = any(Initiator)
+  by AppId, AppDisplayName
+| where AppDisplayName !in~ (KnownSafeApps)  // baseline exclusion
+| extend
+    RiskScore = case(
+        IsAppOnly == "\"True\"" and OnBehalfOfAll == "\"True\"", 10,
+        IsAppOnly == "\"True\"", 7,
+        OnBehalfOfAll == "\"True\"", 5,
+        2
+    ),
+    RiskLevel = case(
+        RiskScore >= 10, "Critical",
+        RiskScore >= 7,  "High",
+        RiskScore >= 5,  "Moderate",
+        "Low"
+    ),
+    HunterDirective = strcat(
+        "App '", AppDisplayName, "' (", AppId, ") consented by ", Initiator,
+        ". AppOnly=", IsAppOnly, ", OnBehalfOfAll=", OnBehalfOfAll,
+        ". Review publisher: ", PublisherInfo,
+        ". Validate if the app is approved. If unknown, disable consent and investigate immediately."
+    ),
+    InvestigationLink = strcat(
+        "https://portal.azure.com/#blade/Microsoft_AAD_IAM/StartboardApplicationsMenuBlade/AllApps/menuId/",
+        AppId
+    )
+| project 
+    TimeGenerated, AppDisplayName, AppId, RiskLevel, RiskScore,
+    Initiator, IPAddress, UserAgent, PublisherInfo,
+    HunterDirective, InvestigationLink
+| sort by RiskScore desc, TimeGenerated desc
