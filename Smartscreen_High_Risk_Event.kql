@@ -1,0 +1,19 @@
+// ---------------------------------------------------------------------------
+//  SmartScreen High-Risk Events (Initial Access / User Execution)
+//    - Flags executions / URLs where SmartScreen intervened.
+//    - Good early-warning surface for phishing + malware delivery.
+//    Tactics: TA0001 (Initial Access), TA0002 (Execution)
+// ---------------------------------------------------------------------------
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("SmartScreenAppWarning", "SmartScreenUrlWarning")
+| extend SmartScreenTrigger = iff(ActionType == "SmartScreenUrlWarning", RemoteUrl, FileName)
+| extend ReasonForTrigger = tostring(parse_json(AdditionalFields).Experience)
+| project
+    Timestamp,
+    DeviceName,
+    ActionType,
+    SmartScreenTrigger,
+    ReasonForTrigger,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine
