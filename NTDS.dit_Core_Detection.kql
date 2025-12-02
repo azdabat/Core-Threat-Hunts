@@ -1,91 +1,79 @@
-
 // ============================================================================
-// NTDS.dit Behavioural Hunt — Core Detection
+// CORE HUNT — NTDS / Domain Credential Dumping (Behaviour-Only)
 // Author: Ala Dabat
-// Version: 2025-12
-// Purpose: Identify NTDS.dit collection attempts using modern attacker tooling.
-// MITRE: T1003.003 (Credential Dumping: NTDS), T1059 (Execution),
-//        T1105 (Ingress Tool Transfer), T1070 (Defense Evasion)
+// Purpose: Identify behaviour consistent with NTDS.dit extraction attempts.
+// MITRE: T1003.003 (NTDS), T1105 (Staging), T1021.002 (SMB Admin Shares)
 // ============================================================================
 
 let lookback = 7d;
-
-// Known paths attackers use to stage NTDS outputs (2024–2025 tradecraft)
-let NtdsPaths = dynamic([
+let ntds_keywords = dynamic(["ntdsutil", "create full", "ac i ntds", "shadowcopy"]);
+let ntds_paths = dynamic([
     @"\ntds.dit",
-    @"\Windows\NTDS\", 
-    @"\Temp\", @"\Users\Public\", @"\AppData\", @"\Downloads\", @"\Desktop\"
+    @"\Windows\NTDS\",
+    @"\Temp\", @"\Users\Public\", @"\Downloads\", @"\Desktop\"
 ]);
 
-// Process behaviours strongly tied to NTDS copying
-let SuspiciousCommands = dynamic([
-    "create full",       // VSS full copy
-    "ntdsutil",          // Direct DB extraction
-    "ac i ntds",         // 'activate instance ntds'
-    "ifm",               // DS installation media
-    "ntds",              // generic NTDS reference
-    "vssadmin", "shadow", "shadowcopy",
-    "esentutl", "wbadmin" // copy-out utilities
-]);
-
-// Modern 2024–2025 extraction tools
-let ModernDumpTools = dynamic([
-    "secretsdump.py", "secretsdump", "impacket", "Invoke-NinjaCopy", "NinjaCopy"
-]);
-
-//
-// 1) Process activity: ntdsutil, esentutl, wbadmin, Python tools
-//
-let Proc =
+// 1) Suspicious process behaviour (ntdsutil, python dumpers, PowerShell copy ops)
+let ProcActivity =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in ("ntdsutil.exe","esentutl.exe","wbadmin.exe","powershell.exe","python.exe")
-       or ProcessCommandLine has_any (SuspiciousCommands)
-       or ProcessCommandLine has_any (ModernDumpTools)
-| extend EventType = "Process"
+| where FileName in~ ("ntdsutil.exe","esentutl.exe","python.exe","powershell.exe")
+    or ProcessCommandLine has_any (ntds_keywords)
+    or InitiatingProcessCommandLine has_any (ntds_keywords)
+| extend Parent = InitiatingProcessFileName
 | project Timestamp, DeviceName, AccountName,
-          FileName, ProcessCommandLine, EventType;
+          Process = FileName,
+          Cmd = ProcessCommandLine,
+          Parent;
 
-//
-// 2) File events: suspicious NTDS.dit access or staging
-//
-let File =
+// 2) NTDS file access / staging attempts
+let FileActivity =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
-| where FileName has "ntds.dit" or FolderPath has_any (NtdsPaths)
-| where InitiatingProcessFileName !in ("TiWorker.exe", "SearchIndexer.exe")   // noise reduction
-| extend EventType = "File"
-| project Timestamp, DeviceName, FolderPath, FileName,
-          InitiatingProcessFileName, InitiatingProcessCommandLine, EventType;
+| where FileName has_cs "ntds.dit"
+    or FolderPath has_any (ntds_paths)
+| where InitiatingProcessFileName !in~ ("TiWorker.exe") // reduce noise
+| project Timestamp, DeviceName,
+          FileName, FolderPath,
+          Proc = InitiatingProcessFileName,
+          Cmd = InitiatingProcessCommandLine;
 
-//
-// 3) Network exfil or remote extraction behaviour
-//    Includes secretsdump.py over LDAP/SMB (impacket ≥2024)
-//
-let Net =
-DeviceNetworkEvents
+// 3) PowerShell-based staging / copy attempts
+let PsStaging =
+DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where InitiatingProcessCommandLine has_any (ModernDumpTools)
-    or RemotePort in (135,139,389,445,636,3268,3269)
-| extend EventType = "Network"
-| project Timestamp, DeviceName, RemoteIP, RemotePort,
-          InitiatingProcessFileName, InitiatingProcessCommandLine, EventType;
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine has_any (dynamic(["copy", "cp", "move", "robocopy", "Get-Item", "Get-ChildItem", "Get-Content"]))
+| where ProcessCommandLine has_any (dynamic(["ntds","shadow","vss","\\Windows\\NTDS"]))
+| project Timestamp, DeviceName, AccountName,
+          Process = "powershell.exe",
+          Cmd = ProcessCommandLine,
+          Parent = InitiatingProcessFileName;
 
-//
-// Final union
-//
-union Proc, File, Net
+// 4) SMB Admin$ / C$ staging
+let AdminShares =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FolderPath startswith @"\\"
+| where FolderPath has_any (dynamic(["ADMIN$","C$"]))
+    and FileName has_any (dynamic(["ntds","dit"]))
+| project Timestamp, DeviceName, FolderPath, FileName,
+          Proc = InitiatingProcessFileName, Cmd = InitiatingProcessCommandLine;
+
+// --- Combine all signals ---
+union ProcActivity, FileActivity, PsStaging, AdminShares
 | order by Timestamp desc
-| extend HunterDirective = case(
-    EventType == "Process" and FileName =~ "ntdsutil.exe",
-        "Review process tree. ntdsutil usage must be justified by DC admin tasks. Look for shadow copy creation, esentutl, and copy operations.",
-    EventType == "Process" and ProcessCommandLine has_any (ModernDumpTools),
-        "Modern extraction tool detected (secretsdump/NinjaCopy). Check for lateral movement and LDAP/SMB flows to DCs.",
-    EventType == "File" and FileName has "ntds.dit",
-        "NTDS.dit file touched. Validate path — attackers commonly stage to Temp/Public/Downloads. Check initiating process.",
-    EventType == "Network" and InitiatingProcessCommandLine has_any (ModernDumpTools),
-        "Potential remote secretsdump/DCsync traffic. Validate RemoteIP and privilege context.",
-    EventType == "Network",
-        "LDAP/SMB traffic touching NTDS-related ports. Validate if part of normal DC sync or backup operations.",
-    "Investigate sequence of File → Process → Network for exfil patterns."
-)
+| extend HunterDirective =
+    case(
+        Process =~ "ntdsutil.exe",
+            "CRITICAL: NTDSUTIL execution detected. Confirm backup legitimacy immediately.",
+        Process =~ "python.exe" and Cmd has_any ("secretsdump","ntds"),
+            "HIGH: Python-based NTDS extraction (secretsdump-family). Check lateral paths + NTLM traffic.",
+        Process =~ "powershell.exe" and Cmd has_any ("copy","shadow","vss"),
+            "HIGH: PowerShell staging of NTDS/shadowcopy. Investigate file writes + network share usage.",
+        FileName has_cs "ntds.dit",
+            "HIGH: NTDS database file touched. Verify if backup or shadow copy operation is approved.",
+        FolderPath startswith @"\\",
+            "MEDIUM: NTDS-related file access over SMB. Validate admin share access.",
+        "Review activity for shadow copies, backup tools, or credential dumpers."
+    )
