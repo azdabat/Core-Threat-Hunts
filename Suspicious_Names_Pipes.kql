@@ -1,0 +1,52 @@
+// Suspicious C2-Style Named Pipes
+// Purpose: Identify named pipes associated with common post-exploitation frameworks.
+// Author: Ala Dabat
+
+let lookback = 7d;
+
+// High-signal C2 pipe patterns (cleaned / low-noise core set)
+let SuspiciousPipes = dynamic([
+    "msse-", "status_", "msagent_", "postex", "beacon", "pipetst",         // Cobalt Strike
+    "remcom", "remcom_",                                                   // RemCom
+    "gruntsvc", "covenant",                                                // Covenant
+    "poshc2",                                                               // PoshC2
+    "sliver", "sliverpipe",                                                // Sliver
+    "meter_", "mspipe",                                                    // Meterpreter
+    "empire", "emppipe",                                                   // Empire
+    "lsadump", "cachedump", "wceservicepipe"                               // Credential dumpers
+]);
+
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "NamedPipeEvent"
+| extend p = tostring(parse_json(AdditionalFields).PipeName),
+         op = tostring(parse_json(AdditionalFields).FileOperation)
+| where op == "File created"
+| where tolower(p) has_any (SuspiciousPipes)
+| extend Pipe = tostring(p)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    Pipe,
+    KillChain = "Post-Exploitation / C2 Channel",
+    RiskScore =
+        4
+      + iif(InitiatingProcessFileName has_any ("powershell","cmd","wscript"), 1, 0)
+      + iif(InitiatingProcessCommandLine contains "127.0.0.1", 1, 0),
+    HunterDirective = case(
+        Pipe has "beacon" or Pipe has "postex",
+            "Check for Cobalt Strike activity. Review process tree, investigate parent process, dump memory if suspicious.",
+        Pipe has "sliver",
+            "Possible Sliver C2. Validate host legitimacy and inspect for unsigned or side-loaded binaries.",
+        Pipe has "poshc2",
+            "PoshC2 pipe detected. Look for PowerShell execution, encoded payloads, AMSI bypasses.",
+        Pipe has "remcom",
+            "Remote admin tool activity—verify if authorised. Review logons from the same host.",
+        Pipe has_any ("lsadump","cachedump","wceservicepipe"),
+            "Credential dumping pipe detected. Immediately check LSASS access patterns and isolate if unexpected.",
+        "Review parent process, user context and lateral movement evidence."
+    )
+| order by Timestamp desc
