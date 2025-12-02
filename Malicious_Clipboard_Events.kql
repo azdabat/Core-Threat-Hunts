@@ -1,0 +1,21 @@
+// Clipboard readers (not just explorer)
+// Author: Ala Dabat
+let clipboardEvents = 
+    DeviceEvents
+    | where ActionType contains "GetClipboardData" or ActionType contains "SetClipboardData"
+    | where InitiatingProcessFileName !in~ ("explorer.exe", "rdpclip.exe")
+    | project DeviceName, TimeGenerated, InitiatingProcessFileName, AccountName, ActionType;
+// Suspicious process launches in same time window
+let suspiciousProcesses = 
+    DeviceProcessEvents
+    | where FileName has_any ("powershell.exe", "mshta.exe", "python.exe", "wscript.exe", "cscript.exe", "cmd.exe", "rundll32.exe", "chrome.exe", "firefox.exe", "msedge.exe", "Teams.exe", "OUTLOOK.EXE", "AutoHotkey.exe")
+    | where (ProcessCommandLine contains "http" and ProcessCommandLine !contains "localhost")
+    | project DeviceName, TimeGenerated, FileName, ProcessCommandLine, AccountName;
+// Join within a 2-minute window for strong correlation
+clipboardEvents
+| join kind=inner (
+    suspiciousProcesses
+) on DeviceName
+| where abs(datetime_diff('minute', clipboardEvents.TimeGenerated, suspiciousProcesses.TimeGenerated)) <= 2
+| project DeviceName, clipboardEvents.TimeGenerated, clipboardEvents.InitiatingProcessFileName, clipboardEvents.ActionType, suspiciousProcesses.FileName, suspiciousProcesses.ProcessCommandLine, clipboardEvents.AccountName
+| summarize by DeviceName
