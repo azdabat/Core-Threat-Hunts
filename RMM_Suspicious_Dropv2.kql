@@ -1,0 +1,85 @@
+// ============================================================================
+// CORE HUNT — Unauthorized RMM Usage + Suspicious File Drop
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose: Detect possible unauthorized remote access tools and correlated file
+//          creation/modification that may indicate staging or post-exploitation.
+// ============================================================================
+
+let lookback = 7d;
+
+// Common RMM / remote-access tools
+let RMM_Tools = dynamic([
+    "anydesk.exe", "teamviewer.exe", "logmein.exe", "remotepc.exe",
+    "screenconnect.client.exe", "chrome_remote_desktop.exe", "splashtop.exe",
+    "dwrcc.exe", "bomgar.exe", "gotoassist.exe", "zohoassist.exe",
+    "ammyy_admin.exe", "showmypc.exe", "ultravnc.exe", "realvnc.exe",
+    "radmin.exe", "tightvnc.exe", "parallelsaccess.exe", "anyplacecontrol.exe",
+    "winbox.exe", "kaseyavsa.exe"
+]);
+
+// Suspicious file types frequently dropped after remote access
+let HighRiskExt = dynamic([".dll",".exe",".ps1",".vbs",".cmd",".bat",".hta",".js",".jse",".cpl"]);
+
+let RMM_Exec =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where tolower(FileName) in~ (RMM_Tools)
+| extend Proc = tolower(FileName)
+| project RMM_Time = Timestamp, DeviceId, DeviceName, Proc,
+          RMM_CMD = ProcessCommandLine, RMM_Parent = InitiatingProcessFileName;
+
+// File drops created shortly after remote-access process starts
+let FileDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified")
+| extend Ext = tostring(tolower(strcat(".", split(FileName, ".")[-1])))
+| where Ext in~ (HighRiskExt)
+| project File_Time = Timestamp, DeviceId, DeviceName, FileName, Ext,
+          File_CMD = InitiatingProcessCommandLine,
+          File_Initiator = InitiatingProcessFileName;
+
+// Prevalence baseline to reduce noise (how common each RMM tool is)
+let Prevalence =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where tolower(FileName) in~ (RMM_Tools)
+| summarize HostCount = dcount(DeviceId) by FileName = tolower(FileName);
+
+// Join RMM use → suspicious file drops (within 10 minutes)
+RMM_Exec
+| join kind=leftouter (
+      FileDrops
+      | where File_Time between (ago(lookback) .. now())
+) on DeviceId, DeviceName
+| where File_Time between (RMM_Time .. RMM_Time + 10m)
+| join kind=leftouter Prevalence on $left.Proc == $right.FileName
+| extend OrgPrevalence = iif(isnull(HostCount), 0, HostCount)
+
+// --- Risk scoring ---
+| extend RiskScore =
+      0
+    + 3                                                   // RMM tool executed
+    + iif(OrgPrevalence <= 3, 2, 0)                       // rare tool in org
+    + iif(isnotempty(FileName), 4, 0)                     // suspicious file drop
+    + iif(Ext in (".exe",".dll",".ps1",".hta"), 2, 0)     // high-risk extension
+| extend Severity = case(
+      RiskScore >= 8, "High",
+      RiskScore >= 5, "Medium",
+      "Low"
+  )
+
+// --- Hunter Directives (inline, human written) ---
+| extend HunterDirective = case(
+      Severity == "High",
+      "HIGH: Rare RMM tool + high-risk file drop. Verify whether this host is authorised for remote access. Collect process tree, inspect file contents, check for new services or scheduled tasks.",
+      Severity == "Medium",
+      "MEDIUM: RMM tool used with moderate risk indicators. Validate whether the user or host legitimately uses remote tools. Review parent process and recent authentication.",
+      "LOW: RMM tool seen but no strong indicators. Confirm legitimate use if outside normal admin hosts."
+  )
+
+| project TimeDetected = now(), DeviceName, Proc, RMM_CMD, RMM_Parent,
+          FileName, Ext, File_CMD, File_Initiator,
+          OrgPrevalence, RiskScore, Severity, HunterDirective
+| order by RiskScore desc;
