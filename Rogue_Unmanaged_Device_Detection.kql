@@ -1,8 +1,8 @@
 // ============================================================================
-// Rogue / Unmanaged Device Detection 
+// Rogue / Unmanaged Device Detection (Core Hunt)
 // Author: Ala Dabat
 // Version: 2025-12
-// Purpose: Detect unmanaged, spoofed, or attacker-created devices plus EDR gaps.
+// Purpose: Hunt for unmanaged, spoofed, or attacker-created devices + EDR gaps.
 // MITRE: T1078 (Valid Accounts), T1087 (Account Discovery),
 //        T1557 (Adversary-in-the-Middle), T1606 (Forge Web Credentials)
 // ============================================================================
@@ -24,18 +24,19 @@ let MDEInventory =
         OnboardingState;
 
 // 2) Devices observed anywhere in telemetry (network, processes, logons, security events)
-let ObservedDevices =
+let TelemetryDevices =
     union isfuzzy=true
-        (DeviceNetworkEvents | project DeviceName, DeviceId),
-        (DeviceProcessEvents | project DeviceName, DeviceId),
-        (DeviceLogonEvents  | project DeviceName, DeviceId),
-        (SecurityEvent      | project DeviceName = Computer, DeviceId)
+        (DeviceNetworkEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceProcessEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceLogonEvents  | project Timestamp, DeviceName, DeviceId),
+        (SecurityEvent      | project Timestamp = TimeGenerated,
+                              DeviceName = Computer,
+                              DeviceId)
     | where isnotempty(DeviceName)
-    | summarize arg_max(DeviceId, *) by DeviceName
+    | summarize arg_max(Timestamp, *) by DeviceName
     | project DeviceName, TelemetryDeviceId = DeviceId;
 
-// 3) Optional: EDR-related secure configuration issues (TVM)
-//    - Devices with non-compliant EDR settings raise risk further.
+// 3) EDR-related secure configuration issues (TVM) – raises risk if present
 let EdrConfigIssues =
     DeviceTvmSecureConfigurationAssessment
     | join kind=inner (
@@ -50,7 +51,7 @@ let EdrConfigIssues =
       by DeviceName;
 
 // 4) Join everything, score, and surface highest-risk candidates
-ObservedDevices
+TelemetryDevices
 | extend NormalizedName = tostring(DeviceName)
 | extend NameOk = NormalizedName matches regex ApprovedNamingPattern
 | join kind=leftouter MDEInventory on DeviceName
@@ -62,7 +63,7 @@ ObservedDevices
         0
     )
 | extend IsUnknownToMDE = iif(isnull(MDE_DeviceId), 1, 0)
-| extend HasEdrIssues = iif(EdrIssueCount > 0, 1, 0)
+| extend HasEdrIssues   = iif(EdrIssueCount > 0, 1, 0)
 | extend RiskScore =
       0
     + iif(NameOk == false, 4, 0)
@@ -72,16 +73,16 @@ ObservedDevices
 | where RiskScore >= 4
 | extend HunterDirective = case(
     NameOk == false and IsUnknownToMDE == 1,
-        "CRITICAL: Device not in MDE inventory + non-standard name. Validate ownership, network location, and isolate if untrusted.",
+        "CRITICAL: Device is not in MDE inventory and has a non-standard hostname. Verify with asset owners and network diagrams. If unrecognised, isolate from the network.",
     IsUnknownToMDE == 1 and IsOnboarded == 0,
-        "HIGH: Device seen in telemetry but not in MDE inventory/onboarding. Confirm with asset owner; treat as potential rogue endpoint.",
+        "HIGH: Device appears in telemetry but is missing from MDE inventory/onboarding. Validate whether this is a shadow IT or attacker-controlled asset.",
     NameOk == false,
-        "HIGH: Hostname deviates from naming scheme. Check AD object, DHCP leases, and network segment.",
+        "HIGH: Hostname breaks the corporate naming standard. Check AD computer object, DHCP leases, and network segment for spoofed or unmanaged hosts.",
     HasEdrIssues == 1 and IsOnboarded == 1,
-        "HIGH: Onboarded device with EDR misconfiguration. Fix EDR settings and validate sensor coverage.",
+        "HIGH: Onboarded device with EDR misconfiguration. Fix EDR policy, confirm sensor coverage, and re-check for gaps in other security controls.",
     IsOnboarded == 0,
-        "MEDIUM: Device appears not fully onboarded to EDR. Confirm deployment status.",
-    "Investigate device legitimacy and ensure full EDR coverage."
+        "MEDIUM: Device seems partially or not onboarded to EDR. Confirm deployment status and ensure full sensor coverage.",
+    "Investigate device legitimacy and ensure it is fully inventoried and covered by EDR."
 )
 | project
     TimeDetected = now(),
