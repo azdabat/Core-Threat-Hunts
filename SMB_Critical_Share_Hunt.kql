@@ -1,0 +1,114 @@
+// ============================================================================
+// SMB Lateral Movement Hunt — Critical Shares & Remote Service Activity
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose: Hunt for PsExec/WMI/SCExec-style lateral movement via SMB shares.
+// MITRE: T1021.002 (SMB/Windows Admin Shares), T1569.002 (Service Execution),
+//        T1077 (Windows Admin Shares) [legacy]
+// ============================================================================
+
+let lookback = 3d;
+let corr_window = 15m;
+let propagation_threshold = 3;
+let LateralTools = dynamic(["psexec.exe","wmic.exe","powershell.exe","cmd.exe","sc.exe"]);
+let HighRiskShares = dynamic(["ADMIN$","C$","IPC$","PRINT$","SYSVOL","NETLOGON"]);
+let SuspiciousExt = dynamic([".exe",".dll",".sys",".ps1",".vbs",".js",".jse",".bat",".cmd",".hta"]);
+
+// 1) SMB network connections driven by typical lateral tooling
+let SmbNet =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 445
+| where InitiatingProcessFileName in (LateralTools)
+| extend SrcHost = DeviceName,
+         DstIP   = RemoteIP,
+         SmbProc = InitiatingProcessFileName,
+         SmbCmd  = InitiatingProcessCommandLine
+| project SmbTime = Timestamp, SrcHost, DstIP, SmbProc, SmbCmd, InitiatingProcessAccountName;
+
+// 2) High-risk share writes (ADMIN$, C$, SYSVOL, NETLOGON, etc.)
+let ShareWrites =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FolderPath startswith @"\\"
+| extend Host      = tostring(split(FolderPath,"\\")[2]),
+         ShareName = tostring(split(FolderPath,"\\")[3]),
+         FileExt   = tostring(tolower(strcat(".", split(FileName, ".")[-1])))
+| where ShareName in~ (HighRiskShares)
+| where FileExt in~ (SuspiciousExt)
+| project FileTime = Timestamp,
+          Host,
+          ShareName,
+          FolderPath,
+          FileName,
+          FileExt,
+          SHA256,
+          WriteProc = InitiatingProcessFileName,
+          WriteCmd  = InitiatingProcessCommandLine,
+          WriteAccount = InitiatingProcessAccountName,
+          WriteDevice  = DeviceName;
+
+// 3) Remote service creation / PsExec-style service usage
+let ServiceExec =
+union
+(
+ DeviceProcessEvents
+ | where Timestamp >= ago(lookback)
+ | where FileName in ("psexesvc.exe","services.exe","svchost.exe")
+        or ProcessCommandLine has_any ("psexec","\\\\ADMIN$","sc.exe create","sc.exe start")
+ | project SvcTime = Timestamp,
+           SvcHost = DeviceName,
+           SvcFileName = FileName,
+           SvcCmd = ProcessCommandLine,
+           SvcAccount = InitiatingProcessAccountName
+),
+(
+ SecurityEvent
+ | where TimeGenerated >= ago(lookback)
+ | where EventID == 7045
+ | extend SvcTime = TimeGenerated,
+           SvcHost = Computer,
+           SvcFileName = "ServiceCreation",
+           SvcCmd = tostring(EventData),
+           SvcAccount = SubjectUserName
+ | project SvcTime, SvcHost, SvcFileName, SvcCmd, SvcAccount
+);
+
+// 4) Correlate network -> share write -> service activity on same remote host
+let Correlated =
+SmbNet
+| join kind=inner (
+    ShareWrites
+    | join kind=leftouter ServiceExec
+        on $left.Host == $right.SvcHost
+        and $right.SvcTime between (FileTime .. FileTime + corr_window)
+) on $left.DstIP == $right.Host
+   and $right.FileTime between (SmbTime .. SmbTime + corr_window)
+| summarize
+    FirstSeen = min(SmbTime),
+    LastSeen  = max(SvcTime),
+    RemoteHost = any(Host),
+    SharesTouched = make_set(ShareName),
+    FilesDropped  = make_set(FileName),
+    ToolsUsed     = make_set(SmbProc),
+    ServiceCommands = make_set(SvcCmd),
+    AccountsUsed  = make_set(InitiatingProcessAccountName),
+    SrcHosts      = make_set(SrcHost)
+  by RemoteHost;
+
+// 5) Propagation score per source → remote host
+let Propagation =
+SmbNet
+| summarize RemoteHosts = dcount(DstIP) by SrcHost
+| where RemoteHosts >= propagation_threshold;
+
+// Final output: high-risk correlated lateral movement candidates
+Correlated
+| join kind=leftouter Propagation on $left.RemoteHost in (SrcHost)
+| extend PropagationScore = iff(isnull(RemoteHosts), 1, RemoteHosts)
+| extend RiskScore =
+      0
+    + 4 // Baseline: lateral tools + admin share writes
+    + iif(array_length(SharesTouched) >= 2, 2, 0)
+    + iif(PropagationScore >= propagation_threshold, 3, 0)
+| order by RiskScore desc, LastSeen desc
