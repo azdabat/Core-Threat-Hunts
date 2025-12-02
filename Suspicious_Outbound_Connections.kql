@@ -1,0 +1,93 @@
+// ======================================================================
+// Suspicious Outbound Connection Hunt — Behavioural Scoring
+// Author: Ala Dabat | Version: 2025-12
+// Purpose: behaviour-based outbound C2/Exfil hunt with scoring,
+//          OrgPrevalence weighting, binary trust scoring, parent-chain
+//          scoring, VT enrichment and built-in hunter directives.
+// ======================================================================
+
+let lookback = 7d;
+
+// --- Allowlisted Cloud/CDN Providers ---
+let KnownCDN =
+dynamic([
+  "cloudflare", "akamai", "fastly", "amazonaws",
+  "azureedge", "googleusercontent", "vercel", "netlify"
+]);
+
+// --- Core Data ---
+let net = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemoteIPType == "Public"
+| project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessParentFileName, InitiatingProcessAccountName,
+          InitiatingProcessIntegrityLevel, Protocol;
+
+// --- Org Prevalence Calculation (how common is this IP internally?) ---
+let OrgPrevalence =
+net
+| summarize OrgSeen=dcount(DeviceId) by RemoteIP;
+
+// --- Parent Process Scoring ---
+let ParentScore =
+net
+| extend ParentScore =
+  case(
+    InitiatingProcessParentFileName =~ "powershell.exe", 3,
+    InitiatingProcessParentFileName =~ "cmd.exe",         2,
+    InitiatingProcessParentFileName =~ "wscript.exe" or InitiatingProcessParentFileName =~ "cscript.exe", 4,
+    InitiatingProcessParentFileName =~ "rundll32.exe",    4,
+    InitiatingProcessParentFileName =~ "mshta.exe",       5,
+    1
+  )
+| project RemoteIP, ParentScore;
+
+// --- Unsigned / Unknown Publisher Scoring ---
+let SignatureScore =
+DeviceFileCertificateInfo
+| where Timestamp >= ago(lookback)
+| summarize arg_max(Timestamp, *) by SHA256
+| project SHA256, Publisher = Signer, IsTrusted
+| extend SigScore = case(IsTrusted == 0, 5, 1);
+
+// --- Join Scoring Layers ---
+let SuspiciousConnections =
+net
+| lookup OrgPrevalence on RemoteIP
+| lookup ParentScore on RemoteIP
+| lookup SignatureScore on SHA256
+| extend OrgSeen = coalesce(OrgSeen, 0)
+| extend IsCDN =
+  iif(RemoteUrl has_any (KnownCDN), 1, 0)
+| extend VT = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+| extend RiskScore =
+      0
+    + iif(OrgSeen <= 1, 4, 0)                   // Rare internal destination
+    + iif(ParentScore >= 3, 3, 0)               // Suspicious parent
+    + iif(SigScore >= 4, 4, 0)                  // Unsigned binary
+    + iif(InitiatingProcessIntegrityLevel == "High", 2, 0)
+    + iif(RemotePort in (8080, 8443, 53, 443, 4444, 5985, 8081) == false, 2, 0)
+    + iif(IsCDN == 1, -4, 0)                    // Cloud/CDN likely benign
+| extend Severity =
+    case(
+      RiskScore >= 10, "High",
+      RiskScore >= 6,  "Medium",
+      RiskScore >= 3,  "Low",
+      "Informational"
+    )
+| extend HunterDirective =
+    case(
+      Severity == "High",
+      "CRITICAL: Rare outbound connection from high-risk parent process. Validate process tree, isolate host if unauthorized.",
+      Severity == "Medium",
+      "Investigate: Review process lineage, binary signature, and user context. Check if this connection is expected.",
+      Severity == "Low",
+      "Review: Rare destination but low-risk parent/context. Validate business justification.",
+      "Informational: Normal activity."
+    )
+| project-reorder Timestamp, DeviceName, RemoteIP, RemotePort, Severity,
+                  RiskScore, OrgSeen, InitiatingProcessFileName,
+                  InitiatingProcessParentFileName, InitiatingProcessAccountName,
+                  VT, HunterDirective;
+SuspiciousConnections
