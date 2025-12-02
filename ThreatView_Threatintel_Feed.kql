@@ -1,13 +1,75 @@
-// IP Threat Feed
-let ThreatIntelFeed = externaldata(DestIP: string)[@"https://threatview.io/Downloads/IP-High-Confidence-Feed.txt"] with (format="txt", ignoreFirstRecord=True);
-let IPRegex = '[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}';
-let MaliciousIP = materialize (
-       ThreatIntelFeed
-       | where DestIP matches regex IPRegex
-       | distinct DestIP
-        );
+// ============================================================================
+// High-Confidence Malicious IP Hunt (ThreatView Feed Enriched)
+// Author: Ala Dabat
+// Purpose: Identify outbound connections to high-confidence malicious IPs
+// Source: https://threatview.io/Downloads/IP-High-Confidence-Feed.txt
+// ============================================================================
+
+let lookback = 7d;
+let ThreatViewFeed = externaldata(DestIP: string)
+[@"https://threatview.io/Downloads/IP-High-Confidence-Feed.txt"]
+with (format="txt", ignoreFirstRecord=true);
+
+let IPv4_Regex = @"^[0-9]{1,3}(\.[0-9]{1,3}){3}$";
+
+// --- Clean & normalise feed ---
+let MaliciousIPs =
+ThreatViewFeed
+| where DestIP matches regex IPv4_Regex
+| extend IP = tostring(DestIP)
+| distinct IP;
+
+// --- Device prevalence for noise suppression ---
+let OrgPrevalence =
 DeviceNetworkEvents
-| where RemoteIP in (MaliciousIP)
-| extend GeoIPInfo = geo_info_from_ip_address(RemoteIP)
-| extend country = tostring(parse_json(GeoIPInfo).country), state = tostring(parse_json(GeoIPInfo).state), city = tostring(parse_json(GeoIPInfo).city), latitude = tostring(parse_json(GeoIPInfo).latitude), longitude = tostring(parse_json(GeoIPInfo).longitude)
-| project-reorder Timestamp, DeviceName, RemoteIP, RemotePort, InitiatingProcessAccountName
+| where Timestamp >= ago(lookback)
+| summarize SeenOnDevices = dcount(DeviceId) by RemoteIP;
+
+// --- Hunt for matches ---
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemoteIP in (MaliciousIPs)
+| extend VT_IP_Report = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+| extend Geo = geo_info_from_ip_address(RemoteIP)
+| extend Country = tostring(parse_json(Geo).country),
+         City     = tostring(parse_json(Geo).city),
+         ASN      = tostring(parse_json(Geo).asn),
+         Org      = tostring(parse_json(Geo).org)
+| join kind=leftouter OrgPrevalence on $left.RemoteIP == $right.RemoteIP
+| extend SeenOnDevices = coalesce(SeenOnDevices, 0)
+| extend OrgPrevalenceScore = case(
+        SeenOnDevices <= 1, 4,          // rare → high risk
+        SeenOnDevices <= 3, 2,          // uncommon → medium risk
+        1                               // common → likely noise
+)
+| extend RiskScore =
+      4                                 // threat feed = high confidence
+    + OrgPrevalenceScore                // prevalence-based scoring
+| extend KillChain = "Command and Control"
+| extend HunterDirective = case(
+        RiskScore >= 7,
+        "CRITICAL: High-confidence malicious IP contacted. Host may be beaconing. Validate process tree, isolate if behaviour persists.",
+        
+        RiskScore between (5 .. 6),
+        "HIGH: Outbound connection to malicious IP. Check process lineage, command-line, and correlate with user activity.",
+        
+        "MEDIUM: IP appears in feed but seen on multiple hosts. Validate legitimacy; may be shared infrastructure or noise."
+    )
+| project
+    Timestamp,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    RemoteIP,
+    RemotePort,
+    Country,
+    City,
+    ASN,
+    Org,
+    VT_IP_Report,
+    SeenOnDevices,
+    OrgPrevalenceScore,
+    RiskScore,
+    KillChain,
+    HunterDirective
+| order by RiskScore desc, Timestamp desc;
