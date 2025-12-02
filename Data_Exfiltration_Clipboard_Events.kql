@@ -1,0 +1,37 @@
+// Clipboard readers 
+// clipboard data exfiltration
+// Author: Ala Dabat
+// Search for direct network connection attempts correlated with clipboard access.
+
+let lookback = 5m; // A tighter window for high confidence
+let clipboardEvents = 
+    DeviceEvents
+    | where ActionType contains "GetClipboardData" or ActionType contains "SetClipboardData"
+    | where InitiatingProcessFileName !in~ ("explorer.exe", "rdpclip.exe", "Teams.exe", "OUTLOOK.EXE") // Added Teams/Outlook for more exclusion if they're noisy
+    | project DeviceName, TimeGenerated, InitiatingProcessFileName, AccountName, ActionType, InitiatingProcessId;
+
+// Network events that are NOT internal/local
+let suspiciousNetwork = 
+    DeviceNetworkEvents
+    | where RemoteIP !startswith "192.168"
+    | where RemoteIP !startswith "172.16"
+    | where RemoteIP !startswith "10."
+    | where RemoteIP != "127.0.0.1"
+    | project DeviceName, NetworkTime=TimeGenerated, InitiatingProcessFileName, InitiatingProcessId, RemoteUrl, RemoteIP, ActionType;
+
+// Join on Device and Process ID for perfect correlation
+clipboardEvents
+| join kind=inner (
+    suspiciousNetwork
+) on DeviceName, $left.InitiatingProcessId == $right.InitiatingProcessId
+| where abs(datetime_diff('minute', clipboardEvents.TimeGenerated, NetworkTime)) <= lookback
+| project 
+    DeviceName, 
+    ClipboardTime=TimeGenerated, 
+    NetworkTime, 
+    InitiatingProcessFileName, 
+    ActionType, 
+    RemoteUrl, 
+    RemoteIP, 
+    AccountName
+| order by ClipboardTime desc
