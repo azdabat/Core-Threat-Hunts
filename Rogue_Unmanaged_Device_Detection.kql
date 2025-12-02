@@ -1,0 +1,99 @@
+// ============================================================================
+// Rogue / Unmanaged Device Detection 
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose: Detect unmanaged, spoofed, or attacker-created devices plus EDR gaps.
+// MITRE: T1078 (Valid Accounts), T1087 (Account Discovery),
+//        T1557 (Adversary-in-the-Middle), T1606 (Forge Web Credentials)
+// ============================================================================
+
+let lookback = 30d;
+
+// Adjust to match your org naming conventions
+let ApprovedNamingPattern = @"^ACME-(DC|SVC|SQL|WIN|LAP|ADMIN)-\d{2}$";
+
+// 1) Baseline device list from MDE (inventory + onboarding state)
+let MDEInventory =
+    DeviceInfo
+    | where Timestamp >= ago(lookback)
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project
+        MDE_DeviceId = DeviceId,
+        DeviceName,
+        OSPlatform,
+        OnboardingState;
+
+// 2) Devices observed anywhere in telemetry (network, processes, logons, security events)
+let ObservedDevices =
+    union isfuzzy=true
+        (DeviceNetworkEvents | project DeviceName, DeviceId),
+        (DeviceProcessEvents | project DeviceName, DeviceId),
+        (DeviceLogonEvents  | project DeviceName, DeviceId),
+        (SecurityEvent      | project DeviceName = Computer, DeviceId)
+    | where isnotempty(DeviceName)
+    | summarize arg_max(DeviceId, *) by DeviceName
+    | project DeviceName, TelemetryDeviceId = DeviceId;
+
+// 3) Optional: EDR-related secure configuration issues (TVM)
+//    - Devices with non-compliant EDR settings raise risk further.
+let EdrConfigIssues =
+    DeviceTvmSecureConfigurationAssessment
+    | join kind=inner (
+        DeviceTvmSecureConfigurationAssessmentKB
+        on ConfigurationId
+      )
+    | where IsCompliant == 0 and IsApplicable == 1
+    | where ConfigurationSubcategory == "EDR"
+    | summarize
+        EdrIssueCount = count(),
+        EdrIssues = make_set(ConfigurationName)
+      by DeviceName;
+
+// 4) Join everything, score, and surface highest-risk candidates
+ObservedDevices
+| extend NormalizedName = tostring(DeviceName)
+| extend NameOk = NormalizedName matches regex ApprovedNamingPattern
+| join kind=leftouter MDEInventory on DeviceName
+| join kind=leftouter EdrConfigIssues on DeviceName
+| extend IsOnboarded =
+    case(
+        OnboardingState == "Onboarded", 1,
+        isnull(OnboardingState), 0,
+        0
+    )
+| extend IsUnknownToMDE = iif(isnull(MDE_DeviceId), 1, 0)
+| extend HasEdrIssues = iif(EdrIssueCount > 0, 1, 0)
+| extend RiskScore =
+      0
+    + iif(NameOk == false, 4, 0)
+    + iif(IsUnknownToMDE == 1, 5, 0)
+    + iif(IsOnboarded == 0, 3, 0)
+    + iif(HasEdrIssues == 1, 2, 0)
+| where RiskScore >= 4
+| extend HunterDirective = case(
+    NameOk == false and IsUnknownToMDE == 1,
+        "CRITICAL: Device not in MDE inventory + non-standard name. Validate ownership, network location, and isolate if untrusted.",
+    IsUnknownToMDE == 1 and IsOnboarded == 0,
+        "HIGH: Device seen in telemetry but not in MDE inventory/onboarding. Confirm with asset owner; treat as potential rogue endpoint.",
+    NameOk == false,
+        "HIGH: Hostname deviates from naming scheme. Check AD object, DHCP leases, and network segment.",
+    HasEdrIssues == 1 and IsOnboarded == 1,
+        "HIGH: Onboarded device with EDR misconfiguration. Fix EDR settings and validate sensor coverage.",
+    IsOnboarded == 0,
+        "MEDIUM: Device appears not fully onboarded to EDR. Confirm deployment status.",
+    "Investigate device legitimacy and ensure full EDR coverage."
+)
+| project
+    TimeDetected = now(),
+    DeviceName,
+    TelemetryDeviceId,
+    MDE_DeviceId,
+    OSPlatform,
+    OnboardingState,
+    NameOk,
+    IsUnknownToMDE,
+    HasEdrIssues,
+    EdrIssueCount,
+    RiskScore,
+    HunterDirective
+| order by RiskScore desc, DeviceName
