@@ -1,0 +1,90 @@
+// ============================================================================
+// RDP / Remote Access → Suspicious File Drop Correlation Hunt
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose: Detect suspicious file drops shortly after remote-access activity.
+// MITRE: T1133 (External Remote Services), T1021.001 (RDP), T1105 (Ingress Tool Transfer)
+// ============================================================================
+
+let lookback = 3d;
+let corr_window = 5m;
+let RareExt = dynamic([".exe",".dll",".sys",".ps1",".hta",".cmd",".bat",".vbs",".jse",".js",".cpl"]);
+let RemoteTools = dynamic(["mstsc.exe","rdpclip.exe","tscon.exe","shadow.exe",
+                           "anydesk.exe","teamviewer.exe","vncviewer.exe",
+                           "psexec.exe","qprocess.exe","query.exe"]);
+
+//
+// 1) Remote-access processes making external connections
+//
+let RemoteAccessNet =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName in~ (RemoteTools)
+| where RemoteIPType == "Public"
+| extend Proc = tolower(InitiatingProcessFileName)
+| project NetTime = Timestamp, DeviceId, DeviceName, Proc, RemoteIP, RemotePort,
+         NetAccount = InitiatingProcessAccountName;
+
+//
+// 2) File drops by same remote-access tools
+//
+let FileDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified")
+| extend Ext = tolower(strcat(".", split(FileName, ".")[-1]))
+| where Ext in~ (RareExt)
+| extend Proc = tolower(InitiatingProcessFileName)
+| project FileTime = Timestamp, DeviceId, DeviceName, FileName, Ext, FolderPath,
+         Proc, FileAccount = InitiatingProcessAccountName;
+
+//
+// 3) Session context (interactive logons / privileged users)
+//
+let Logons =
+DeviceLogonEvents
+| where Timestamp >= ago(lookback)
+| where LogonType in ("2","10")   // interactive / remote interactive
+| project DeviceId, LogonTime = Timestamp,
+         AccountName, LogonType;
+
+//
+// 4) Correlation: network → logon → file drop
+//
+RemoteAccessNet
+| join kind=inner (Logons) on DeviceId
+    // correlation window for remote access → interactive session
+    | where LogonTime between (NetTime .. NetTime + corr_window)
+| join kind=inner (FileDrops) on DeviceId
+    // correlation window for session → file-drop staging
+    | where FileTime between (LogonTime .. LogonTime + corr_window)
+| summarize
+      FirstEvent = min(NetTime),
+      LastEvent  = max(FileTime),
+      ToolUsed   = any(Proc),
+      FilesDropped = make_set(FileName),
+      DropPaths     = make_set(FolderPath),
+      Accounts      = make_set(NetAccount),
+      RemoteIPs     = make_set(RemoteIP),
+      Host = any(DeviceName)
+  by DeviceId
+// suppress high-prevalence noisy hosts
+| join kind=leftouter (
+        DeviceFileEvents
+        | summarize HostPrevalence = dcount(FileName) by DeviceId
+) on DeviceId
+| where HostPrevalence < 200   // baseline suppression threshold
+| extend RiskScore =
+        0
+        + 4   // remote-access + file drop
+        + iif(array_length(FilesDropped) > 1, 1, 0)
+        + iif(array_length(DropPaths) > 1, 1, 0)
+| extend HunterDirective =
+    case(
+        RiskScore >= 6,
+        "HIGH: Remote-access followed by rare file drops. Check for ingress tool transfer, ransomware staging, or operator activity.",
+        RiskScore >= 5,
+        "MEDIUM: Remote-access activity with file writes. Review session lineage and intended user behaviour.",
+        "LOW: Remote-access file activity. Validate legitimacy."
+    )
+| order by RiskScore desc, LastEvent desc;
