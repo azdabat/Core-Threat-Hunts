@@ -333,5 +333,5 @@ Legitimate software rarely triggers *multiple* suspicious surfaces at the same t
 
 ---
 
-# End of Section 6–9 Consolidation
+# End of Section
 
