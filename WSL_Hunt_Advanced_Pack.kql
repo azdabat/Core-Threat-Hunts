@@ -1,0 +1,73 @@
+// WSL Privilege Escalation & Persistence Hunt
+// Author: Ala Dabat
+// Detects WSL-based privilege escalation, persistence, and host escape techniques.
+// Focus: suspicious WSL command lines, dangerous mounts, root-level actions, and critical file changes.
+
+let lookback = 7d;
+let WslBins = dynamic(["wsl.exe","wslhost.exe","bash.exe","ubuntu.exe","kali.exe","debian.exe"]);
+let HighRiskParents = dynamic(["mshta.exe","wscript.exe","cscript.exe","regsvr32.exe","rundll32.exe","installutil.exe"]);
+let DangerousFlags = dynamic(["--debug-shell","--system","-u root","--user root","/etc/shadow","/etc/sudoers","/root/.ssh/id_rsa","/var/run/docker.sock"]);
+let NetExecRx = @"\s(-e|--exec)\s+(""|')?(nc\s|curl\s+http|wget\s+http|python\s+-c\s+""import|perl\s+-e\s+""system)";
+let MountRx = @"(--mount|--unmount).*(/mnt/c/Windows|/mnt/c/ProgramData|/mnt/c/Users)";
+
+// Suspicious WSL executions
+let SuspiciousExec =
+DeviceProcessEvents
+| where FileName in~ (WslBins)
+| extend c = tolower(ProcessCommandLine), p = tolower(InitiatingProcessFileName)
+| where (
+        (c has_any (DangerousFlags) and p in~ (HighRiskParents)) or
+        (c matches regex NetExecRx and p in~ (HighRiskParents)) or
+        (c matches regex MountRx)
+    )
+| extend Score =
+        iif(c has_any (DangerousFlags), 40, 0) +
+        iif(c matches regex MountRx, 30, 0) +
+        iif(c matches regex NetExecRx, 25, 0) +
+        iif(p in~ (HighRiskParents), 20, 0)
+| extend Severity =
+        case(Score >= 80, "High",
+             Score >= 50, "Medium",
+             "Low"),
+         KillChain =
+        case(c has_any (DangerousFlags), "Privilege Escalation",
+             c matches regex MountRx, "Container Escape",
+             c matches regex NetExecRx, "Execution",
+             "Suspicious Activity")
+| project Timestamp, DeviceName, Detection="WSL_PrivEsc_Persistence",
+          ParentProcess=p, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine=c,
+          Score, Severity, KillChain,
+          InitiatingProcessAccountName, FolderPath, SHA256;
+
+// Critical file permission changes
+let CriticalPaths = dynamic(["/etc/shadow","/etc/sudoers","/etc/gshadow","/root/.ssh/authorized_keys","/var/run/docker.sock"]);
+let PermRx = @"\b(666|777)\b";
+
+let FilePerms =
+DeviceFileEvents
+| where ActionType in ("FileCreated","FileModified","PermissionsModified")
+| where tolower(FolderPath) has_any (CriticalPaths)
+| extend af = tostring(AdditionalFields)
+| where af matches regex PermRx
+| extend Score =
+        iif(FolderPath contains "/etc/shadow", 50, 0) +
+        iif(FolderPath contains "/root/.ssh", 40, 0) +
+        iif(FolderPath contains "/var/run/docker.sock", 35, 0) +
+        20
+| extend Severity =
+        case(Score >= 80, "High",
+             Score >= 50, "Medium",
+             "Low"),
+         KillChain =
+        case(FolderPath contains "/etc/shadow", "Credential Access",
+             FolderPath contains "/root/.ssh", "Persistence",
+             "Privilege Escalation")
+| project Timestamp, DeviceName, Detection="WSL_PrivEsc_Persistence",
+          FileName, FolderPath, ActionType,
+          Score, Severity, KillChain,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName, AdditionalFields, SHA256;
+
+union SuspiciousExec, FilePerms
+| order by Timestamp desc
