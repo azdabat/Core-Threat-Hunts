@@ -89,7 +89,7 @@ Both follow the same **structured methodology**, shown below.
 
 ---
 
-# 4. MITRE ATT&CK Master Coverage Table
+# 4. MITRE ATT&CK Master Coverage Table (Examples)
 
 | Tactic | Technique | What We Hunt |
 |--------|-----------|--------------|
