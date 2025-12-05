@@ -1,0 +1,108 @@
+// ============================================================================
+//  Core and more Primitive: Image-Based Stego Loader Chain
+//  Author: Ala Dabat
+//  Version: 2025-12 (Strict Core) L1/L2 (Good for Threat Hunting)
+//  Purpose:
+//    Minimal behavioural correlation for stego-style loaders where a user-facing
+//    app spawns a script/LOLBin which reads image files from Downloads/Temp and
+//    then makes outbound network connections shortly afterwards.
+//
+//  MITRE:
+//    TA0001 Initial Access      : T1566.001 (Spearphishing Attachment)
+//    TA0002 Execution           : T1059 (Command & Scripting Interpreter)
+//    TA0005 Defense Evasion     : T1027.003 (Steganography / Obfuscated Content)
+//    TA0011 Command & Control   : T1071.001 (HTTPS C2)
+// ============================================================================
+
+let lookback = 7d;
+let TimeWindowMinutes = 5;
+
+// User-facing parents (where the lure is likely opened)
+let UserFacingParents = dynamic([
+    "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+    "chrome.exe","msedge.exe","iexplore.exe","firefox.exe"
+]);
+
+// Script / LOLBin-style loaders typically abused here
+let ScriptHosts = dynamic([
+    "powershell.exe","pwsh.exe",
+    "wscript.exe","cscript.exe",
+    "mshta.exe","rundll32.exe"
+]);
+
+// Image extensions commonly abused for stego payloads
+let ImageExt = dynamic([".png",".jpg",".jpeg",".bmp",".gif"]);
+
+// 1) Script / LOLBin spawned from user-facing app
+let ScriptFromUserApps =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ScriptHosts)
+| where InitiatingProcessFileName in~ (UserFacingParents)
+| project
+    ScriptTime   = Timestamp,
+    DeviceId,
+    DeviceName,
+    AccountName,
+    ScriptFile   = FileName,
+    ScriptCommand = ProcessCommandLine,
+    ParentImage  = InitiatingProcessFileName,
+    ProcessId;
+
+// 2) Same process reading image files from Downloads / Temp / browser caches
+let ImageReadsByScript =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileRead","FileCreated","FileModified")
+| extend FileExt = tolower(strcat(".", split(FileName, ".")[-1]))
+| where FileExt in~ (ImageExt)
+| where FolderPath has_any ("\\Downloads\\","\\Download\\","\\Temp\\","\\AppData\\Local\\Temp\\")
+| project
+    ImageReadTime      = Timestamp,
+    DeviceId,
+    InitiatingProcessId,
+    ImageFile          = FileName,
+    ImageFolder        = FolderPath;
+
+// 3) Same script process then making outbound network calls shortly afterwards
+let NetFromScript =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort in (80,443)
+| project
+    NetTime            = Timestamp,
+    DeviceId,
+    InitiatingProcessId,
+    RemoteIP,
+    RemoteUrl,
+    RemotePort;
+
+// 4) Correlate: ScriptFromUserApps → ImageReads → Network connections (within time window)
+ScriptFromUserApps
+| join kind=inner (
+    ImageReadsByScript
+) on DeviceId, $left.ProcessId == $right.InitiatingProcessId
+| where ImageReadTime between (ScriptTime - 2m .. ScriptTime + TimeWindowMinutes * 1m)
+| join kind=inner (
+    NetFromScript
+) on DeviceId, $left.ProcessId == $right.InitiatingProcessId
+| where NetTime between (ImageReadTime .. ImageReadTime + TimeWindowMinutes * 1m)
+
+// 5) Aggregate per device+process chain
+| summarize
+    FirstScriptTime   = min(ScriptTime),
+    LastActivityTime  = max(NetTime),
+    ParentImage       = any(ParentImage),
+    ScriptFile        = any(ScriptFile),
+    ScriptCommand     = any(ScriptCommand),
+    DeviceName        = any(DeviceName),
+    AccountName       = any(AccountName),
+    ImageFiles        = make_set(ImageFile, 10),
+    ImageFolders      = make_set(ImageFolder, 10),
+    RemoteIPs         = make_set(RemoteIP, 10),
+    RemoteUrls        = make_set(RemoteUrl, 10),
+    RemotePorts       = make_set(RemotePort, 10),
+    ImageReadEvents   = count()
+  by DeviceId, ProcessId
+
+| order by LastActivityTime desc
