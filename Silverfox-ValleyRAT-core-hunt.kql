@@ -2,6 +2,7 @@
 // SilverFox_ValleyRat_Sideload_BYOVD_Core
 // Author: Ala Dabat
 // Version: 2025-12
+// WORK IN PROGRESS
 // Purpose:
 //   Behavioural correlation hunt for SilverFox/ValleyRat-style chains where a
 //   signed / legitimate loader performs DLL sideloading, drops a vulnerable
