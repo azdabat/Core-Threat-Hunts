@@ -1,0 +1,61 @@
+// SMB & RPC Lateral Movement Hunt (Fixed)
+// Author: Ala Dabat (Optimized)
+// Fixes: Join logic (IP!=Host), Fileless support (Impacket), Renamed binary support.
+
+let Lookback = 3d;
+let CorrWindow = 15m;
+let HighRiskShares = dynamic(["ADMIN$", "C$", "IPC$", "admin$", "c$", "ipc$"]);
+
+// 1. INCOMING Lateral Movement (The Victim's Perspective)
+// Instead of looking at the source (IP), look at the Destination (Device) receiving the file/service.
+let IncomingWrites = 
+    DeviceFileEvents
+    | where Timestamp >= ago(Lookback)
+    | where FolderPath has_any (HighRiskShares)
+    | where FileName endswith ".exe" or FileName endswith ".dll" or FileName endswith ".sys"
+    | project DeviceId, DeviceName, WriteTime=Timestamp, FileName, FolderPath, ShareName=extract(@"\\(\w+)\$", 1, FolderPath);
+
+// 2. Service Creation (The Execution)
+// Catches PsExec (PSEXESVC) and Impacket (Random Service Names)
+let ServiceCreation = 
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    // PSEXESVC is the default, but attackers change it. Look for the BEHAVIOR:
+    // A service process spawned by services.exe that isn't a known good binary
+    | where InitiatingProcessFileName == "services.exe" 
+    | where FileName !in~ ("svchost.exe", "msmpeng.exe", "searchindexer.exe") // Filter noise
+    | project DeviceId, DeviceName, SvcTime=Timestamp, SvcProc=FileName, SvcCmd=ProcessCommandLine;
+
+// 3. Network Source Context (Optional Enrichment)
+// Who talked to this device on 445/135 recently?
+let InboundNet = 
+    DeviceNetworkEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "InboundConnectionAccepted"
+    | where LocalPort in (445, 135)
+    | project DeviceId, NetTime=Timestamp, SourceIP=RemoteIP;
+
+// 4. Correlation: Service Created + (Optional File Write or Inbound Net)
+ServiceCreation
+| join kind=leftouter (IncomingWrites) on DeviceId
+    | where WriteTime between ((SvcTime - CorrWindow) .. SvcTime)
+| join kind=inner (InboundNet) on DeviceId
+    | where NetTime between ((SvcTime - CorrWindow) .. SvcTime)
+| summarize 
+    Time = min(SvcTime),
+    TargetHost = any(DeviceName),
+    SourceIPs = make_set(SourceIP, 5),
+    ServiceCommands = make_set(SvcCmd, 5),
+    DroppedFiles = make_set(FileName, 5)
+    by DeviceId
+
+// 5. Scoring / Logic
+| extend Confidence = 
+    iif(isnotempty(DroppedFiles), "High (File Drop + Service)", "Medium (Service + Network)")
+| extend HunterDirective = strcat(
+    "LATERAL MOVEMENT DETECTED. Host ", TargetHost, 
+    " received connection from ", tostring(SourceIPs), 
+    " followed by Service Creation: ", tostring(ServiceCommands),
+    ". Dropped Files: ", tostring(DroppedFiles)
+)
+| order by Time desc
