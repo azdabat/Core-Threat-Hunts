@@ -1,32 +1,61 @@
 // ---------------------------------------------------------------------------
-//    Blocked / Audited Untrusted Executables (ASR)
-//    - Focus on low-prevalence binaries blocked or audited by ASR.
-//    - Very strong surface for early-stage malware / tools dropped on disk.
-//    Tactics: TA0002 (Execution), TA0005 (Defense Evasion)
+// ASR HUNT: Blocked / Audited Untrusted Executables (Enhanced)
+// Author: Ala Dabat
+// Focus: Low-prevalence binaries stopped by ASR Rule "Block executable files..."
 // ---------------------------------------------------------------------------
-;
+
+let Lookback = 30d;
+
 DeviceEvents
-| where Timestamp >= ago(30d)
-| where ActionType in ("AsrUntrustedExecutableAudited","AsrUntrustedExecutableBlocked")
-| summarize FirstSeen = min(Timestamp),
-            LastSeen  = max(Timestamp),
-            LocalPrevalence = dcount(DeviceId),
-            Devices = make_set(DeviceName)
-        by SHA1, FileName
-| where LastSeen >= ago(1d)
-| where LocalPrevalence <= 5
+// ---------------------------------------------------------------------------
+// SECTION 1: EVENT SCOPE
+// ---------------------------------------------------------------------------
+| where Timestamp >= ago(Lookback)
+| where ActionType in ("AsrUntrustedExecutableAudited", "AsrUntrustedExecutableBlocked")
+
+// ---------------------------------------------------------------------------
+// SECTION 2: NOISE REDUCTION & AGGREGATION
+// ---------------------------------------------------------------------------
+| summarize 
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp),
+    LocalPrevalence = dcount(DeviceId), // How many machines in YOUR org have this?
+    DeviceList      = make_set(DeviceName, 5), // Sample of affected devices
+    ActionTypes     = make_set(ActionType), // Was it Blocked, Audited, or both?
+    LaunchParents   = make_set(InitiatingProcessFileName, 5) // Who launched it?
+    by SHA1, FileName, FolderPath
+
+// ---------------------------------------------------------------------------
+// SECTION 3: RARITY FILTER (The "Hunting" Logic)
+// ---------------------------------------------------------------------------
+| where LocalPrevalence <= 5  // Only show things rare in our environment
+| where LastSeen >= ago(24h)  // Focus on recent activity
+
+// ---------------------------------------------------------------------------
+// SECTION 4: ENRICHMENT (Global Context)
+// ---------------------------------------------------------------------------
+| invoke FileProfile(SHA1, 1000) 
 | join kind=leftouter (
     DeviceFileCertificateInfo
-    | where Timestamp >= ago(30d)
-    | summarize arg_max(Timestamp, *) by SHA1
+    | where Timestamp >= ago(Lookback)
+    | summarize arg_max(Timestamp, SignerName=Signer, IssuerName=Issuer) by SHA1
 ) on SHA1
-| invoke FileProfile(SHA1, 1000)
-| project
+
+// ---------------------------------------------------------------------------
+// SECTION 5: HUNTER'S VIEW (Output)
+// ---------------------------------------------------------------------------
+| project 
     LastSeen,
+    ActionTypes,
     FileName,
-    SHA1,
+    FolderPath,
+    LaunchParents,      // Critical context: Did 'explorer.exe' launch it or 'powershell.exe'?
     LocalPrevalence,
-    GlobalPrevalence,
-    IsTrusted,
-    Signer = Publisher,
-    Devices
+    GlobalPrevalence,   // From FileProfile: Is it rare globally?
+    SignerName,         // From CertInfo: Who signed it?
+    IssuerName,
+    ThreatName,         // From FileProfile: Does Microsoft already know it's bad?
+    SoftwareName,
+    SHA1,
+    DeviceList
+| order by LastSeen desc
