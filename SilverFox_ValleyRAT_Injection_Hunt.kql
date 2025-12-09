@@ -1,0 +1,30 @@
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// SilverFox / ValleyRAT – INJECTION HUNT 
+// Author Ala Dabat
+// Purpose/Correction: Detect user-path-loader injecting into critical system processes (svchost/msbuild).
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 48h;
+let WritablePaths = dynamic(["\\Users\\","\\AppData\\","\\Temp\\","\\Downloads\\"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("svchost.exe","msbuild.exe","RegAsm.exe")
+| where not(InitiatingProcessFolderPath has "\\Windows\\")       // parent from non-standard path
+| where InitiatingProcessFolderPath has_any (WritablePaths)
+| project 
+    Timestamp,
+    DeviceId,
+    Target = FileName,
+    TargetCmd = ProcessCommandLine,
+    Parent = InitiatingProcessFileName,
+    ParentPath = InitiatingProcessFolderPath,
+    ParentCmd = InitiatingProcessCommandLine,
+    Severity = "High",
+    HunterDirective = strcat(
+        "High: Possible memory injection. ", Parent, 
+        " launched ", Target, 
+        " from ", ParentPath, 
+        ". Investigate parent process behaviour."
+    )
+| order by Timestamp desc
