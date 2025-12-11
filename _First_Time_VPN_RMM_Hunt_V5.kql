@@ -1,0 +1,86 @@
+// Rule: L3_First_Time_VPN_RMM_Hunt_V5
+// Purpose: Detect Akira/BlackBasta-style chain:
+//   1) First-time or anomalous VPN login (new IP, geo, ASN, or device)
+//   2) Followed by RMM execution or installation within 4 hours
+// MITRE: T1133, T1219, T1078
+// Tactics: Initial Access, Persistence, C2
+
+let lookback = 24h;
+let history  = 14d;
+let window   = 4h;
+
+// ---------------------------
+// RMM Tool Definitions
+// ---------------------------
+let RMM = dynamic([
+  "anydesk.exe","teamviewer.exe","rustdesk.exe","screenconnect.client.exe",
+  "splashtop.exe","logmein.exe","ateraagent.exe","remoteutilities.exe",
+  "vncviewer.exe","realvnc.exe","tightvnc.exe","ultravnc.exe","supremo.exe"
+]);
+
+// ---------------------------
+// Stage 1 — RMM Execution or Installation
+// ---------------------------
+let RMMExec = DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (RMM)
+      or ProcessCommandLine has_any ("anydesk","teamviewer","rustdesk","screenconnect","vnc","splashtop")
+      or (FileName =~ "msiexec.exe" and ProcessCommandLine has_any ("anydesk","teamviewer","rustdesk"))
+| extend User = tolower(AccountName)
+| project RMM_Time=TimeGenerated, User, DeviceName, FileName, Cmd=ProcessCommandLine;
+
+// ---------------------------
+// Stage 2 — VPN Logins (Multi-source Normalisation)
+// ---------------------------
+let VPN_All = (
+    IdentityLogonEvents
+    | where TimeGenerated > ago(history)
+    | where LogonType in ("RemoteInteractive","RemoteAccess")
+    | project TimeGenerated, User=tolower(AccountName), IP=IPAddress, Location
+)
+union (
+    SigninLogs
+    | where TimeGenerated > ago(history)
+    | where AppDisplayName has "VPN" or ResourceDisplayName has "VPN" or ClientAppUsed has "VPN"
+    | where ResultType == 0
+    | extend Country = tostring(LocationDetails["countryOrRegion"])
+    | project TimeGenerated, User=tolower(UserPrincipalName), IP=IPAddress, Location=Country
+);
+
+// ---------------------------
+// Stage 3 — Baseline
+// ---------------------------
+let Historical = VPN_All
+| where TimeGenerated between (ago(history) .. ago(lookback))
+| distinct User, IP, Location;
+
+let Recent = VPN_All
+| where TimeGenerated > ago(lookback);
+
+// ---------------------------
+// Stage 4 — New or Anomalous VPN Login
+// ---------------------------
+let SuspiciousVPN =
+Recent
+| join kind=leftanti (Historical) on User, IP
+| extend Reason = "NewIP"
+| project VPN_Time=TimeGenerated, User, IP, Location, Reason;
+
+// ---------------------------
+// Stage 5 — Correlation (VPN → RMM within 4h)
+// ---------------------------
+SuspiciousVPN
+| join kind=inner (RMMExec) on User
+| where (RMM_Time - VPN_Time) between (0min .. window)
+| extend RiskScore =
+    80
+    + iif(FileName =~ "anydesk.exe" or FileName =~ "rustdesk.exe",10,0)
+    + iif(Cmd has "install" or Cmd has "setup" or Cmd has "msiexec",10,0)
+| extend Hunter_Directive = strcat(
+    "CRITICAL: User '", User, "' logged in via NEW VPN IP ", IP,
+    " then executed RMM tool '", FileName, "' on device '", DeviceName,
+    "'. Investigate credential compromise and persistence."
+)
+| project VPN_Time, RMM_Time, User, DeviceName, IP, Location,
+          FileName, Cmd, RiskScore, Hunter_Directive
+| order by RiskScore desc
