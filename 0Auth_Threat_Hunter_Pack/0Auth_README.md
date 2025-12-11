@@ -433,41 +433,37 @@ This folder contains the **diagrammatic OAuth attack flow** and the full **Senti
 
 # 1. OAuth Attack Chain Diagram (Mermaid)
 
-```mermaid
 flowchart TD
+    A[User receives phishing link] --> B{How does user sign in?}
+    B -->|Standard login| C[User authenticates]
+    B -->|Device code flow| C
 
-A[User Receives Phishing Link] --> B{Login Prompt?}
-B -->|Yes| C[User Authenticates]
-B -->|No (Device Code Flow)| C
+    C --> D[OAuth consent page shown]
+    D --> E{Does user grant consent?}
 
-C --> D[OAuth Consent Page Presented]
-D --> E{User Grants Permissions?}
+    E -->|Yes| F[Malicious app granted scopes]
+    E -->|No| H[No attack]
 
-E -->|Yes| F[Malicious App Granted Scopes]
-E -->|No| H[No Attack]
+    F --> G{Scope severity}
+    G -->|Mail Files Directory| H1[High risk access granted]
+    G -->|Low impact scopes| H2[Moderate risk access]
 
-F --> G{Scope Severity}
-G -->|Mail/Files/Directory| H1[High-Risk Access Granted]
-G -->|Low Impact| H2[Moderate Risk]
+    H1 --> I[Attacker gains token via consent]
+    H2 --> I
 
-H1 --> I[Attacker Gains Token via Consent]
-H2 --> I
+    I --> J{Attack path}
+    J -->|Graph API abuse| K[Mail and data exfiltration]
+    J -->|Silent access| L[Persistence via refresh tokens]
+    J -->|Privilege escalation| M[Directory manipulation]
+    J -->|Service principal abuse| N[New secrets added to service principals]
 
-I --> J{Attack Path}
-J -->|Graph API Abuse| K[Mail/Data Exfiltration]
-J -->|Silent Access| L[Persistence via Refresh Tokens]
-J -->|Privilege Escalation| M[Directory Manipulation]
-J -->|SP Abuse| N[New Secrets Added to Service Principals]
+    K --> O[Long term compromise]
+    L --> O
+    M --> O
+    N --> O
 
-K --> O[Long-term Compromise]
-L --> O
-M --> O
-N --> O
-
-O --> P[Detection Surface]
-P -->|New Consents| Q1[Hunt 1: Consent Risk]
-P -->|Token Replay| Q2[Hunt 2: Token Theft]
-P -->|Burst Pattern| Q3[Hunt 3: Burst Phishing]
-P -->|SP Credential Injection| Q4[Hunt 4: SP Backdoor]
-
-
+    O --> P[Detection surface]
+    P -->|New consent events| Q1[Hunt 1 Consent risk]
+    P -->|Token replay| Q2[Hunt 2 Token theft]
+    P -->|Burst of consents| Q3[Hunt 3 Burst phishing]
+    P -->|SP credential changes| Q4[Hunt 4 SP backdoor]
