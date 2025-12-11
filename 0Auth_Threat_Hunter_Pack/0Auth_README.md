@@ -433,6 +433,7 @@ This folder contains the **diagrammatic OAuth attack flow** and the full **Senti
 
 # 1. OAuth Attack Chain Diagram (Mermaid)
 
+~~~mermaid
 flowchart TD
     A[User receives phishing link] --> B{How does user sign in?}
     B -->|Standard login| C[User authenticates]
@@ -467,3 +468,4 @@ flowchart TD
     P -->|Token replay| Q2[Hunt 2 Token theft]
     P -->|Burst of consents| Q3[Hunt 3 Burst phishing]
     P -->|SP credential changes| Q4[Hunt 4 SP backdoor]
+~~~
