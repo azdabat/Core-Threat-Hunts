@@ -1,0 +1,477 @@
+////////////////////////////////////////////////////////////////////////////////
+// OAuth Analytic Pack — Consent Abuse, Token Theft, SP Credential Abuse
+// Author: Ala Dabat
+// Version: 2025-12 (V4)
+//
+// Contents:
+//   1) OAuth_Consent_Abuse_V4
+//        New high-risk OAuth grants (delegated + app roles) + usage context
+//
+//   2) OAuth_Token_Theft_SuspiciousUsage_V2
+//        Suspicious use of existing OAuth tokens from new geo / ASN / UA
+//        (no new consent needed)
+//
+//   3) OAuth_SP_Credential_Additions_V2
+//        New secrets/keys on service principals (backdoor existing apps)
+//
+// Design notes:
+//   - Everything is written to be readable under pressure.
+//   - Scoring is deliberately simple and comment-documented so you can talk
+//     through it in an interview without looking like it came from a black box.
+//   - These are hunting queries first. Promote to analytics once tuned per tenant.
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+// 1) OAuth_Consent_Abuse_V4
+//    New high-risk grants + basic risk engine
+//
+// Idea:
+//   - Focus on *successful* grants that introduce dangerous scopes/roles.
+//   - Weight permissions heavily (they define blast radius).
+//   - Treat publisher/app allowlists as suppressors, not hard bypasses.
+//   - Add context (usage, UA) as supporting risk, not the core driver.
+//
+// MITRE: TA0001, TA0003, T1078, T1550.001
+////////////////////////////////////////////////////////////////////////////////
+
+let ConsentLookback      = 30d;  // How far back to look for new grants
+let UsageLookback        = 7d;   // Shorter window for "is the app actually doing anything?"
+let ConsentRiskThreshold = 10;   // Keep low enough for hunts, adjust for production
+
+// Local allowlists – move these into watchlists when you go to production
+let KnownSafeApps = dynamic([
+    "Microsoft Teams",
+    "SharePoint Online",
+    "Outlook Web App",
+    "OneDrive",
+    "Office 365 Portal",
+    "Exchange Online",
+    "Azure Portal",
+    "Microsoft Graph",
+    "Power BI",
+    "Intune",
+    "Azure AD Connect",
+    "Defender for Endpoint",
+    "Defender for Identity",
+    "Defender for Office 365"
+]);
+
+let KnownSafePublishers = dynamic([
+    "Microsoft Corporation",
+    "Microsoft Azure",
+    "Microsoft Online Services",
+    "Office 365 Exchange Online",
+    "Windows Azure Active Directory"
+]);
+
+// Tool / script UAs that are more suspicious when used during consent
+let SuspiciousUserAgents = dynamic([
+    "python","curl","wget","http-client","go-http","okhttp","java","ruby",
+    "perl","postman","insomnia","rest-client","powershell"
+]);
+
+// Exact high-risk scopes / roles.
+// These are the ones where a *single* grant is already concerning.
+let HighRiskExact = dynamic([
+    "Application.ReadWrite.All",
+    "AppRoleAssignment.ReadWrite.All",
+    "RoleManagement.ReadWrite.Directory",
+    "ServicePrincipal.ReadWrite.All",
+    "Directory.ReadWrite.All",
+    "Directory.AccessAsUser.All",
+    "Mail.Read",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "MailboxSettings.ReadWrite",
+    "Files.ReadWrite.All",
+    "Sites.ReadWrite.All",
+    "Sites.FullControl.All",
+    "User.ReadWrite.All",
+    "Group.ReadWrite.All"
+    // NOTE: offline_access is handled as a modifier, not a primary high-risk perm.
+]);
+
+// Regex families for broad patterns
+let HighRiskRegex1 = @"^(Application|AppRoleAssignment|ServicePrincipal|RoleManagement|Directory|Domain|Policy)\.(ReadWrite.*|AccessAsUser\.All)$";
+let HighRiskRegex2 = @"^(AuditLog|Reports|Security|IdentityRisk(Event|yUser)|Threat)\.(Read.*|ReadWrite.*)$";
+let HighRiskRegex3 = @"^(Mail|MailboxSettings)\.(Read.*|ReadWrite.*|Send)$";
+let HighRiskRegex4 = @"^(Files|Sites)\.(Read.*|ReadWrite.*|FullControl\.All)$";
+let HighRiskRegex5 = @"^(Group|User|Device)\.(ReadWrite.*)$";
+let HighRiskRegex6 = @".*\.FullControl\.All$";
+let HighRiskRegex7 = @".*\.ReadWrite\.All$";
+
+// --------------------------------------------------------
+// 1A. Consent Events
+//     Normalise scopes / roles and calculate how dangerous the grant is.
+// --------------------------------------------------------
+let OAuthConsents =
+AuditLogs
+| where TimeGenerated >= ago(ConsentLookback)
+| where OperationName in (
+    "Consent to application",
+    "Add delegated permission grant",
+    "Add app role assignment grant to service principal"
+)
+| where Result =~ "success"  // This rule is about successful persistence, not failed probing.
+// Basic app + actor context
+| extend Target = TargetResources[0]
+| extend AppId          = tostring(Target.id),
+         AppDisplayName = tostring(Target.displayName),
+         InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
+         InitiatorId    = tostring(InitiatedBy.user.id),
+         InitiatorIp    = tostring(InitiatedBy.user.ipAddress),
+         UserAgent      = tostring(InitiatedBy.user.userAgent)
+| extend Props = Target.modifiedProperties
+| mv-expand P = Props
+| extend PropName  = tostring(P.displayName),
+         PropValue = tostring(P.newValue)
+// Pull out relevant consent properties
+| summarize
+    IsAppOnlyRaw      = any(iff(PropName == "ConsentContext.IsAppOnly", PropValue, "")),
+    OnBehalfOfAllRaw  = any(iff(PropName == "ConsentContext.OnBehalfOfAll", PropValue, "")),
+    PublisherNameRaw  = any(iff(PropName == "ConsentContext.PublisherName", PropValue, "")),
+    DelegatedRaw      = any(iff(PropName == "Scope", PropValue, "")),
+    AppRolesRaw       = any(iff(PropName == "AppRoles", PropValue, "")),
+    CreatedTime       = min(TimeGenerated),
+    Initiator         = any(InitiatorUPN),
+    InitiatorId       = any(InitiatorId),
+    InitiatorIp       = any(InitiatorIp),
+    UserAgent         = any(UserAgent)
+  by AppId, AppDisplayName
+// Normalise + combine delegated scopes and app roles into one list
+| extend IsAppOnly     = tobool(trim('"', tostring(IsAppOnlyRaw))),
+         OnBehalfAll   = tobool(trim('"', tostring(OnBehalfOfAllRaw))),
+         PublisherName = trim('"', tostring(PublisherNameRaw)),
+         AllPerms      = array_concat(
+                           split(replace_string(tostring(DelegatedRaw), '"', ""), " "),
+                           split(replace_string(tostring(AppRolesRaw),  '"', ""), " ")
+                         )
+| mv-expand Permission = AllPerms to typeof(string)
+| where isnotempty(Permission)
+// offline_access: present on many normal apps, so treat as a small risk multiplier only when it
+// appears alongside other high-risk scopes.
+| extend IsOfflineAccess = iif(Permission == "offline_access", 1, 0)
+// High-risk perm if it is in our explicit list or matches any of the regex “families”
+| extend IsHighRisk = iif(
+      Permission in (HighRiskExact)
+      or Permission matches regex HighRiskRegex1
+      or Permission matches regex HighRiskRegex2
+      or Permission matches regex HighRiskRegex3
+      or Permission matches regex HighRiskRegex4
+      or Permission matches regex HighRiskRegex5
+      or Permission matches regex HighRiskRegex6
+      or Permission matches regex HighRiskRegex7,
+      1, 0)
+// Scripted / tool user-agents are more suspicious at the point of consent
+| extend IsSuspiciousUA = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), 1, 0)
+| summarize
+    HighRiskCount    = sum(IsHighRisk),
+    HasOfflineAccess = max(IsOfflineAccess),
+    IsSuspiciousUA   = max(IsSuspiciousUA),
+    HighRiskPerms    = make_set_if(Permission, IsHighRisk == 1, 100),
+    AllPermissions   = make_set(Permission, 100),
+    PublisherName    = any(PublisherName),
+    CreatedTime      = any(CreatedTime),
+    Initiator        = any(Initiator),
+    InitiatorId      = any(InitiatorId),
+    InitiatorIp      = any(InitiatorIp),
+    UserAgent        = any(UserAgent)
+  by AppId, AppDisplayName, IsAppOnly, OnBehalfAll;
+
+// --------------------------------------------------------
+// 1B. Usage Correlation
+//     Check whether the SP / app is actually in use in the recent window.
+// --------------------------------------------------------
+let SPActivity =
+ServicePrincipalSignInLogs
+| where TimeGenerated >= ago(UsageLookback)
+| summarize
+    SPCalls   = count(),
+    LastSPUse = max(TimeGenerated),
+    SP_UAs    = make_set(tostring(UserAgent), 50)
+  by AppId;
+
+let UserActivity =
+SigninLogs
+| where TimeGenerated >= ago(UsageLookback)
+| summarize
+    UserSignins = count(),
+    LastUserUse = max(TimeGenerated),
+    User_UAs    = make_set(tostring(UserAgent), 50)
+  by AppId;
+
+// --------------------------------------------------------
+// 1C. Risk Engine and Output
+//     Permissions drive the score; publisher/app allowlists dampen noise.
+// --------------------------------------------------------
+OAuthConsents
+| join kind=leftouter SPActivity on AppId
+| join kind=leftouter UserActivity on AppId
+| extend HasUsage = iif(SPCalls > 0 or UserSignins > 0, 1, 0)
+| extend IsKnownGoodApp       = iif(AppDisplayName in~ (KnownSafeApps), 1, 0),
+         IsKnownGoodPublisher = iif(PublisherName in~ (KnownSafePublishers), 1, 0)
+// Risk model:
+//   - HighRiskCount * 10: one bad perm is enough to care; multiple perms escalate quickly.
+//   - OnBehalfAll: admin consent is very high risk.
+//   - Known good app/publisher: strong suppressor, but not a full bypass.
+//   - Usage: raises priority but does not create risk on its own.
+//   - Suspicious UA: scripted consent is a strong signal of abuse.
+//   - offline_access: small amplifier when combined with other high-risk perms.
+| extend RiskScore = 
+      (HighRiskCount * 10)                                           // main driver
+    + (iif(OnBehalfAll, 10, 0))                                      // admin consent
+    + (iif(IsKnownGoodPublisher == 1 or IsKnownGoodApp == 1, -15, 3))// strong suppression for known-good
+    + (iif(HasUsage == 1, 2, 0))                                     // context only
+    + (iif(IsSuspiciousUA == 1, 15, 0))                              // consent via tools/scripts
+    + (iif(HasOfflineAccess == 1 and HighRiskCount > 0, 5, 0))       // offline_access in addition to other perms
+| where RiskScore >= ConsentRiskThreshold
+| extend Severity = case(
+      RiskScore >= 40, "Critical",
+      RiskScore >= 25, "High",
+      "Medium"
+  )
+| extend HunterDirective = strcat(
+      "Review OAuth app '", AppDisplayName, "' (", AppId, "). ",
+      "Publisher: ", iif(isempty(PublisherName), "Unknown", PublisherName), ". ",
+      "Admin consent: ", iif(OnBehalfAll, "YES", "NO"), ". ",
+      "High-risk permissions: ", tostring(HighRiskPerms), " (count=", tostring(HighRiskCount), "). ",
+      "Usage last ", tostring(UsageLookback), ": ", iif(HasUsage == 1, "YES", "NO"), ". ",
+      "If this app is not a known business requirement, treat as possible illicit consent / persistence and escalate."
+  )
+| project
+    CreatedTime,
+    Severity,
+    RiskScore,
+    AppDisplayName,
+    AppId,
+    PublisherName,
+    IsAppOnly,
+    OnBehalfAll,
+    HighRiskCount,
+    HighRiskPerms,
+    AllPermissions,
+    SPCalls,
+    LastSPUse,
+    UserSignins,
+    LastUserUse,
+    Initiator,
+    InitiatorId,
+    InitiatorIp,
+    UserAgent,
+    HunterDirective
+| order by RiskScore desc, CreatedTime desc;
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// 2) OAuth_Token_Theft_SuspiciousUsage_V2
+//     Suspicious use of existing tokens (no new consent)
+//
+// Idea:
+//   - Build a baseline per (UserPrincipalName, AppId) for country, ASN, and UA family.
+//   - Look at recent sign-ins by that same pair and flag "first time" geos/ASNs/UAs.
+//   - Raise threshold high enough to avoid pure travel/VPN noise.
+//
+// MITRE: TA0003, T1078, T1550.001
+////////////////////////////////////////////////////////////////////////////////
+
+let TokenBaselineWindow = 30d;
+let TokenRecentWindow   = 7d;
+let MinBaselineEvents   = 5;    // Require some history to consider something "new"
+// For UA family we only keep the first word (e.g. "Chrome", "Firefox", "python-requests").
+
+let TokenBaseline =
+SigninLogs
+| where TimeGenerated between (ago(TokenBaselineWindow) .. ago(TokenRecentWindow))
+| project
+    UserPrincipalName,
+    AppId,
+    AppDisplayName,
+    TimeGenerated,
+    Country   = tostring(LocationDetails.countryOrRegion),
+    ASN       = tostring(NetworkLocationDetails.autonomousSystemNumber),
+    UA_Family = toupper(strcat_array(array_slice(split(tostring(UserAgent), " "), 0, 1), ""))
+| where isnotempty(UserPrincipalName) and isnotempty(AppId) and isnotempty(Country)
+| summarize
+    BaselineCount      = count(),
+    BaselineCountries  = make_set(Country, 20),
+    BaselineASNs       = make_set(ASN, 20),
+    BaselineUAFamilies = make_set(UA_Family, 20)
+  by UserPrincipalName, AppId, AppDisplayName
+| where BaselineCount >= MinBaselineEvents;
+
+let TokenRecent =
+SigninLogs
+| where TimeGenerated >= ago(TokenRecentWindow)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    AppId,
+    AppDisplayName,
+    IPAddress,
+    Country      = tostring(LocationDetails.countryOrRegion),
+    City         = tostring(LocationDetails.city),
+    ASN          = tostring(NetworkLocationDetails.autonomousSystemNumber),
+    ISP          = tostring(NetworkLocationDetails.autonomousSystemName),
+    UA           = tostring(UserAgent),
+    UA_Family    = toupper(strcat_array(array_slice(split(tostring(UserAgent), " "), 0, 1), "")),
+    AuthenticationRequirement = tostring(AuthenticationRequirement),
+    ClientAppUsed = tostring(ClientAppUsed);
+
+TokenRecent
+| join kind=inner TokenBaseline on UserPrincipalName, AppId
+| extend IsNewCountry  = iif(not(Country   in (BaselineCountries)), 1, 0),
+         IsNewASN      = iif(not(ASN       in (BaselineASNs)),      1, 0),
+         IsNewUAFamily = iif(not(UA_Family in (BaselineUAFamilies)),1, 0)
+// AnomalyScore:
+//   - New country: strongest signal.
+//   - New ASN: slightly weaker but still useful.
+//   - New UA family: a scripted client where we expect a browser is suspect.
+//   - Single-factor auth (no MFA) makes the whole pattern riskier.
+| extend AnomalyScore =
+      (IsNewCountry  * 3)
+    + (IsNewASN      * 2)
+    + (IsNewUAFamily * 2)
+    + (iif(AuthenticationRequirement =~ "singleFactorAuthentication", 2, 0))
+| where AnomalyScore >= 6  // tuned up to avoid pure travel/VPN-only cases
+| extend Severity = case(
+      AnomalyScore >= 8, "High",
+      "Medium"
+  )
+| extend HunterDirective = strcat(
+      "Possible OAuth token theft or session reuse for user '", UserPrincipalName,
+      "' via app '", AppDisplayName, "' (", AppId, "). ",
+      "Anomalous sign-in: Country=", Country, ", ASN=", ASN, ", UA_Family=", UA_Family, ". ",
+      "Baseline Countries=", tostring(BaselineCountries),
+      "; Baseline ASNs=", tostring(BaselineASNs),
+      "; Baseline UA Families=", tostring(BaselineUAFamilies), ". ",
+      "Confirm whether user is travelling or using a new ISP/VPN. ",
+      "If not expected, review mailbox/file access and consider revoking sessions."
+  )
+| project
+    TimeGenerated,
+    Severity,
+    AnomalyScore,
+    UserPrincipalName,
+    AppId,
+    AppDisplayName,
+    Country,
+    City,
+    ASN,
+    ISP,
+    IPAddress,
+    UA,
+    AuthenticationRequirement,
+    ClientAppUsed,
+    BaselineCountries,
+    BaselineASNs,
+    BaselineUAFamilies,
+    IsNewCountry,
+    IsNewASN,
+    IsNewUAFamily,
+    HunterDirective
+| order by AnomalyScore desc, TimeGenerated desc;
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// 3) OAuth_SP_Credential_Additions_V2
+//     New secrets/keys on existing service principals
+//
+// Idea:
+//   - Look for AuditLogs events that touch credential properties.
+//   - Distinguish secrets (passwordCredentials) from cert updates.
+//   - Any new secret is suspicious on a non-dev SP; on high-value SPs, treat as critical.
+//
+// MITRE: TA0003, T1098
+////////////////////////////////////////////////////////////////////////////////
+
+let SPCredLookback      = 30d;
+let SPCredRiskThreshold = 5;
+
+// High value SP list – AppIds or display names for truly sensitive apps.
+// Populate per tenant (e.g. Graph, Exchange Online, key LOB apps).
+let HighValueServicePrincipals = dynamic([
+    // "00000003-0000-0000-c000-000000000000", // Example: Microsoft Graph
+    // "Some Critical Line of Business App"
+]);
+
+AuditLogs
+| where TimeGenerated >= ago(SPCredLookback)
+| where OperationName in (
+    "Add service principal credentials",
+    "Update application",
+    "Update service principal"
+)
+| extend Target = TargetResources[0]
+| extend AppId          = tostring(Target.id),
+         AppDisplayName = tostring(Target.displayName),
+         Category       = tostring(Category),
+         Activity       = tostring(ActivityDisplayName)
+| extend InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
+         InitiatorId    = tostring(InitiatedBy.user.id),
+         InitiatorIp    = tostring(InitiatedBy.user.ipAddress)
+| extend Props = Target.modifiedProperties
+| mv-expand P = Props
+| extend PropName = tostring(P.displayName),
+         OldValue = tostring(P.oldValue),
+         NewValue = tostring(P.newValue)
+// Focus on credential-related properties. Names can vary slightly,
+// so this is intentionally broad. Tune after first run in your tenant.
+| where PropName has_any ("passwordCredentials","keyCredentials","KeyDescription","KeyId","KeyIdentifier","KeyUsage")
+| summarize
+    FirstSeen    = min(TimeGenerated),
+    LastSeen     = max(TimeGenerated),
+    Operations   = make_set(OperationName, 10),
+    Categories   = make_set(Category, 10),
+    PropNames    = make_set(PropName, 20),
+    SampleOld    = any(OldValue),
+    SampleNew    = any(NewValue),
+    Initiators   = make_set(InitiatorUPN, 10),
+    InitiatorIds = make_set(InitiatorId, 10),
+    InitiatorIps = make_set(InitiatorIp, 10)
+  by AppId, AppDisplayName
+| extend PropChangeCount = array_length(PropNames)
+// Secrets (passwordCredentials / KeyId) are more interesting than generic cert/key updates.
+| extend AddsSecret = iif(PropNames has "passwordCredentials" or PropNames has "KeyId", 1, 0)
+| extend IsHighValueSP = iif(AppId in (HighValueServicePrincipals) or AppDisplayName in (HighValueServicePrincipals), 1, 0)
+// Risk model:
+//   - Any change: baseline 2.
+//   - Secret addition: 5 (enough to trigger on its own).
+//   - High-value SP: +10 on top.
+//   - PropChangeCount: tie-breaker / minor escalator.
+| extend RiskScore =
+      (iif(AddsSecret == 1, 5, 2))
+    + (iif(IsHighValueSP == 1, 10, 0))
+    + (PropChangeCount)
+| where RiskScore >= SPCredRiskThreshold
+| extend Severity = case(
+      IsHighValueSP == 1 and AddsSecret == 1, "Critical",
+      AddsSecret == 1 and PropChangeCount >= 2, "High",
+      "Medium"
+  )
+| extend HunterDirective = strcat(
+      "New credentials added/updated for service principal '", AppDisplayName, "' (", AppId, "). ",
+      "Changed properties: ", tostring(PropNames), ". ",
+      "Initiators: ", tostring(Initiators), ". ",
+      "If no planned key/secret rotation exists for this app, treat as potential SP backdoor. ",
+      "For high-value SPs, involve app owner and investigate recent sign-ins and directory role changes."
+  )
+| project
+    FirstSeen,
+    LastSeen,
+    Severity,
+    RiskScore,
+    AppDisplayName,
+    AppId,
+    Operations,
+    Categories,
+    PropNames,
+    SampleOld,
+    SampleNew,
+    Initiators,
+    InitiatorIds,
+    InitiatorIps,
+    HunterDirective
+| order by RiskScore desc, LastSeen desc;
