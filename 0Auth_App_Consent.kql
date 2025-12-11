@@ -1,61 +1,75 @@
-//  Suspicious OAuth Application Consents
+// Advanced Hunt: Risk-Based OAuth Consent Analysis (Scopes + Burst + Admin)
 // Author: Ala Dabat
+// Purpose: Detects illicit consent grants by analyzing permission severity and consent bursts (phishing patterns).
 
-let KnownSafeApps = dynamic([
-    "Microsoft Office 365 Portal", "Microsoft Teams", "SharePoint Online",
-    "OneDrive", "Outlook Web App", "Microsoft Intune"
-]);
+let Lookback = 24h;
+// 1. Define High-Risk Keywords in Permissions (Scopes)
+let RiskyScopes = dynamic(["Mail.Read", "Mail.ReadWrite", "Files.Read", "Files.Read.All", "Notes.Read.All", "User.ReadWrite.All", "Directory.ReadWrite.All"]);
+// 2. Define Safe Publishers (Reduce Noise)
+let SafePublishers = dynamic(["Microsoft Services", "Microsoft Corporation"]); 
 
-AuditLogs
-| where OperationName == "Consent to application"
-| where Result == "success"
-| extend Target = TargetResources[0]
-| extend
-    AppId          = tostring(Target.id),
-    AppDisplayName = tostring(Target.displayName),
-    ModifiedProps  = Target.modifiedProperties,
-    Initiator      = tostring(InitiatedBy.user.userPrincipalName),
-    IPAddress      = tostring(InitiatedBy.user.ipAddress),
-    UserAgent      = tostring(InitiatedBy.user.userAgent)
-| mv-expand Prop = ModifiedProps
-| extend
-    PropName  = tostring(Prop.displayName),
-    PropValue = tostring(Prop.newValue)
-| summarize
-    IsAppOnly      = any(iff(PropName == "ConsentContext.IsAppOnly",       PropValue, "")),
-    OnBehalfOfAll  = any(iff(PropName == "ConsentContext.OnBehalfOfAll",   PropValue, "")),
-    PublisherInfo  = any(iff(PropName == "TargetId.ServicePrincipalNames", PropValue, "")),
-    TimeGenerated  = any(TimeGenerated),
-    UserAgent      = any(UserAgent),
-    IPAddress      = any(IPAddress),
-    Initiator      = any(Initiator)
-  by AppId, AppDisplayName
-| where AppDisplayName !in~ (KnownSafeApps)  // baseline exclusion
-| extend
-    RiskScore = case(
-        IsAppOnly == "\"True\"" and OnBehalfOfAll == "\"True\"", 10,
-        IsAppOnly == "\"True\"", 7,
-        OnBehalfOfAll == "\"True\"", 5,
-        2
-    ),
-    RiskLevel = case(
-        RiskScore >= 10, "Critical",
-        RiskScore >= 7,  "High",
-        RiskScore >= 5,  "Moderate",
-        "Low"
-    ),
-    HunterDirective = strcat(
-        "App '", AppDisplayName, "' (", AppId, ") consented by ", Initiator,
-        ". AppOnly=", IsAppOnly, ", OnBehalfOfAll=", OnBehalfOfAll,
-        ". Review publisher: ", PublisherInfo,
-        ". Validate if the app is approved. If unknown, disable consent and investigate immediately."
-    ),
-    InvestigationLink = strcat(
-        "https://portal.azure.com/#blade/Microsoft_AAD_IAM/StartboardApplicationsMenuBlade/AllApps/menuId/",
-        AppId
+// 3. Base Event: Successful Application Consents
+let ConsentEvents = 
+    AuditLogs
+    | where TimeGenerated > ago(Lookback)
+    | where OperationName == "Consent to application"
+    | where Result == "success"
+    | extend Target = TargetResources[0]
+    | extend Initiator = tostring(InitiatedBy.user.userPrincipalName)
+    | extend IPAddress = tostring(InitiatedBy.user.ipAddress)
+    | extend UserAgent = tostring(InitiatedBy.user.userAgent)
+    | extend AppDisplayName = tostring(Target.displayName)
+    | extend AppId = tostring(Target.id)
+    // 4. Extract Critical Context from ModifiedProperties
+    | mv-apply Prop = Target.modifiedProperties on (
+        summarize 
+            IsAdminConsent = take_anyif(tostring(Prop.newValue), Prop.displayName == "ConsentContext.OnBehalfOfAll"),
+            GrantedScopes  = take_anyif(tostring(Prop.newValue), Prop.displayName == "ConsentContext.Permissions"), // The actual permissions (e.g. "Mail.Read")
+            Publisher      = take_anyif(tostring(Prop.newValue), Prop.displayName == "PublisherName") // Note: Field availability varies by tenant config
     )
+    | extend IsAdminConsent = iff(IsAdminConsent =~ "True", 1, 0)
+    | extend Publisher = iff(isempty(Publisher), "Unknown", Publisher);
+
+// 5. Burst Analysis: How many unique users consented to this AppID in the window?
+let AppPopularity = 
+    ConsentEvents
+    | summarize ConsentCount = dcount(Initiator) by AppId;
+
+// 6. Enrichment & Scoring
+ConsentEvents
+| join kind=leftouter (AppPopularity) on AppId
+| extend 
+    // Score 1: Admin Consent (Critical Impact)
+    Score_Admin = iff(IsAdminConsent == 1, 10, 0),
+    // Score 2: Risky Scopes (Data Exfil Potential)
+    Score_Scopes = iff(GrantedScopes has_any (RiskyScopes), 10, 0),
+    // Score 3: Phishing Burst (Multiple users tricked into consenting)
+    Score_Burst = iff(ConsentCount >= 3, 5, 0), 
+    // Score 4: Unverified Publisher
+    Score_Publisher = iff(Publisher !in (SafePublishers) and Publisher != "Unknown", 5, 0)
+
+| extend RiskScore = Score_Admin + Score_Scopes + Score_Burst + Score_Publisher
+// 7. Filter Noise (Only show interesting events)
+| where RiskScore >= 5 
+
+// 8. Dynamic Hunter Directive
+| extend HunterDirective = case(
+    RiskScore >= 20, strcat("CRITICAL: Illicit Consent Grant suspected. Admin-level permissions (", GrantedScopes, ") granted to '", AppDisplayName, "'. Burst activity detected (", ConsentCount, " users)."),
+    RiskScore >= 10, strcat("HIGH: Risky App Permissions. '", AppDisplayName, "' granted sensitive scopes: ", GrantedScopes),
+    "MEDIUM: Non-standard OAuth consent detected."
+)
+
+// 9. Final Projection for the Analyst
 | project 
-    TimeGenerated, AppDisplayName, AppId, RiskLevel, RiskScore,
-    Initiator, IPAddress, UserAgent, PublisherInfo,
-    HunterDirective, InvestigationLink
+    TimeGenerated, 
+    RiskScore, 
+    HunterDirective, 
+    AppDisplayName, 
+    AppId, 
+    Initiator, 
+    IPAddress, 
+    IsAdminConsent, 
+    GrantedScopes, 
+    ConsentCount, 
+    Publisher
 | sort by RiskScore desc, TimeGenerated desc
