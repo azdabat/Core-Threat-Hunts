@@ -1,0 +1,49 @@
+//////////////////////////////////////////////////////////////////////////////////////////////
+// RULE: WebRCE_StagingAndDownload_L3
+// AUTHOR: Ala Dabat
+//
+// PURPOSE:
+//   Detect staging activity (curl, wget, iwr, bitsadmin) originating FROM web processes,
+//   following an RCE pivot.
+//
+// MITRE:
+//   - T1105: Ingress Tool Transfer
+//   - T1190: Exploit Public-Facing Application
+//
+// ENHANCEMENTS APPLIED:
+//   - Preserved curl|bash detection as high-fidelity
+//   - Added support for developer automation allowlisting in SOP
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 7d;
+
+let WebParents = dynamic(["node.exe","nginx.exe","httpd.exe","w3wp.exe","iisexpress.exe","dotnet.exe","java.exe"]);
+let StagingBins = dynamic(["curl","wget","powershell.exe","pwsh.exe","cmd.exe"]);
+let PipeToShell = dynamic(["curl|bash","wget|bash","curl | bash","wget | bash"]);
+let StagingTokens = dynamic([
+    "curl ","wget ","Invoke-WebRequest","iwr",
+    "DownloadFile","DownloadString","Start-BitsTransfer"
+]);
+
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where InitiatingProcessFileName has_any (WebParents)
+| where FileName has_any (StagingBins)
+| where ProcessCommandLine has_any (StagingTokens) or ProcessCommandLine has_any (PipeToShell)
+| extend Pipe = ProcessCommandLine has_any (PipeToShell)
+| extend Severity = iff(Pipe, "High", "Medium")
+| extend RiskScore = iff(Severity == "High", 80, 60)
+| extend HunterDirective =
+    case(
+        Severity == "High",
+            "HIGH: Web server executed curl|bash or wget|bash. Treat as active exploitation.",
+        "MEDIUM: Web server fetching external content. Verify deployment/automation context."
+    )
+| project Timestamp, DeviceName, Severity, RiskScore,
+         Parent = InitiatingProcessFileName,
+         ParentCmd = InitiatingProcessCommandLine,
+         Downloader = FileName,
+         DownloadCmd = ProcessCommandLine,
+         MITRE = "T1105",
+         HunterDirective
+| order by Timestamp desc
