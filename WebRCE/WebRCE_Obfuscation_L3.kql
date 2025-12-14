@@ -1,0 +1,35 @@
+# ================================
+# WebRCE_Obfuscation_L3.kql
+# LOCATION: /WebRCE/WebRCE_Obfuscation_L3.kql
+# PURPOSE: Detect encoded stagers, AMSI bypass, reflection assembly loading
+# MITRE: T1562.001 (AMSI Bypass), T1027 (Obfuscation)
+# Gemini Enhancement: Increase Base64 minimum length to 60 for FP reduction
+# ================================
+
+let Lookback = 7d;
+
+let ObfTokens = dynamic([
+    "AmsiUtils", "AmsiScanBuffer", "amsiInitFailed",
+    "FromBase64String", "EncodedCommand",
+    "Reflection.Assembly", "Add-Type"
+]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where ProcessCommandLine has_any (ObfTokens)
+       or ProcessCommandLine matches regex @"[A-Za-z0-9+/]{60,}={0,2}"
+| extend Base64Blob = extract_all(@"[A-Za-z0-9+/]{60,}={0,2}", ProcessCommandLine)
+| extend AmsiHits = extract_all(@"(AmsiScanBuffer|AmsiUtils|System\.Management\.Automation)", ProcessCommandLine)
+| extend Signals = array_length(Base64Blob) + array_length(AmsiHits)
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, Base64Blob, AmsiHits, Signals
+| extend Severity = case(
+        Signals >= 2, "Critical – Obfuscation + AMSI Bypass",
+        "High – Obfuscation Detected"
+    ),
+    HunterDirective = case(
+        Severity startswith "Critical",
+        "Immediate review. Decode Base64 payloads, validate if loader present. Check follow-on C2.",
+        "High-value signal. Check for staging or prior RCE."
+    ),
+    MITRE = "T1562.001; T1027"
+| order by Timestamp desc
