@@ -1,10 +1,10 @@
 // ==========================================================
-// Rule: Userland_UnsignedBinary_L3_V5
-// Path: /Loaders/Userland_UnsignedBinary_L3_V5.kql
-// Purpose: Detect execution of unsigned binaries from user-writable paths
-// MITRE: TA0002, T1059, T1204
+// Rule: Userland_UnsignedMaliciousLoader_L4
+// Path: /Loaders/Userland_UnsignedMaliciousLoader_L4.kql
+// Purpose: Detect execution of unsigned binaries from user-writable paths with advanced loader characteristics.
 // Notes: Generic loader/implant detector, ideal for EtherRAT and similar
-// Author: Ala Dabat
+// MITRE: TA0002, T1059, T1204, T1569.002, T1027
+// Author: Ala Dabat's V5)
 // ==========================================================
 
 let Lookback = 72h;
@@ -13,7 +13,17 @@ let UserPaths = dynamic([
     "/home/","/tmp/","/var/tmp/"
 ]);
 
-let DevHints = dynamic(["dev","build","ci","runner"]);
+let DevHints = dynamic(["dev","build","ci","runner","jenkins","gitlab"]); // Expanded for better Dev/Ops exclusion
+
+// 1. Loader Evasion/Remote Execution Characteristics
+let AdvancedSuspicion = dynamic([
+    // Common obfuscation/execution techniques
+    "-enc", "FromBase64String", "Invoke-Expression", "IEX", "cmd /c", "/c powershell",
+    // Common C2/Download Patterns
+    "http://", "https://", "Invoke-WebRequest", "wget", "curl", "certutil",
+    // Specific tool/language characteristics (often used for loaders/stagers)
+    "go-runner", "rustc", "rcore", "chisel", "sliver"
+]);
 
 // Unsigned binary execution in user writable paths
 DeviceProcessEvents
@@ -23,24 +33,31 @@ DeviceProcessEvents
 | where Unsigned == 1
 | extend
     IsDevHost = iif(DeviceName has_any (DevHints), 1, 0),
-    HasSuspiciousArgs = iif(ProcessCommandLine has_any (dynamic(["-enc","FromBase64String","http://","https://"])), 1, 0)
+    HasSuspiciousArgs = iif(ProcessCommandLine has_any (AdvancedSuspicion), 1, 0),
+    // NEW: Check for execution by common scripting/interpreted languages (often stagers)
+    IsScriptedParent = iif(InitiatingProcessFileName in ('powershell.exe', 'cmd.exe', 'bash', 'sh', 'python.exe', 'wscript.exe'), 1, 0)
+
 | extend RiskScore =
       0
-    + iif(IsDevHost == 0, 40, 0)
-    + iif(HasSuspiciousArgs == 1, 30, 0)
-| where RiskScore >= 40
+    + iif(IsDevHost == 0, 40, 0) // High risk if not a dev host
+    + iif(HasSuspiciousArgs == 1, 30, 0) // High risk if args suggest obfuscation/remote contact
+    + iif(IsScriptedParent == 1, 20, 0) // Added risk if launched by a script/shell process
+| where RiskScore >= 40 // Keep the baseline threshold
 | extend Severity = case(
-        RiskScore >= 70, "P1 – Unsigned Loader Execution (Non-Dev Host)",
-        "P2 – Unsigned Binary in User Path"
+        RiskScore >= 70, "P1 – Unsigned Malicious Loader (Non-Dev Host + Evasion)",
+        RiskScore >= 50, "P2 – Unsigned Loader with Scripted Parent/Arguments",
+        "P3 – Unsigned Binary in User Path"
     ),
     Hunter_Directive = case(
         Severity startswith "P1",
-        "Acquire binary, calculate hash, submit to sandbox. Pivot to NetworkEvents for C2 and SecretsRecon for prior data access.",
-        "Confirm whether this binary is part of a dev/build toolchain. If not, treat as possible implant.",
+        "**CRITICAL**: Acquire binary and process memory. Submit hash to sandbox. **IMMEDIATELY** pivot to DeviceNetworkEvents for C2 and look for follow-on file creation (SecretsRecon).",
+        Severity startswith "P2",
+        "Review parent process (InitiatingProcess) and full command line. Check DeviceRegistryEvents for persistence. Confirm if linked to RCE.",
+        "Confirm whether this binary is part of a dev/build toolchain. If not, treat as possible implant and acquire binary.",
         "Review process tree and determine if linked to RCE or staging hunts."
     ),
-    MITRE_Tactics = "Execution",
-    MITRE_Techniques = "T1059; T1204"
+    MITRE_Tactics = "Execution; Defense Evasion; Command and Control",
+    MITRE_Techniques = "T1059; T1204; T1027; T1569.002"
 | project
     Timestamp,
     DeviceName,
@@ -53,6 +70,7 @@ DeviceProcessEvents
     Unsigned,
     IsDevHost,
     HasSuspiciousArgs,
+    IsScriptedParent, // NEW Field
     RiskScore,
     Severity,
     MITRE_Tactics,
