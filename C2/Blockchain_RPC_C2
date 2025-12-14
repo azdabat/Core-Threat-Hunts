@@ -1,0 +1,49 @@
+// ==========================================================
+// Rule: Blockchain_RPC_C2_L3_V5
+// Path: /C2/Blockchain_RPC_C2_L3_V5.kql
+// Purpose: Detect Web3 / Blockchain RPC used as C2 (EtherRAT-style)
+// MITRE: TA0011, T1102
+// Notes: Designed for correlation with Userland_UnsignedBinary_L3_V5
+// Author: Ala Dabat
+// ==========================================================
+
+let Lookback = 48h;
+
+let RpcProviders = dynamic([
+    "solana","alchemy","infura","etherscan","quicknode","moralis","chainstack"
+]);
+
+let DevHints = dynamic(["dev","blockchain","chain","web3","crypto","wallet"]);
+
+// Aggregate by device + process + RPC host
+DeviceNetworkEvents
+| where Timestamp >= ago(Lookback)
+| where RemoteUrl has_any (RpcProviders)
+| summarize
+    FirstSeen   = min(Timestamp),
+    LastSeen    = max(Timestamp),
+    EventCount  = count(),
+    SampleCmd   = any(InitiatingProcessCommandLine)
+    by DeviceName,
+       InitiatingProcessFileName,
+       RemoteUrl
+| extend
+    IsDevHost = iif(DeviceName has_any (DevHints), 1, 0),
+    IsBeaconLike = iif(EventCount >= 5, 1, 0)
+| extend RiskScore =
+      0
+    + iif(IsDevHost == 0, 30, 0)
+    + iif(IsBeaconLike == 1, 30, 0)
+| where RiskScore >= 30
+| extend Severity = case(
+        RiskScore >= 60, "P1 – Likely RPC C2 on Non-Dev Host",
+        "P2 – RPC Use Requiring Context"
+    ),
+    Hunter_Directive = case(
+        Severity startswith "P1",
+        "Correlate with Userland_UnsignedBinary_L3_V5. If parent is unsigned loader, treat as active C2 and isolate host.",
+        "Validate if host is part of blockchain/Web3 team. If not, investigate process tree and business justification."
+    ),
+    MITRE_Tactics = "Command and Control",
+    MITRE_Techniques = "T1102"
+| order by RiskScore desc, LastSeen desc
