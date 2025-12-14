@@ -4,19 +4,28 @@
 // Purpose: Detect the creation of new kernel/driver services using all available data sources (T1543.003, T1569.002).
 // Data: SecurityEvent (7045), DeviceProcessEvents, DeviceRegistryEvents
 // MITRE: T1543.003 (Windows Service), T1569.002 (Service Execution)
+// Noise supression optional if you remove Event ID, but lower fedelity. If you create a comprehensive whitelist the rule will become "ideal"
 // ============================================================================
-
 let lookback = 7d;
 let DriverExtensions = dynamic([".sys", ".dll", ".dat", ".tmp"]);
 
-// --- 1. Define all Service Creation Events from high-fidelity sources ---
+// --- CONFIGURATION: WHITELIST ---
+// Add Service Names known to be legitimately installed in your environment (e.g., VPNs, AV, Virtualizers).
+let TrustedServices = dynamic([
+    "vmware-usb", "OpenVPNService", "VeeamEndpointService", 
+    "SentinelOneAgent", "CrowdStrikeFWS", "LogitechService"
+]);
+
+// --- 1. Define all Service Creation Events (The Core UNION) ---
 let ServiceEvents =
 union
 (
-    // Method 1: Security Event ID 7045 (Highest Fidelity - API usage)
+    // METHOD 1: SECURITY EVENT ID 7045 (Highest Fidelity Source - Comment out for Low Noise)
     SecurityEvent
     | where TimeGenerated > ago(lookback)
     | where EventID == 7045
+    // Internal Noise Filter: Exclude known, trusted system accounts (E.g., Windows updates, SCM)
+    | where SubjectUserName !startswith "NT AUTHORITY" or SubjectUserName in ("AdminUser1", "ServiceAccount_Monitor") // Custom inclusion for known safe users
     | extend 
         SvcTime = TimeGenerated,
         ImagePath = tostring(parse_json(EventData).ImagePath),
@@ -25,27 +34,25 @@ union
     | project DeviceName = Computer, SvcTime, ImagePath, SvcName, CreationMethod, AccountName=SubjectUserName
 ),
 (
-    // Method 2: Process Events (for command-line context)
+    // METHOD 2: PROCESS EVENTS (Command Line context for tools like sc.exe)
     DeviceProcessEvents 
     | where Timestamp > ago(lookback)
     | where FileName in~ ("sc.exe", "pnputil.exe", "wmic.exe")
     | where ProcessCommandLine has_any ("create", "driver", "kernel", ".sys")
     | extend 
         SvcTime = Timestamp,
-        ImagePath = extract_regex(@"(?i)binPath\s*=\s*(.*?)\s", 1, ProcessCommandLine), // Attempt to extract the path
-        SvcName = extract_regex(@"(?i)create\s*([a-zA-Z0-9_-]+)\s", 1, ProcessCommandLine), // Attempt to extract the name
+        ImagePath = extract_regex(@"(?i)binPath\s*=\s*(.*?)\s", 1, ProcessCommandLine),
+        SvcName = extract_regex(@"(?i)create\s*([a-zA-Z0-9_-]+)\s", 1, ProcessCommandLine),
         CreationMethod = "Process_SC_Utility"
     | project DeviceName, SvcTime, ImagePath, SvcName, CreationMethod, AccountName=InitiatingProcessAccountName
-);
+)
+// NOTE: Registry Events are omitted here as they are covered by the high-fidelity Event 7045.
+| where ImagePath has_any (DriverExtensions) // Filter for files with driver/loader extensions
+| where SvcName !in~ (TrustedServices) // APPLY THE WHITELIST
+| summarize arg_max(SvcTime, *) by DeviceName, SvcName; // De-duplicate
 
-
-// --- 2. FINAL AGGREGATION, FILTERING, AND DIRECTIVES ---
+// --- 2. FINAL AGGREGATION AND DIRECTIVES ---
 ServiceEvents
-// Filter for potential driver/rootkit file paths
-| where ImagePath has_any (DriverExtensions)
-// Filter out noise from trusted service installers (e.g., TrustedInstaller.exe)
-| where AccountName !startswith "NT AUTHORITY" or InitiatingProcessFileName !in~ ("TrustedInstaller.exe", "msiexec.exe", "setup.exe")
-// Aggregate and de-duplicate events for a single, comprehensive alert
 | summarize 
     Count=count(), 
     FirstSeen=min(SvcTime), 
@@ -55,13 +62,16 @@ ServiceEvents
     by DeviceName, SvcName, AccountName
 | extend HunterDirective = 
     case(
-        SamplePath contains "temp" or SamplePath contains "public" or SamplePath contains "downloads",
+        SamplePath has_any ("temp", "public", "downloads", "appdata"),
         "CRITICAL: New Kernel Service created from a high-risk user-writable path. Isolate host immediately and check the driver file hash against LOLDrivers.io.",
         
         SampleMethod == "SecurityEvent_7045" and Count == 1,
-        "HIGH: New Service creation detected via API (Event 7045). Investigate the process that triggered this API call; this could be a stealthy implant.",
+        "HIGH: New Service created via API (Event 7045). Investigate the parent process for stealthy API-driven execution. Validate the signed publisher.",
         
-        "MEDIUM: New service created by a utility. Validate service legitimacy, publisher, and ensure the driver file is digitally signed and known."
+        SampleMethod == "Process_SC_Utility",
+        "HIGH: New Service created via Command Line Utility (sc.exe/wmic.exe). Validate the legitimacy of the user/script that initiated the command.",
+        
+        "MEDIUM: New service created. Validate the service's purpose and ensure the driver file is digitally signed and known."
     )
-| project FirstSeen, LastSeen, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count, HunterDirective
+| project FirstSeen, LastSeen, Severity=HunterDirective, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count
 | order by FirstSeen asc
