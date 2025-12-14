@@ -21,20 +21,6 @@
 //   - These are hunting queries first. Promote to analytics once tuned per tenant.
 ////////////////////////////////////////////////////////////////////////////////
 
-
-////////////////////////////////////////////////////////////////////////////////
-// 1) OAuth_Consent_Abuse_V4
-//    New high-risk grants + basic risk engine
-//
-// Idea:
-//   - Focus on *successful* grants that introduce dangerous scopes/roles.
-//   - Weight permissions heavily (they define blast radius).
-//   - Treat publisher/app allowlists as suppressors, not hard bypasses.
-//   - Add context (usage, UA) as supporting risk, not the core driver.
-//
-// MITRE: TA0001, TA0003, T1078, T1550.001
-////////////////////////////////////////////////////////////////////////////////
-
 let ConsentLookback      = 30d;  // How far back to look for new grants
 let UsageLookback        = 7d;   // Shorter window for "is the app actually doing anything?"
 let ConsentRiskThreshold = 10;   // Keep low enough for hunts, adjust for production
