@@ -1,0 +1,67 @@
+// ============================================================================
+// L3_BYOVD_Service_Creation_Detection 
+// Author: Ala Dabat
+// Purpose: Detect the creation of new kernel/driver services using all available data sources (T1543.003, T1569.002).
+// Data: SecurityEvent (7045), DeviceProcessEvents, DeviceRegistryEvents
+// MITRE: T1543.003 (Windows Service), T1569.002 (Service Execution)
+// ============================================================================
+
+let lookback = 7d;
+let DriverExtensions = dynamic([".sys", ".dll", ".dat", ".tmp"]);
+
+// --- 1. Define all Service Creation Events from high-fidelity sources ---
+let ServiceEvents =
+union
+(
+    // Method 1: Security Event ID 7045 (Highest Fidelity - API usage)
+    SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 7045
+    | extend 
+        SvcTime = TimeGenerated,
+        ImagePath = tostring(parse_json(EventData).ImagePath),
+        SvcName = tostring(parse_json(EventData).ServiceName),
+        CreationMethod = "SecurityEvent_7045"
+    | project DeviceName = Computer, SvcTime, ImagePath, SvcName, CreationMethod, AccountName=SubjectUserName
+),
+(
+    // Method 2: Process Events (for command-line context)
+    DeviceProcessEvents 
+    | where Timestamp > ago(lookback)
+    | where FileName in~ ("sc.exe", "pnputil.exe", "wmic.exe")
+    | where ProcessCommandLine has_any ("create", "driver", "kernel", ".sys")
+    | extend 
+        SvcTime = Timestamp,
+        ImagePath = extract_regex(@"(?i)binPath\s*=\s*(.*?)\s", 1, ProcessCommandLine), // Attempt to extract the path
+        SvcName = extract_regex(@"(?i)create\s*([a-zA-Z0-9_-]+)\s", 1, ProcessCommandLine), // Attempt to extract the name
+        CreationMethod = "Process_SC_Utility"
+    | project DeviceName, SvcTime, ImagePath, SvcName, CreationMethod, AccountName=InitiatingProcessAccountName
+);
+
+
+// --- 2. FINAL AGGREGATION, FILTERING, AND DIRECTIVES ---
+ServiceEvents
+// Filter for potential driver/rootkit file paths
+| where ImagePath has_any (DriverExtensions)
+// Filter out noise from trusted service installers (e.g., TrustedInstaller.exe)
+| where AccountName !startswith "NT AUTHORITY" or InitiatingProcessFileName !in~ ("TrustedInstaller.exe", "msiexec.exe", "setup.exe")
+// Aggregate and de-duplicate events for a single, comprehensive alert
+| summarize 
+    Count=count(), 
+    FirstSeen=min(SvcTime), 
+    LastSeen=max(SvcTime), 
+    SampleMethod=any(CreationMethod), 
+    SamplePath=any(ImagePath) 
+    by DeviceName, SvcName, AccountName
+| extend HunterDirective = 
+    case(
+        SamplePath contains "temp" or SamplePath contains "public" or SamplePath contains "downloads",
+        "CRITICAL: New Kernel Service created from a high-risk user-writable path. Isolate host immediately and check the driver file hash against LOLDrivers.io.",
+        
+        SampleMethod == "SecurityEvent_7045" and Count == 1,
+        "HIGH: New Service creation detected via API (Event 7045). Investigate the process that triggered this API call; this could be a stealthy implant.",
+        
+        "MEDIUM: New service created by a utility. Validate service legitimacy, publisher, and ensure the driver file is digitally signed and known."
+    )
+| project FirstSeen, LastSeen, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count, HunterDirective
+| order by FirstSeen asc
