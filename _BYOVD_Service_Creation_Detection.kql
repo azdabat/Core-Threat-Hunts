@@ -1,11 +1,12 @@
 // ============================================================================
-// L3_BYOVD_Service_Creation_Detection 
+// L3_BYOVD_Service_Creation_Detection (Toggle-Ready Production Rule)
 // Author: Ala Dabat
 // Purpose: Detect the creation of new kernel/driver services using all available data sources (T1543.003, T1569.002).
 // Data: SecurityEvent (7045), DeviceProcessEvents, DeviceRegistryEvents
 // MITRE: T1543.003 (Windows Service), T1569.002 (Service Execution)
-// Noise supression optional if you remove Event ID, but lower fedelity. If you create a comprehensive whitelist the rule will become "ideal"
+// Toggle: Use '//' to comment out the 'SecurityEvent' line for lower noise.
 // ============================================================================
+
 let lookback = 7d;
 let DriverExtensions = dynamic([".sys", ".dll", ".dat", ".tmp"]);
 
@@ -25,7 +26,7 @@ union
     | where TimeGenerated > ago(lookback)
     | where EventID == 7045
     // Internal Noise Filter: Exclude known, trusted system accounts (E.g., Windows updates, SCM)
-    | where SubjectUserName !startswith "NT AUTHORITY" or SubjectUserName in ("AdminUser1", "ServiceAccount_Monitor") // Custom inclusion for known safe users
+    | where SubjectUserName !startswith "NT AUTHORITY" or SubjectUserName in ("AdminUser1", "ServiceAccount_Monitor")
     | extend 
         SvcTime = TimeGenerated,
         ImagePath = tostring(parse_json(EventData).ImagePath),
@@ -46,7 +47,6 @@ union
         CreationMethod = "Process_SC_Utility"
     | project DeviceName, SvcTime, ImagePath, SvcName, CreationMethod, AccountName=InitiatingProcessAccountName
 )
-// NOTE: Registry Events are omitted here as they are covered by the high-fidelity Event 7045.
 | where ImagePath has_any (DriverExtensions) // Filter for files with driver/loader extensions
 | where SvcName !in~ (TrustedServices) // APPLY THE WHITELIST
 | summarize arg_max(SvcTime, *) by DeviceName, SvcName; // De-duplicate
@@ -76,19 +76,24 @@ ServiceEvents
 | project FirstSeen, LastSeen, Severity=HunterDirective, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count
 | order by FirstSeen asc
 
-~~~
-# Incident Response
+/*
+===============================================================================
+INCIDENT RESPONSE AND MITIGATION NOTES (BYOVD SERVICE CREATION)
+===============================================================================
 
-1. Monitor service creation from non-admin accounts
+This alert signals the final stage of a Bring Your Own Vulnerable Driver (BYOVD) attack: the attacker has dropped and loaded a malicious or vulnerable driver to achieve SYSTEM/Kernel privileges.
 
-2. Alert on kernel drivers loading from temp directories
+### Triage / Prioritization:
+1.  **CRITICAL Alerts:** Immediately isolate the host. Focus on drivers loaded from /Temp or user-writable paths.
+2.  **HIGH Alerts:** Check the Publisher/Signer of the driver file (SamplePath). If the signer is revoked or unknown, proceed with isolation.
 
-3. Baseline normal IOCTL patterns for critical drivers
+### Containment Steps (Analyst Actions):
+1.  **Extract File:** Get the hash (SHA256) of the file at the 'SamplePath'. Upload to VirusTotal and check against LOLDrivers.io.
+2.  **Kill Persistence:** If the driver is still running, attempt to stop and delete the service, and delete the corresponding .sys file from disk.
+3.  **Check Callbacks:** Investigate kernel callback modifications (PsCallbacks, ObCallbacks) if possible, as the driver may have tampered with EDR.
 
-4. Implement driver allow-listing for critical systems
-
-5. Monitor kernel callback modifications (PsCallbacks, ObCallbacks)
-
-6. Use HVCI/Memory Integrity to prevent driver-based code execution
-
-7. Deploy driver block policies via WDAC
+### Mitigation / Defense Improvement (Proactive):
+1.  **Driver Block Policies (WDAC):** Implement Windows Defender Application Control (WDAC) policies to block known vulnerable driver hashes (LOLDrivers list).
+2.  **Memory Integrity:** Ensure HVCI/Memory Integrity is enabled on all critical systems to prevent driver-based code execution.
+3.  **Monitor IOCTL:** Baseline normal IOCTL patterns for critical drivers and alert on anomalies, as this is the actual exploitation vector.
+*/
