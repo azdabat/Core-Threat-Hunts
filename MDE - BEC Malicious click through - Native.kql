@@ -1,0 +1,82 @@
+///////////////////////////////////////////////////////////////////////////////
+// BEC / SafeLinks Click-Through Detection (Native KQL – No TI)
+// Author: Ala Dabat
+// Version: 2025-11
+// Purpose: Detect users who clicked URLs inside delivered emails (SafeLinks).
+// Tables used: EmailEvents, UrlClickEvents
+///////////////////////////////////////////////////////////////////////////////
+
+let lookback = 7d;
+
+//
+// 1. Delivered emails within the lookback window
+//
+let DeliveredEmails =
+EmailEvents
+| where TimeGenerated >= ago(lookback)
+| where DeliveryAction == "Delivered"
+| project
+    EmailTime       = TimeGenerated,
+    NetworkMessageId,
+    RecipientEmailAddress,
+    SenderFromAddress,
+    Subject,
+    AttachmentCount,
+    DeliveryAction;
+
+//
+// 2. URL click events (SafeLinks clicks)
+// Includes: ClickAllowed (bypassed) and ClickBlocked (user attempted, but blocked)
+//
+let UrlClicks =
+UrlClickEvents
+| where TimeGenerated >= ago(lookback)
+| where ActionType in ("ClickAllowed","ClickBlocked")
+| project
+    ClickTime       = TimeGenerated,
+    NetworkMessageId,
+    RecipientEmailAddress,
+    Url,
+    ActionType;
+
+//
+// 3. Join delivered emails with corresponding SafeLinks clicks
+//
+let EmailClickThrough =
+DeliveredEmails
+| join kind=inner (UrlClicks)
+    on NetworkMessageId, RecipientEmailAddress
+| extend
+    ClickedDomain = tostring(parse_url(Url).Host),
+    ClickDelay    = ClickTime - EmailTime
+| project
+    ClickTime,
+    RecipientEmailAddress,
+    SenderFromAddress,
+    Subject,
+    Url,
+    ClickedDomain,
+    ActionType,
+    ClickDelay,
+    AttachmentCount,
+    DeliveryAction;
+
+//
+// 4. Add behavioural scoring (native only – no TI)
+//
+EmailClickThrough
+| extend
+    RiskScore = case(
+        ActionType == "ClickAllowed" and AttachmentCount > 0, 3,
+        ActionType == "ClickAllowed",                       2,
+        ActionType == "ClickBlocked",                       1,
+        0
+    )
+| extend
+    ThreatHunterDirective = case(
+        ActionType == "ClickAllowed", "Review user activity, confirm intent, check endpoint for post-click behaviour.",
+        ActionType == "ClickBlocked", "Validate why SafeLinks blocked the URL and confirm no secondary payloads.",
+        "No action recorded."
+    )
+| order by ClickTime desc
+
