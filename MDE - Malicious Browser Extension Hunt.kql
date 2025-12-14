@@ -1,0 +1,160 @@
+// ==============================================
+//  Browser Extension Threat Hunt with External CSV Feed
+//  Feed Source: https://github.com/mthcht/awesome-lists/tree/main/Lists/Browser%20Extensions
+//  Author: Ala Dabat
+//  Purpose: Detect potentially malicious or unsanctioned Chrome/Edge extensions
+//  Integrates: external CSV feed, device telemetry, MISP/OpenCTI context, ATT&CK mappings
+// ==============================================
+
+// ===== Parameters =====
+let lookback = 14d;
+let feed_url = "https://raw.githubusercontent.com/mthcht/awesome-lists/refs/heads/main/Lists/Browser%20Extensions/browser_extensions_list.csv";
+let exclude_types = dynamic(["sensitive", "deceptive"]); // categories we ignore (optional)
+let ApprovedExtensionsWatchlist = "ApprovedBrowserExtensions"; // columns: ExtensionID, Reason
+let ApprovedForceInstallWatchlist = "ApprovedForceInstall";    // columns: ExtensionID, Reason
+
+// ===== External Feed (structure validated) =====
+let MaliciousExtensions =
+materialize(
+    externaldata(
+        browser_extension:string,
+        browser_extension_id:string,
+        metadata_category:string,
+        metadata_type:string,
+        metadata_link:string,
+        metadata_comment:string
+    )
+    [feed_url]
+    with (format="csv", ignoreFirstRecord=true)
+    // Normalize and clean
+    | extend NormalizedExtensionID = tolower(trim(" ", browser_extension_id))
+    | where isnotempty(NormalizedExtensionID)
+    | where NormalizedExtensionID matches regex @"^[a-z]{32}$"   // only valid Chrome/Edge IDs
+    | where tolower(metadata_type) !in (exclude_types)
+    | project NormalizedExtensionID, browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment
+);
+
+// ===== Watchlist Allowlists =====
+let ApprovedExt =
+    (_GetWatchlist(ApprovedExtensionsWatchlist)
+    | project ApprovedID = tolower(tostring(ExtensionID)), ApprovedReason = tostring(Reason));
+
+let ApprovedForce =
+    (_GetWatchlist(ApprovedForceInstallWatchlist)
+    | project ApprovedID = tolower(tostring(ExtensionID)), ApprovedReason = tostring(Reason));
+
+// ===== Artifact 1: CRX installer files dropped =====
+let CrxDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "FileCreated" and FileName endswith ".crx"
+| extend NormalizedExtractedID = tolower(extract(@"([a-z]{32})", 1, FileName))
+| where isnotempty(NormalizedExtractedID)
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, SHA256, ArtifactType="CRXCreate", NormalizedExtractedID;
+
+// ===== Artifact 2: Extension directory creation =====
+let ExtFolderCreates =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated", "FolderCreated")
+| where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
+| extend NormalizedExtractedID = tolower(extract(@"\\Extensions\\([a-z]{32})\\", 1, FolderPath))
+| where isnotempty(NormalizedExtractedID)
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, SHA256, ArtifactType="ExtFolder", NormalizedExtractedID;
+
+// ===== Artifact 3: Manifest.json writes =====
+let ManifestWrites =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated", "FileModified") and FileName =~ "manifest.json"
+| where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
+| extend NormalizedExtractedID = tolower(extract(@"\\Extensions\\([a-z]{32})\\", 1, FolderPath))
+| where isnotempty(NormalizedExtractedID)
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, SHA256, ArtifactType="Manifest", NormalizedExtractedID;
+
+// ===== Artifact 4: Policy force-installs (enterprise persistence) =====
+let PolicyForceInstall =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("RegistryValueSet","RegistryValueAdded")
+| where (RegistryKey startswith @"HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
+     or  RegistryKey startswith @"HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist")
+| extend NormalizedExtractedID = tolower(extract(@"([a-z]{32})", 1, tostring(RegistryValueData)))
+| where isnotempty(NormalizedExtractedID)
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RegistryKey, RegistryValueName, RegistryValueData, ArtifactType="PolicyForce", NormalizedExtractedID;
+
+// ===== Union all artifacts and join feed =====
+union CrxDrops, ExtFolderCreates, ManifestWrites, PolicyForceInstall
+| join kind=inner MaliciousExtensions on $left.NormalizedExtractedID == $right.NormalizedExtensionID
+| join kind=leftouter (
+    DeviceInfo
+    | project DeviceId, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags
+) on DeviceId
+| join kind=leftouter (ApprovedExt)  on $left.NormalizedExtractedID == $right.ApprovedID
+| join kind=leftouter (ApprovedForce) on $left.NormalizedExtractedID == $right.ApprovedID
+| where isnull(ApprovedExt.ApprovedID) and not(ArtifactType=="PolicyForce" and isnotnull(ApprovedForce.ApprovedID))
+
+// ===== Enrichments and scoring =====
+| extend
+    ChromeWebStore = strcat("https://chrome.google.com/webstore/detail/", browser_extension, "/", NormalizedExtractedID),
+    EdgeAddonsStore = strcat("https://microsoftedge.microsoft.com/addons/detail/", browser_extension, "/", NormalizedExtractedID),
+    CRXcavator = strcat("https://crxcavator.io/report/", NormalizedExtractedID),
+    VT_Link = iif(isnotempty(SHA256), strcat("https://www.virustotal.com/gui/file/", SHA256), ""),
+    BaseScore = case(
+        tolower(metadata_category) has_any ("malware","stealer","adware","cryptominer","c2","hijacker"), 2,
+        tolower(metadata_category) has_any ("tracking","grayware"), 1, 0),
+    ArtifactScore = case(ArtifactType == "PolicyForce", 2, ArtifactType in ("CRXCreate","ExtFolder","Manifest"), 1, 0),
+    ExpoScore = case(ExposureLevel =~ "High", 2, ExposureLevel =~ "Medium", 1, 0),
+    LoaderScore = case(
+        InitiatingProcessFileName in ("powershell.exe","wscript.exe","mshta.exe","rundll32.exe","cmd.exe","curl.exe"), 1, 0),
+    SevNum = 1 + BaseScore + ArtifactScore + ExpoScore + LoaderScore
+| extend Severity = case(SevNum >= 5, "CRITICAL", SevNum >= 4, "HIGH", SevNum >= 2, "MEDIUM", "LOW")
+| extend
+    MITRE_Tactics = "TA0003: Persistence, TA0005: Defense Evasion, TA0009: Collection, TA0010: Exfiltration",
+    MITRE_Techniques = case(
+        ArtifactType == "PolicyForce", "T1053/T1112 Policy Abuse, T1546 Event-triggered Execution",
+        "T1176 Browser Extensions, T1112 Modify Registry")
+
+// ===== Summarize results =====
+| summarize
+    FirstSeen=min(Timestamp),
+    LastSeen=max(Timestamp),
+    EventCount=count(),
+    SampleLoader=arg_max(Timestamp, InitiatingProcessFileName),
+    SampleCmd=arg_max(Timestamp, InitiatingProcessCommandLine),
+    AnySHA256=any(SHA256),
+    AnyFolder=any(FolderPath),
+    AnyFileName=any(FileName),
+    AnyRegKey=any(RegistryKey),
+    AnyRegValue=any(RegistryValueData)
+    by DeviceId, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags,
+       NormalizedExtractedID, browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment,
+       ArtifactType, Severity, MITRE_Tactics, MITRE_Techniques, ChromeWebStore, EdgeAddonsStore, CRXcavator, VT_Link
+
+// ===== Hunter Directives =====
+| extend HuntingDirectives = pack_array(
+    strcat("1) Validate extension '", browser_extension, "' (", NormalizedExtractedID, ") on ", DeviceName),
+    strcat("2) Review loader: ", tostring(SampleLoader), " | CmdLine: ", tostring(SampleCmd)),
+    strcat("3) Check install artifact: ", ArtifactType, " (", tostring(AnyFileName), ") in ", tostring(AnyFolder)),
+    "4) Scope across environment using extension ID.",
+    strcat("5) Enrich: Chrome=", ChromeWebStore, " | Edge=", EdgeAddonsStore, " | CRXcavator=", CRXcavator),
+    strcat("6) Review permissions in CRXcavator; compare to category/type: ", metadata_category, "/", metadata_type),
+    "7) If unsanctioned, remove extension and block via policy.",
+    "8) For PolicyForce installs, remediate GPO/MDM setting and audit policy change source.",
+    "9) Hunt for browser exfil activity in proxy and EDR logs.",
+    "10) Add extension ID to MISP watchlist and TI feedback loop."
+)
+
+// ===== Final Output =====
+| project
+    FirstSeen, LastSeen, EventCount, Severity,
+    DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags,
+    ArtifactType, browser_extension, ExtensionID=NormalizedExtractedID,
+    metadata_category, metadata_type, metadata_comment, metadata_link,
+    SampleLoader, SampleCmd,
+    ChromeWebStore, EdgeAddonsStore, CRXcavator, VT_Link, HuntingDirectives
+| order by case(Severity=="CRITICAL",4, Severity=="HIGH",3, Severity=="MEDIUM",2, 1) desc, LastSeen desc
