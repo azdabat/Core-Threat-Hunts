@@ -1,0 +1,61 @@
+// ==========================================================
+// Rule: Userland_UnsignedBinary_L3_V5
+// Path: /Loaders/Userland_UnsignedBinary_L3_V5.kql
+// Purpose: Detect execution of unsigned binaries from user-writable paths
+// MITRE: TA0002, T1059, T1204
+// Notes: Generic loader/implant detector, ideal for EtherRAT and similar
+// Author: Ala Dabat
+// ==========================================================
+
+let Lookback = 72h;
+let UserPaths = dynamic([
+    "\\Users\\","\\AppData\\","\\Temp\\","\\Downloads\\",
+    "/home/","/tmp/","/var/tmp/"
+]);
+
+let DevHints = dynamic(["dev","build","ci","runner"]);
+
+// Unsigned binary execution in user writable paths
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FolderPath has_any (UserPaths)
+| extend Unsigned = iif(isempty(Signer) or Signer == "Unknown", 1, 0)
+| where Unsigned == 1
+| extend
+    IsDevHost = iif(DeviceName has_any (DevHints), 1, 0),
+    HasSuspiciousArgs = iif(ProcessCommandLine has_any (dynamic(["-enc","FromBase64String","http://","https://"])), 1, 0)
+| extend RiskScore =
+      0
+    + iif(IsDevHost == 0, 40, 0)
+    + iif(HasSuspiciousArgs == 1, 30, 0)
+| where RiskScore >= 40
+| extend Severity = case(
+        RiskScore >= 70, "P1 – Unsigned Loader Execution (Non-Dev Host)",
+        "P2 – Unsigned Binary in User Path"
+    ),
+    Hunter_Directive = case(
+        Severity startswith "P1",
+        "Acquire binary, calculate hash, submit to sandbox. Pivot to NetworkEvents for C2 and SecretsRecon for prior data access.",
+        "Confirm whether this binary is part of a dev/build toolchain. If not, treat as possible implant.",
+        "Review process tree and determine if linked to RCE or staging hunts."
+    ),
+    MITRE_Tactics = "Execution",
+    MITRE_Techniques = "T1059; T1204"
+| project
+    Timestamp,
+    DeviceName,
+    FileName,
+    FolderPath,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    Signer,
+    Unsigned,
+    IsDevHost,
+    HasSuspiciousArgs,
+    RiskScore,
+    Severity,
+    MITRE_Tactics,
+    MITRE_Techniques,
+    Hunter_Directive
+| order by RiskScore desc, Timestamp desc
