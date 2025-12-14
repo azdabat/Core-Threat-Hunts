@@ -73,3 +73,39 @@ ConsentEvents
     ConsentCount, 
     Publisher
 | sort by RiskScore desc, TimeGenerated desc
+
+// ============================================================================
+// Incident Response (Runbook) — OAuth Consent Abuse
+// Add these steps at the end so the hunt output is immediately actionable.
+// ============================================================================
+// 1) Validate the consent event
+//    - Confirm AppDisplayName/AppId, Initiator, IPAddress, UserAgent, and whether IsAdminConsent == 1.
+//    - Check if the app is new to the tenant and whether Publisher is expected (or "Unknown").
+//
+// 2) Scope impact triage
+//    - If GrantedScopes includes: Directory.ReadWrite.All / User.ReadWrite.All => treat as identity takeover risk.
+//    - If GrantedScopes includes: Mail.ReadWrite / Files.Read.All => treat as data access/exfil risk.
+//    - Map “what can be read/modified” to affected services (Exchange/SharePoint/OneDrive/Entra ID).
+//
+// 3) Containment (priority order)
+//    - Immediately revoke the app’s access: disable the service principal / remove OAuth grants / revoke admin consent.
+//    - Reset compromised user sessions and tokens (revoke refresh tokens) for Initiator and other consenting users.
+//    - If admin consent occurred: audit privileged roles and review recent role assignments.
+//    - Block suspicious source IPs (where appropriate) and enforce Conditional Access for risky sign-ins.
+//
+// 4) Hunt expansion / pivots (same AppId)
+//    - Pivot: list all users who consented to the same AppId within 7–30 days.
+//    - Pivot: review SigninLogs for the consenting users around TimeGenerated (impossible travel, unfamiliar locations/devices).
+//    - Pivot: review AuditLogs for “Add service principal”, “Update application”, “Add app role assignment”, “Grant consent”.
+//    - Pivot: check MailboxAudit / UnifiedAuditLog for abnormal mailbox access or mass download patterns post-consent.
+//
+// 5) Eradication & recovery
+//    - Remove the malicious app registration if tenant-owned; otherwise remove enterprise application and permissions.
+//    - Rotate secrets: impacted mailbox rules, OAuth tokens, and any credentials exposed via mail/file access.
+//    - Check for persistence: new inbox rules, forwarding, OAuth app re-consent attempts, new CA bypasses.
+//
+// 6) Lessons learned / hardening
+//    - Enforce admin consent workflow (require approval), restrict user consent, and limit allowed publishers.
+//    - Alert on bursty consent patterns (ConsentCount spikes) and risky scopes granted by non-admins.
+//    - Baseline “known-good” publishers/apps; maintain an allowlist for sanctioned integrations.
+// ============================================================================
