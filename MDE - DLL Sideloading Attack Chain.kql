@@ -1,0 +1,158 @@
+// ============================================================================
+// L3_DLL_BYOVD_High_Fidelity (DLL Sideloading & Persistence Hunt)
+// Author: Ala Dabat 
+// Purpose: Detect the full chain: File Drop/Download -> DLL Sideload -> Persistence.
+// Data: DeviceFileEvents, DeviceImageLoadEvents, DeviceRegistryEvents, DeviceNetworkEvents
+// MITRE: T1574.001 (DLL Sideloading), T1543.003 (Windows Service), T1105 (Ingress)
+// ============================================================================
+
+let lookback = 14d;
+let CorrelationWindow = 5m; // Tight time window for immediate execution/persistence
+let DormantDays = 7d;
+let WritableUserPaths = dynamic([
+    "c:\\programdata\\", "c:\\users\\", "c:\\temp\\", 
+    "c:\\windows\\temp\\", "c:\\windows\\tasks\\", "\\appdata\\local\\temp\\"
+]);
+
+// --- CONFIGURATION: WHITELISTS ---
+// Known benign files that often drop or load DLLs (E.g., VS Code, trusted installers)
+let BenignLoaders = dynamic(["code.exe", "msiexec.exe", "setup.exe", "trustedinstaller.exe"]);
+// Specific Registry Persistence keys for high-fidelity hunting
+let PersistenceKeys = dynamic([
+    "\\run\\", "\\runonce\\", "\\winlogon\\shell", "\\winlogon\\userinit", "\\currentversion\\windows\\load",
+    "\\services\\" // For driver/service persistence
+]);
+
+// ============================================================================
+// 1. CORE SPINE: File Drops (DLL or Driver)
+// Projects Process info (PID/Hash) to enable tight correlation.
+// ============================================================================
+let FileDrops = DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".dll" or FileName endswith ".sys"
+| where FolderPath has_any (WritableUserPaths)
+| extend DropperSHA1 = InitiatingProcessSHA1, DropperPid = InitiatingProcessId
+| project DropTime = Timestamp, DeviceId, DeviceName, FileName, FileHash=SHA1, FolderPath, 
+          IsDriver = iff(FileName endswith ".sys", 1, 0), DropperSHA1, DropperPid;
+
+// ============================================================================
+// 2. CORRELATION SOURCES (Linked by Time/Process Context)
+// ============================================================================
+
+// A. DLL Sideload Signature: Signed Executable loading from a Writable Path
+let SideloadLoads = DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where ImageFileName endswith ".dll"
+// T1574.001: Loader is SIGNED but Image Load Path is SUSPICIOUS
+| where InitiatingProcessSignatureStatus == "Signed" and InitiatingProcessFileName !in~ (BenignLoaders)
+| where FolderPath has_any (WritableUserPaths)
+| extend LoaderSHA1 = InitiatingProcessSHA1, LoaderPid = InitiatingProcessId
+| project LoadTime = Timestamp, DeviceId, ImageHash=SHA1, LoaderSHA1, LoaderPid;
+
+// B. High-Fidelity Registry Persistence
+let Persistence = DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where RegistryKey has_any (PersistenceKeys)
+| extend PersistenceSHA1 = InitiatingProcessSHA1, PersistencePid = InitiatingProcessId
+| project RegTime = Timestamp, DeviceId, PersistenceSHA1, PersistencePid, RegistryKey, RegistryValueData;
+
+// C. Network Downloads (Source of the payload)
+let Downloads = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemoteUrl has_any (".dll", ".sys", ".exe")
+| extend DownloaderSHA1 = InitiatingProcessSHA1, DownloaderPid = InitiatingProcessId
+| project DownloadTime = Timestamp, DeviceId, DownloaderSHA1, DownloaderPid, RemoteUrl;
+
+// ============================================================================
+// 3. CORRELATION & SCORING
+// ============================================================================
+FileDrops
+| join kind=leftouter (SideloadLoads) on DeviceId and $left.FileHash == $right.ImageHash
+| where isnull(LoadTime) or (LoadTime between (DropTime .. DropTime + CorrelationWindow))
+| extend HasSideload = iif(isnotempty(LoadTime), 1, 0)
+
+| join kind=leftouter (Persistence) on DeviceId and $left.DropperSHA1 == $right.PersistenceSHA1
+| where isnull(RegTime) or (RegTime between (DropTime .. DropTime + CorrelationWindow))
+| extend HasPersistence = iif(isnotempty(RegistryKey), 1, 0)
+
+| join kind=leftouter (Downloads) on DeviceId and $left.DropperSHA1 == $right.DownloaderSHA1
+| where isnull(DownloadTime) or (DownloadTime between (DownloadTime - CorrelationWindow .. DownloadTime))
+| extend HasDownload = iif(isnotempty(RemoteUrl), 1, 0)
+
+| extend ConfidenceScore =
+    0
+    + iif(HasSideload == 1, 4, 0)
+    + iif(HasPersistence == 1, 3, 0)
+    + iif(HasDownload == 1, 2, 0)
+    + iif(IsDriver == 1, 1, 0)
+    + iif(IsDriver == 1 and DropTime <= ago(DormantDays) and isnull(LoadTime) and HasPersistence == 1, 5, 0)
+
+| extend Severity = case(
+    ConfidenceScore >= 7, "CRITICAL",
+    ConfidenceScore >= 4, "HIGH",
+    "MEDIUM"
+)
+
+// ============================================================================
+// 4. FINAL PROJECTION & DIRECTIVES
+// ============================================================================
+| where ConfidenceScore >= 4
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+        strcat("CRITICAL: Full Killchain Detected (Sideload + Persistence/Dormancy). Immediate isolation required. Persistence Key: ", tostring(RegistryKey)),
+    HasSideload == 1 and HasPersistence == 1,
+        strcat("HIGH: Confirmed DLL Sideload (T1574.001) followed by Registry Persistence (T1547.001). Review loader process PID and network connections."),
+    IsDriver == 1 and DropTime <= ago(DormantDays) and HasPersistence == 1,
+        strcat("HIGH: Dormant BYOVD Driver (", FileName, ") with Confirmed Persistence. Driver load for kernel exploitation is likely imminent."),
+    HasSideload == 1,
+        strcat("HIGH: Confirmed DLL Sideloading. Signed binary loaded ", FileName, " from user path. Investigate parent process and execution chain."),
+    "MEDIUM: Correlated file drop and persistence, but execution not confirmed."
+)
+| project
+    DropTime, LoadTime, RegTime,
+    Severity, DeviceName, AccountName=InitiatingProcessAccountName,
+    FileName, FolderPath, FileHash,
+    SideloadSignature = iif(HasSideload==1, "SIGNED_EXE_LOADED_FROM_USER_PATH", "N/A"),
+    HasPersistence, HasDownload, IsDriver,
+    ConfidenceScore, HunterDirective
+| order by DropTime desc
+
+// ============================================================================
+// INCIDENT RESPONSE, REMEDIATION & RECOMMENDED ACTIONS (SOC RUNBOOK)
+// ============================================================================
+// 1) Immediate triage
+//    - Confirm Severity and ConfidenceScore; treat CRITICAL as active compromise.
+//    - Identify loader executable, dropped DLL/driver, persistence key, and source URL.
+//    - Validate digital signatures for both loader and payload.
+//
+// 2) Containment
+//    - Immediately isolate the affected host for CRITICAL findings.
+//    - Suspend the user account associated with InitiatingProcessAccountName if compromised.
+//    - Block observed RemoteUrl / IPs and related infrastructure if malicious.
+//
+// 3) Eradication
+//    - Remove registry persistence keys identified in RegistryKey.
+//    - Delete dropped DLL/driver after forensic collection (hash, path, PE metadata).
+//    - If IsDriver == 1, uninstall and block the driver; check for BYOVD matches (e.g., known vulnerable drivers).
+//
+// 4) Forensic follow-ups
+//    - Pivot on FileHash, LoaderSHA1, and DropperSHA1 across the environment.
+//    - Review DeviceProcessEvents for post-load activity (injection, credential access, tampering).
+//    - Review DeviceNetworkEvents for C2 or secondary payload retrieval.
+//
+// 5) Recovery
+//    - Reimage the system if kernel driver execution is confirmed or suspected.
+//    - Reset credentials for affected users and service accounts.
+//    - Validate system integrity (SFC, driver inventory, EDR health).
+//
+// 6) Hardening & prevention
+//    - Enforce DLL search order protections and application directory ACL hardening.
+//    - Enable WDAC / Smart App Control and block unsigned or user-path DLL loads.
+//    - Enable HVCI / Memory Integrity to reduce BYOVD and kernel exploitation risk.
+//    - Maintain an allowlist of legitimate loaders and expected DLL locations.
+//
+// 7) Threat hunting expansion
+//    - Hunt for dormant drivers dropped > DormantDays with persistence but no load.
+//    - Hunt for signed binaries loading DLLs from writable paths without installers.
+//    - Track repeated sideload attempts across different signed loaders.
+// ============================================================================
