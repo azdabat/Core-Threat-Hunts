@@ -1,0 +1,150 @@
+// ============================================================================
+// L3_HTTPS_C2_JITTER_BEACON_HUNT 
+// Author: Ala Dabat 
+// Purpose:
+//   Hunt for outbound HTTPS connections with timing/payload characteristics of C2 beaconing.
+//   Uses statistical analysis (Jitter Ratio, Avg Interval) for high-fidelity detection.
+// Data Sources: DeviceNetworkEvents
+// MITRE: TA0011 Command and Control, TA0005 Defense Evasion
+// ============================================================================
+
+let lookback = 24h;
+let min_connections = 20;      // exclude low-volume noise
+let max_payload_bytes = 50000; // remove bulk data transfers
+
+// --- CONFIGURATION: EXCLUSION LIST (NOISE REDUCTION) ---
+// Processes known to beacon legitimately or have high, benign periodic traffic.
+let BenignProcessExclusions = dynamic([
+    "chrome.exe", "msedge.exe", "firefox.exe", 
+    "teams.exe", "outlook.exe", 
+    "onedrive.exe", "dropbox.exe", "googledrivesync.exe", // Cloud sync
+    "audiodg.exe", "vmtoolsd.exe", "wmiapsrv.exe", // System processes
+    "zoom.exe", "skype.exe", "slack.exe", // Collaboration
+    "sogoucloud.exe", "nfsclient.exe", "java.exe", // Add more specific noisy software here
+    "defendersecurity.exe", "csc.exe", "powershell.exe" // Common system updaters/scripts
+]);
+
+// Stage 1 — Outbound HTTPS flows (non-browser, non-system)
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 443
+| where Protocol == "Tcp"
+| where isnotempty(RemoteIP)
+// Apply the exclusion list
+| where InitiatingProcessFileName !in~ (BenignProcessExclusions)
+| extend TotalBytes = tolong(SentBytes) + tolong(ReceivedBytes)
+| where TotalBytes <= max_payload_bytes
+| project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessParentFileName, TotalBytes;
+
+// Stage 2 — Interval statistics (Calculate timing metrics)
+Net
+| sort by DeviceId, RemoteIP, InitiatingProcessFileName asc, Timestamp asc
+| extend PrevTime = prev(Timestamp),
+         IntervalSec = datetime_diff("second", Timestamp, PrevTime)
+| where IntervalSec > 0
+| summarize
+    ConnectionCount       = count(),
+    AvgIntervalSec        = avg(IntervalSec),
+    MinIntervalSec        = min(IntervalSec),
+    MaxIntervalSec        = max(IntervalSec),
+    StdDevIntervalSec     = stdev(IntervalSec),
+    AvgBytes              = avg(TotalBytes),
+    FirstSeen             = min(Timestamp),
+    LastSeen              = max(Timestamp),
+    SampleProcess         = any(InitiatingProcessFileName),
+    SampleCommand         = any(InitiatingProcessCommandLine),
+    SampleParent          = any(InitiatingProcessParentFileName)
+  by DeviceName, RemoteIP
+
+// Stage 3 — Noise control + scoring
+| where ConnectionCount >= min_connections
+| extend
+    JitterRatio = iif(AvgIntervalSec > 0, StdDevIntervalSec / AvgIntervalSec, 0.0),
+    BeaconScore =
+          iif(AvgIntervalSec between (10 .. 3600), 20, 0)       // typical beacon window (10s to 1h)
+        + iif(JitterRatio between (0.02 .. 0.50), 20, 0)        // C2 jitter (0.02 is slightly randomized)
+        + iif(AvgBytes <= 5000, 10, 0)                          // very small payloads
+        + iif(ConnectionCount >= 40, 10, 0),
+
+    Severity = case(
+        BeaconScore >= 45, "CRITICAL", // Jitter + Interval + Payload/Count
+        BeaconScore >= 30, "HIGH",
+        BeaconScore >= 20, "MEDIUM",
+        "INFO"
+    ),
+
+    HunterDirective = case(
+        Severity == "CRITICAL", strcat("CRITICAL: Confirmed high-jitter beacon. IP ", RemoteIP, " contacted over ", ConnectionCount, " times by ", SampleProcess, ". IMMEDIATE ISOLATION."),
+        Severity == "HIGH", strcat("HIGH: Suspicious timed beacon with low jitter. Confirm RemoteIP is not a legitimate cloud service or software updater."),
+        Severity == "MEDIUM", strcat("MEDIUM: Baseline deviation in network flow timing. Investigate SampleProcess and network traffic details."),
+        "INFO: Baseline network flow detected."
+    ),
+
+    KillChain = "TA0011 — Command & Control"
+
+// Projection
+| project
+    Severity,
+    BeaconScore,
+    DeviceName,
+    RemoteIP,
+    ConnectionCount,
+    AvgIntervalSec,
+    StdDevIntervalSec,
+    JitterRatio,
+    AvgBytes,
+    SampleProcess,
+    SampleCommand,
+    SampleParent,
+    FirstSeen,
+    LastSeen,
+    KillChain,
+    HunterDirective
+| order by BeaconScore desc, ConnectionCount desc
+
+/*
+============================================================================
+INCIDENT RESPONSE, REMEDIATION & RECOMMENDED ACTIONS (SOC RUNBOOK)
+============================================================================
+
+This alert signifies a high-confidence C2 beacon, where a process (SampleProcess) is maintaining contact with a remote server (RemoteIP) at fixed, often randomized, intervals, a key behavior of malware like EtherRat.
+
+### 1) Immediate Triage
+* **Confirm Severity and ConfidenceScore;** treat CRITICAL as active compromise.
+* **Verify IP:** Check the RemoteIP on VirusTotal, AlienVault, and external blacklists. If the IP is known bad, immediately proceed to isolation.
+* **Validate Process:** Check the SampleProcess (e.g., svchost.exe, a renamed binary) to ensure it is not on the BenignProcessExclusions list.
+* **Check Parent:** Review SampleParent to determine the execution source (e.g., was it spawned by a web server or a malicious script?).
+
+### 2) Containment
+* **Immediately isolate the affected host** for CRITICAL/HIGH findings.
+* **Block the observed RemoteIP / Hosts** at the network perimeter (firewall/proxy).
+* **Suspend the user account** associated with the compromise if the initiating process was user-initiated.
+
+### 3) Eradication
+* **Terminate the SampleProcess** that initiated the C2 beacon.
+* **Extract File Hash:** Obtain the SHA256 hash of the SampleProcess file.
+* **Check Persistence:** Pivot to DeviceRegistryEvents and DeviceFileEvents to check if the SampleProcess installed persistence (Run key, Service creation). Remove persistence mechanism.
+
+### 4) Forensic Follow-ups
+* **Pivot on FileHash** of the SampleProcess across the environment to find other infected hosts.
+* **Review Process Events** (DeviceProcessEvents) for the SampleProcess leading up to the C2 activity (e.g., was it dropped by IEX or cURL?).
+* **Review Proxies/DNS Logs** for any associated hostname if the IP is known.
+
+### 5) Recovery
+* **Reimage the system** to ensure all persistent components are removed.
+* **Reset credentials** for affected users and service accounts.
+* **Validate EDR health** to ensure it was not tampered with.
+
+### 6) Hardening & Prevention
+* **Implement Network Segmentation:** Limit which devices can communicate outbound to the internet, especially servers.
+* **Restrict Port 443:** Use HTTPS inspection/decryption tools where feasible to examine payload contents.
+* **Maintain and update the BenignProcessExclusions list** to continuously lower false positives.
+
+### 7) Threat hunting expansion
+* **Hunt for C2 from processes with low reputation.**
+* **Hunt for RPC/DNS over HTTPS (DoH) anomalies** as alternative C2 methods.
+* **Hunt for lateral movement** originating from the infected host.
+*/
