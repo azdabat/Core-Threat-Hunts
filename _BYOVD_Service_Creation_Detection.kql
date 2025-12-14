@@ -76,24 +76,24 @@ ServiceEvents
 | project FirstSeen, LastSeen, Severity=HunterDirective, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count
 | order by FirstSeen asc
 
-/*
+
 ===============================================================================
 INCIDENT RESPONSE AND MITIGATION NOTES (BYOVD SERVICE CREATION)
 ===============================================================================
 
-This alert signals the final stage of a Bring Your Own Vulnerable Driver (BYOVD) attack: the attacker has dropped and loaded a malicious or vulnerable driver to achieve SYSTEM/Kernel privileges.
+//This alert signals the final stage of a Bring Your Own Vulnerable Driver (BYOVD) attack: the attacker has dropped and loaded a malicious or vulnerable driver to achieve SYSTEM/Kernel privileges.
 
-### Triage / Prioritization:
-1.  **CRITICAL Alerts:** Immediately isolate the host. Focus on drivers loaded from /Temp or user-writable paths.
-2.  **HIGH Alerts:** Check the Publisher/Signer of the driver file (SamplePath). If the signer is revoked or unknown, proceed with isolation.
+//### Triage / Prioritization:
+//1.  **CRITICAL Alerts:** Immediately isolate the host. Focus on drivers loaded from /Temp or user-writable paths.
+//2.  **HIGH Alerts:** Check the Publisher/Signer of the driver file (SamplePath). If the signer is revoked or unknown, proceed with isolation.
 
-### Containment Steps (Analyst Actions):
-1.  **Extract File:** Get the hash (SHA256) of the file at the 'SamplePath'. Upload to VirusTotal and check against LOLDrivers.io.
-2.  **Kill Persistence:** If the driver is still running, attempt to stop and delete the service, and delete the corresponding .sys file from disk.
-3.  **Check Callbacks:** Investigate kernel callback modifications (PsCallbacks, ObCallbacks) if possible, as the driver may have tampered with EDR.
+//### Containment Steps (Analyst Actions):
+//1.  **Extract File:** Get the hash (SHA256) of the file at the 'SamplePath'. Upload to VirusTotal and check against LOLDrivers.io.
+//2.  **Kill Persistence:** If the driver is still running, attempt to stop and delete the service, and delete the corresponding .sys file from disk.
+//3.  **Check Callbacks:** Investigate kernel callback modifications (PsCallbacks, ObCallbacks) if possible, as the driver may have tampered with EDR.
 
 ### Mitigation / Defense Improvement (Proactive):
-1.  **Driver Block Policies (WDAC):** Implement Windows Defender Application Control (WDAC) policies to block known vulnerable driver hashes (LOLDrivers list).
-2.  **Memory Integrity:** Ensure HVCI/Memory Integrity is enabled on all critical systems to prevent driver-based code execution.
-3.  **Monitor IOCTL:** Baseline normal IOCTL patterns for critical drivers and alert on anomalies, as this is the actual exploitation vector.
-*/
+//1.  **Driver Block Policies (WDAC):** Implement Windows Defender Application Control (WDAC) policies to block known vulnerable driver hashes (LOLDrivers list).
+//2.  **Memory Integrity:** Ensure HVCI/Memory Integrity is enabled on all critical systems to prevent driver-based code execution.
+//3.  **Monitor IOCTL:** Baseline normal IOCTL patterns for critical drivers and alert on anomalies, as this is the actual exploitation vector.
+
