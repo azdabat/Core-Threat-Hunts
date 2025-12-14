@@ -1,0 +1,109 @@
+///////////////////////////////////////////////////////////////////////////////////////////////
+// L3_Azure_RunCommand_Abuse (Core+ Hunt)
+// Purpose: Detect Azure VM RunCommand / CustomScriptExtension executed via ARM by unexpected identity,
+//          with suspicious command content (base64/powershell/downloads).
+//
+// Data sources:
+//   - Sentinel: AzureActivity (control plane), optionally AzureDiagnostics (if routed)
+//   - Optional enrichment: AuditLogs (identity context for SPNs/users)
+//
+// Notes:
+//   - Azure RunCommand typically appears as Microsoft.Compute/virtualMachines/runCommand/action
+//   - CustomScriptExtension appears as Microsoft.Compute/virtualMachines/extensions/write (publisher/type varies)
+//   - Command content may be present in Properties (AzureActivity) or in AzureDiagnostics payload, depending on routing.
+//
+// TTPs: T1021.002 (remote services), T1059.001 (PowerShell), T1105 (Ingress Tool Transfer), T1140 (Deobfuscate/Decode), T1569.003 (Service Execution)
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+let lookback = 14d;
+let rarityWindow = 30d;
+
+let suspiciousCmdTokens = dynamic([
+  "powershell","pwsh","cmd.exe","bash","sh -c","curl ","wget ",
+  "invoke-webrequest","iwr ","irm ","downloadstring","downloadfile",
+  "frombase64string","base64","certutil","bitsadmin",
+  "-enc","-encodedcommand","mshta","rundll32","regsvr32"
+]);
+
+// --- ORG-WIDE BASELINE: identities that EVER used RunCommand
+let OrgRunCommandInitiators =
+AzureActivity
+| where TimeGenerated > ago(rarityWindow)
+| where OperationNameValue has "runCommand"
+| summarize InitiatorSeen=count() by Caller;
+
+// --- ORG-WIDE BASELINE: command token frequency
+let OrgCommandTokenBaseline =
+AzureActivity
+| where TimeGenerated > ago(rarityWindow)
+| where OperationNameValue has "runCommand"
+| extend Props=parse_json(tostring(Properties))
+| extend Cmd=tostring(Props.properties.commandToExecute)
+| extend CmdLower=tolower(Cmd)
+| mv-expand Token=suspiciousCmdTokens
+| where CmdLower has Token
+| summarize TokenSeen=count() by Token;
+
+// --- MAIN HUNT
+AzureActivity
+| where TimeGenerated > ago(lookback)
+| where OperationNameValue has_any ("runCommand","extensions/write")
+| extend Props=parse_json(tostring(Properties))
+| extend CmdText=coalesce(
+      tostring(Props.properties.commandToExecute),
+      tostring(Props.commandId),
+      tostring(Properties)
+  )
+| extend CmdLower=tolower(CmdText)
+| extend CallerUPN=tostring(Caller)
+| extend VmName=tostring(split(ResourceId,"/")[-1])
+
+// --- RARITY SIGNALS
+| join kind=leftouter OrgRunCommandInitiators on CallerUPN == Caller
+| extend InitiatorRare=iif(isnull(InitiatorSeen),1,0)
+
+| mv-expand Token=suspiciousCmdTokens
+| where CmdLower has Token
+| join kind=leftouter OrgCommandTokenBaseline on Token
+| extend TokenRare=iif(isnull(TokenSeen),1,0)
+
+// --- COMMAND SIGNALS
+| extend HasBase64=iif(CmdLower has "base64",1,0)
+| extend HasDownload=iif(CmdLower has_any ("http://","https://","curl ","wget ","iwr ","irm "),1,0)
+| extend HasEncodedPS=iif(CmdLower has "-enc" or CmdLower has "-encodedcommand",1,0)
+
+// --- RISK ENGINE
+| extend RiskScore =
+    4 * InitiatorRare +
+    3 * TokenRare +
+    3 * HasEncodedPS +
+    3 * HasDownload +
+    2 * HasBase64
+
+// --- ATTACK TYPE CLASSIFIER
+| extend AttackType =
+    case(
+      HasEncodedPS==1, "RunCommand_Encoded_PowerShell",
+      HasDownload==1,  "RunCommand_Download_Execute",
+      HasBase64==1,    "RunCommand_Base64_Payload",
+      InitiatorRare==1 and TokenRare==1, "RunCommand_NewActor_NewPayload",
+      "RunCommand_Suspicious_Generic"
+    )
+
+| extend KillChainStage="Lateral Movement / Execution"
+
+| extend HunterDirectives =
+    case(
+      RiskScore >= 9,
+      "CRITICAL: Validate initiator SPN/user, revoke sessions, extract full command, pivot to MDE DeviceProcessEvents, isolate VM if persistence found.",
+      RiskScore >= 6,
+      "HIGH: Confirm legitimacy of RunCommand use, review RBAC on initiator, hunt for follow-on execution & persistence.",
+      "MEDIUM: Investigate context; likely admin misuse or test activity."
+    )
+
+| where RiskScore >= 6
+| project TimeGenerated, VmName, CallerUPN, CmdText,
+          InitiatorRare, TokenRare,
+          HasEncodedPS, HasDownload, HasBase64,
+          RiskScore, AttackType, KillChainStage, HunterDirectives
+| order by RiskScore desc
