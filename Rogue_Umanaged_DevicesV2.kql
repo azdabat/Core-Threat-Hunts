@@ -1,0 +1,100 @@
+// ============================================================================
+// Rogue / Unmanaged Device Detection (Core Hunt) - FINAL VERSION
+// Author: Ala Dabat
+// Version: 2025-12 (FIXED)
+// Purpose: Hunt for unmanaged, spoofed, or attacker-created devices + EDR gaps.
+// MITRE: T1078 (Valid Accounts), T1087 (Account Discovery),
+//        T1557 (Adversary-in-the-Middle), T1606 (Forge Web Credentials)
+// ============================================================================
+
+let lookback = 30d;
+
+// Adjust to match your org naming conventions
+let ApprovedNamingPattern = @"^ACME-(DC|SVC|SQL|WIN|LAP|ADMIN)-\d{2}$";
+
+// 1) Baseline device list from MDE (inventory + onboarding state)
+let MDEInventory =
+    DeviceInfo
+    | where Timestamp >= ago(lookback)
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project
+        MDE_DeviceId = DeviceId,
+        DeviceName,
+        OSPlatform,
+        OnboardingState;
+
+// 2) Devices observed anywhere in telemetry (network, processes, logons, security events)
+let TelemetryDevices =
+    union isfuzzy=true
+        (DeviceNetworkEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceProcessEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceLogonEvents  | project Timestamp, DeviceName, DeviceId),
+        (SecurityEvent      | project Timestamp = TimeGenerated,
+                              DeviceName = Computer,
+                              DeviceId)
+    | where isnotempty(DeviceName)
+    | summarize arg_max(Timestamp, *) by DeviceName
+    | project DeviceName, TelemetryDeviceId = DeviceId;
+
+// 3) EDR-related secure configuration issues (TVM) – raises risk if present
+let EdrConfigIssues =
+    DeviceTvmSecureConfigurationAssessment
+    | join kind=inner (
+        DeviceTvmSecureConfigurationAssessmentKB
+        on ConfigurationId
+      )
+    | where IsCompliant == 0 and IsApplicable == 1
+    | where ConfigurationSubcategory == "EDR"
+    | summarize
+        EdrIssueCount = count(),
+        EdrIssues = make_set(ConfigurationName)
+      by DeviceName;
+
+// 4) Join everything, score, and surface highest-risk candidates
+TelemetryDevices
+| extend NormalizedName = tostring(DeviceName)
+| extend NameOk = NormalizedName matches regex ApprovedNamingPattern
+| join kind=leftouter MDEInventory on DeviceName
+| join kind=leftouter EdrConfigIssues on DeviceName
+| extend IsOnboarded =
+    case(
+        OnboardingState == "Onboarded", 1,
+        isnull(OnboardingState), 0,
+        0
+    )
+| extend IsUnknownToMDE = iif(isnull(MDE_DeviceId), 1, 0)
+| extend HasEdrIssues   = iif(EdrIssueCount > 0, 1, 0)
+| extend RiskScore =
+      0
+    + iif(NameOk == false, 4, 0)
+    + iif(IsUnknownToMDE == 1, 5, 0)
+    + iif(IsOnboarded == 0, 3, 0)
+    + iif(HasEdrIssues == 1, 4, 0) // <--- THIS SCORE WAS BOOSTED FROM 2 TO 4
+| where RiskScore >= 4
+| extend HunterDirective = case(
+    NameOk == false and IsUnknownToMDE == 1,
+        "CRITICAL: Device is not in MDE inventory and has a non-standard hostname. Verify with asset owners and network diagrams. If unrecognised, isolate from the network.",
+    IsUnknownToMDE == 1 and IsOnboarded == 0,
+        "HIGH: Device appears in telemetry but is missing from MDE inventory/onboarding. Validate whether this is a shadow IT or attacker-controlled asset.",
+    NameOk == false,
+        "HIGH: Hostname breaks the corporate naming standard. Check AD computer object, DHCP leases, and network segment for spoofed or unmanaged hosts.",
+    HasEdrIssues == 1 and IsOnboarded == 1,
+        "HIGH: Onboarded device with EDR misconfiguration. Fix EDR policy, confirm sensor coverage, and re-check for gaps in other security controls.",
+    IsOnboarded == 0,
+        "MEDIUM: Device seems partially or not onboarded to EDR. Confirm deployment status and ensure full sensor coverage.",
+    "Investigate device legitimacy and ensure it is fully inventoried and covered by EDR."
+)
+| project
+    TimeDetected = now(),
+    DeviceName,
+    TelemetryDeviceId,
+    MDE_DeviceId,
+    OSPlatform,
+    OnboardingState,
+    NameOk,
+    IsUnknownToMDE,
+    HasEdrIssues,
+    EdrIssueCount,
+    RiskScore,
+    HunterDirective
+| order by RiskScore desc, DeviceName
