@@ -1,0 +1,64 @@
+//////////////////////////////////////////////////////////////////////////////////////////////
+// RULE: WebRCE_ProcessPivot_L3
+// AUTHOR: Ala Dabat
+//
+// PURPOSE:
+//   Detect web-server → shell execution pivot, the strongest indicator of remote code
+//   execution (RCE) across modern attack families.
+//
+// THREATS DETECTED:
+//   - React2Shell / Next.js RCE
+//   - Log4Shell, Struts, Confluence, JBoss RCE
+//   - PHP RCE (php-cgi → bash)
+//   - Node.js/Java/.NET deserialization exploits
+//   - Webshell pivot (chopper, c99, b374k)
+//
+// MITRE:
+//   - T1190: Exploit Public-Facing Application
+//   - T1059: Command Interpreters
+//
+// ENHANCEMENTS ADDED:
+//   - Added perl.exe & php.exe as children
+//   - Added -enc, -nop, -w hidden indicators
+//   - Improved fidelity for shell spawn detection
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 7d;
+
+let WebParents = dynamic([
+    "node.exe","nginx.exe","httpd.exe","java.exe",
+    "php-cgi.exe","dotnet.exe","w3wp.exe","iisexpress.exe"
+]);
+
+let ShellChildren = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe","bash","sh",
+    "python.exe","python3.exe","perl.exe","php.exe"
+]);
+
+let ShellFlags = dynamic(["-enc","-encodedcommand","-nop","-w","/c","/k"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where InitiatingProcessFileName has_any (WebParents)
+| where FileName has_any (ShellChildren)
+| where ProcessCommandLine has_any (ShellFlags)
+// Identify service vs non-service (non-service = higher fidelity)
+| extend SystemIdentity = InitiatingProcessAccountName in~ ("SYSTEM","NETWORK SERVICE","LOCAL SERVICE")
+| extend Severity = iff(SystemIdentity, "High", "Critical")
+| extend RiskScore = iff(Severity == "Critical", 95, 85)
+| extend HunterDirective =
+    case(
+        Severity == "Critical",
+           "CRITICAL: Web process spawned a shell under a non-service identity. Treat as active exploitation; capture memory and isolate.",
+        "HIGH: Web server spawned a shell under service account. Validate deployment scripts and investigate staging activity."
+    )
+| project
+    Timestamp, DeviceName, Severity, RiskScore,
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommand = InitiatingProcessCommandLine,
+    ChildProcess = FileName,
+    ChildCommand = ProcessCommandLine,
+    Account = InitiatingProcessAccountName,
+    MITRE = "T1190; T1059",
+    HunterDirective
+| order by Timestamp desc
