@@ -75,3 +75,20 @@ ServiceEvents
     )
 | project FirstSeen, LastSeen, Severity=HunterDirective, DeviceName, SvcName, AccountName, SamplePath, SampleMethod, Count
 | order by FirstSeen asc
+
+~~~
+# Incident Response
+
+1. Monitor service creation from non-admin accounts
+
+2. Alert on kernel drivers loading from temp directories
+
+3. Baseline normal IOCTL patterns for critical drivers
+
+4. Implement driver allow-listing for critical systems
+
+5. Monitor kernel callback modifications (PsCallbacks, ObCallbacks)
+
+6. Use HVCI/Memory Integrity to prevent driver-based code execution
+
+7. Deploy driver block policies via WDAC
