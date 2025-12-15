@@ -1,0 +1,126 @@
+// ============================================================================
+// CORE_PASS_THE_HASH_TICKET_NEW_HOST
+// Author: Ala Dabat
+// Audience: L2 SOC Analysts (Core+ Threat Hunt)
+// Purpose: Identify successful Kerberos/NTLM logons where a user authenticates
+//          to hosts they have never accessed before (possible PtH / PtT).
+// Tactics: TA0008 Lateral Movement | TA0006 Credential Access
+// Techniques: T1078 (Valid Accounts), T1021 (Remote Services), T1550.002/.003
+// Data: DeviceLogonEvents (MDE)
+// ============================================================================
+
+let BaselineLookback = 30d;
+let DetectionLookback = 7d;
+let MinNewHosts = 3;   // Simple, L2-friendly threshold
+
+// ------------------------------------------------------------------
+// 1. BASELINE — Hosts a user normally accesses
+// ------------------------------------------------------------------
+let KnownUserHosts =
+DeviceLogonEvents
+| where Timestamp between (ago(BaselineLookback)..ago(DetectionLookback))
+| where ActionType == "LogonSuccess"
+| where LogonType in ("Network", "RemoteInteractive")
+| where AuthenticationPackage in ("Kerberos", "NTLM")
+| extend
+    User = tolower(AccountName),
+    Host = tolower(DeviceName)
+| summarize KnownHosts = make_set(Host, 500) by User;
+
+// ------------------------------------------------------------------
+// 2. RECENT LOGONS — New activity
+// ------------------------------------------------------------------
+let RecentLogons =
+DeviceLogonEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType == "LogonSuccess"
+| where LogonType in ("Network", "RemoteInteractive")
+| where AuthenticationPackage in ("Kerberos", "NTLM")
+| extend
+    LogonTime = Timestamp,
+    User = tolower(AccountName),
+    Host = tolower(DeviceName),
+    SourceDevice = tolower(InitiatingDeviceName);
+
+// ------------------------------------------------------------------
+// 3. FIND NEW USER → HOST RELATIONSHIPS
+// ------------------------------------------------------------------
+RecentLogons
+| join kind=leftouter (KnownUserHosts) on User
+| extend KnownHosts = coalesce(KnownHosts, dynamic([]))
+| where Host !in (KnownHosts)
+
+// ------------------------------------------------------------------
+// 4. AGGREGATE & FILTER — L2-safe output
+// ------------------------------------------------------------------
+| summarize
+    FirstSeen = min(LogonTime),
+    LastSeen  = max(LogonTime),
+    NewHostCount = dcount(Host),
+    NewHosts = make_set(Host, 20),
+    SourceDevices = make_set(SourceDevice, 10),
+    LogonCount = count()
+  by User
+
+| where NewHostCount >= MinNewHosts
+| where User !in (
+    "system", "local service", "network service",
+    "anonymous logon"
+)
+
+// ------------------------------------------------------------------
+// 5. SIMPLE SEVERITY & DIRECTIVES (L2)
+// ------------------------------------------------------------------
+| extend
+    Severity = case(
+        NewHostCount >= 5, "HIGH",
+        "MEDIUM"
+    ),
+    HuntingDirective = case(
+        Severity == "HIGH",
+        "HIGH: User authenticated to multiple new hosts using Kerberos/NTLM. Possible Pass-the-Hash/Ticket. Review source device, recent alerts, and escalate if no business justification.",
+        "MEDIUM: User authenticated to new hosts not seen historically. Validate with user or manager and monitor for follow-on activity."
+    )
+
+// ------------------------------------------------------------------
+// 6. FINAL OUTPUT
+// ------------------------------------------------------------------
+| project
+    Severity,
+    HuntingDirective,
+    FirstSeen,
+    LastSeen,
+    User,
+    NewHostCount,
+    NewHosts,
+    SourceDevices,
+    LogonCount
+| order by NewHostCount desc, LastSeen desc;
+
+// ============================================================================
+// L2 INCIDENT RESPONSE GUIDANCE (CORE+)
+// ============================================================================
+//
+// 1) VALIDATE
+//    - Confirm Kerberos or NTLM authentication.
+//    - Confirm logons are Network or RemoteInteractive.
+//    - Check if user recently changed role, project, or support duties.
+//
+// 2) QUICK CHECKS
+//    - Review SourceDevices for unfamiliar systems.
+//    - Check if the user is an admin or service account.
+//    - Look for other alerts tied to the user or source device.
+//
+// 3) ESCALATE TO L3 IF:
+//    - NewHostCount continues to increase.
+//    - Source device is unknown or unmanaged.
+//    - Other signals exist (LSASS access, suspicious process trees, persistence).
+//
+// 4) CONTAIN (IF CONFIRMED MALICIOUS)
+//    - Disable or reset user credentials.
+//    - Isolate suspicious source device.
+//    - Hand off to L3/IR for deeper investigation.
+//
+// ============================================================================
+// END
+// ============================================================================
