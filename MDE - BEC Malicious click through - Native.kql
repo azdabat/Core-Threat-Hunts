@@ -62,8 +62,7 @@ DeliveredEmails
     DeliveryAction;
 
 //
-// 4. Add behavioural scoring (native only – no TI)
-//
+// 4. Add behavioural scoring 
 EmailClickThrough
 | extend
     RiskScore = case(
