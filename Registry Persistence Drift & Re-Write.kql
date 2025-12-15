@@ -1,0 +1,383 @@
+// ============================================================================
+// L3_PERSISTENCE_BEHAVIOR_ENGINE (Drift + Re-Write + Surface Correlation)
+// Author: Ala Dabat
+// Purpose: Pair “Drift” (rare across org) with “Re-Write” (self-healing persistence)
+//          across Registry Run Keys + Startup Folder + Service Creation + Scheduled Tasks.
+// Philosophy: Behavioral / statistical. Minimal string/IOC dependence. Low-noise by design.
+// ============================================================================
+
+// ---------------------------
+// GLOBAL CONFIG
+// ---------------------------
+let BaselineLookback = 30d;     // org-wide prevalence baseline
+let DetectionLookback = 7d;     // “recent window” for actionable hunting
+let RewriteThreshold = 3;       // >=3 identical re-writes in lookback is suspicious
+let RewriteBurstWindow = 60m;   // tighten for “active self-heal” behavior
+let OrgRareDeviceThreshold = 2; // “drift” threshold (<=2 devices in org)
+
+// Common writable / attacker-favored paths (context, not IOC)
+let WritableUserPaths = dynamic([
+  @"\users\", @"\appdata\", @"\programdata\", @"\windows\temp\", @"\temp\", @"\windows\tasks\"
+]);
+
+// ---------------------------
+// SURFACE 1: REGISTRY RUN KEY DRIFT (ENHANCED NORMALIZATION)
+// ---------------------------
+let RunKeys = dynamic([
+  @"hklm\software\microsoft\windows\currentversion\run",
+  @"hkcu\software\microsoft\windows\currentversion\run",
+  @"hklm\software\microsoft\windows\currentversion\runonce",
+  @"hkcu\software\microsoft\windows\currentversion\runonce",
+  @"hklm\software\wow6432node\microsoft\windows\currentversion\run"
+]);
+
+let NormalizeCmd = (s:string) {
+  trim(" ",
+    replace_regex(
+      tolower(coalesce(s,"")),
+      // strip quotes, collapse whitespace, remove trivial “quiet” flags that cause false uniqueness
+      @"(\""|\'|\s+|/silent|/background|/min|/quiet|/q|/qn)",
+      ""
+    )
+  )
+};
+
+let Registry_RunKey_Baseline =
+DeviceRegistryEvents
+| where Timestamp >= ago(BaselineLookback)
+| where ActionType == "RegistryValueSet"
+| where tolower(RegistryKey) has_any (RunKeys)
+| extend RawValueData = tostring(RegistryValueData)
+| extend NormValueData = NormalizeCmd(RawValueData)
+| extend ExecPath = extract(@"([a-z]:\\[^ ]+\.(exe|dll|ps1|vbs|js|bat))", 1, NormValueData)
+| extend ValueHash = hash(NormValueData)
+| summarize
+    OrgDeviceCount = dcount(DeviceId),
+    OrgUserCount   = dcount(InitiatingProcessAccountName),
+    FirstSeenOrg   = min(Timestamp),
+    LastSeenOrg    = max(Timestamp)
+  by ValueHash, NormValueData, ExecPath;
+
+let Registry_RunKey_Drift =
+DeviceRegistryEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType == "RegistryValueSet"
+| where tolower(RegistryKey) has_any (RunKeys)
+| extend RawValueData = tostring(RegistryValueData)
+| extend NormValueData = NormalizeCmd(RawValueData)
+| extend ExecPath = extract(@"([a-z]:\\[^ ]+\.(exe|dll|ps1|vbs|js|bat))", 1, NormValueData)
+| extend ValueHash = hash(NormValueData)
+| join kind=inner (Registry_RunKey_Baseline) on ValueHash
+| where OrgDeviceCount <= OrgRareDeviceThreshold
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    DurationDays = datetime_diff("day", max(Timestamp), min(Timestamp)),
+    EventCount = count(),
+    Devices = make_set(DeviceName, 5),
+    Users   = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExampleRaw = any(RawValueData)
+  by RegistryKey, RegistryValueName, NormValueData, ExecPath, OrgDeviceCount, OrgUserCount
+| extend Surface="RegistryRunKey", Signal="Drift"
+| extend PathRisk = iif(tolower(ExecPath) has_any (WritableUserPaths), "HIGH_RISK_PATH", "NORMAL_PATH")
+| project FirstSeen, LastSeen, DurationDays, Surface, Signal, PathRisk,
+          OrgDeviceCount, OrgUserCount,
+          ArtifactKey=RegistryKey, ArtifactName=RegistryValueName, ArtifactValue=ExampleRaw, Normalized=NormValueData, ExecPath,
+          Devices, Users, Initiators;
+
+// ---------------------------
+// SURFACE 1B: REGISTRY RUN KEY RE-WRITE (SELF-HEAL / RESILIENCE)
+// ---------------------------
+let Registry_RunKey_Rewrite =
+DeviceRegistryEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType == "RegistryValueSet"
+| where tolower(RegistryKey) has_any (RunKeys)
+| extend RawValueData = tostring(RegistryValueData)
+| extend NormValueData = NormalizeCmd(RawValueData)
+| extend ExecPath = extract(@"([a-z]:\\[^ ]+\.(exe|dll|ps1|vbs|js|bat))", 1, NormValueData)
+| extend ValueHash = hash(NormValueData)
+| summarize
+    WriteCount = count(),
+    FirstWrite = min(Timestamp),
+    LastWrite  = max(Timestamp),
+    BurstWrites = countif(Timestamp >= ago(RewriteBurstWindow)),
+    Users = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExampleRaw = any(RawValueData)
+  by DeviceName, RegistryKey, RegistryValueName, ValueHash, NormValueData, ExecPath
+| where WriteCount >= RewriteThreshold or BurstWrites >= RewriteThreshold
+| extend DurationMinutes = datetime_diff("minute", LastWrite, FirstWrite)
+| extend Surface="RegistryRunKey", Signal="ReWrite"
+| extend PathRisk = iif(tolower(ExecPath) has_any (WritableUserPaths), "HIGH_RISK_PATH", "NORMAL_PATH")
+| project FirstSeen=FirstWrite, LastSeen=LastWrite, DurationDays=real(null), Surface, Signal, PathRisk,
+          OrgDeviceCount=long(null), OrgUserCount=long(null),
+          ArtifactKey=RegistryKey, ArtifactName=RegistryValueName, ArtifactValue=ExampleRaw, Normalized=NormValueData, ExecPath,
+          Devices=pack_array(DeviceName), Users, Initiators,
+          WriteCount, BurstWrites, DurationMinutes;
+
+// ---------------------------
+// SURFACE 2: STARTUP FOLDER DRIFT (STATISTICAL RARITY)
+// Note: Uses folder targeting + prevalence. No “bad strings”.
+// ---------------------------
+let StartupFolders = dynamic([
+  @"\programdata\microsoft\windows\start menu\programs\startup\",
+  @"\users\public\microsoft\windows\start menu\programs\startup\",
+  @"\appdata\roaming\microsoft\windows\start menu\programs\startup\"
+]);
+
+let Startup_Baseline =
+DeviceFileEvents
+| where Timestamp >= ago(BaselineLookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| extend fp = tolower(FolderPath)
+| where fp has_any (StartupFolders)
+| extend FileKey = strcat(fp, "|", tolower(FileName))
+| extend FileHash = tostring(SHA1)
+| summarize
+    OrgDeviceCount = dcount(DeviceId),
+    FirstSeenOrg = min(Timestamp),
+    LastSeenOrg  = max(Timestamp)
+  by FileKey, FileHash;
+
+let Startup_Drift =
+DeviceFileEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| extend fp = tolower(FolderPath)
+| where fp has_any (StartupFolders)
+| extend FileKey = strcat(fp, "|", tolower(FileName))
+| extend FileHash = tostring(SHA1)
+| join kind=leftouter (Startup_Baseline) on FileKey, FileHash
+| where coalesce(OrgDeviceCount, 1) <= OrgRareDeviceThreshold
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    DurationDays = datetime_diff("day", max(Timestamp), min(Timestamp)),
+    EventCount = count(),
+    Devices = make_set(DeviceName, 5),
+    Users   = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExamplePath = any(FolderPath),
+    ExampleHash = any(SHA1)
+  by FileName, FileKey, OrgDeviceCount
+| extend Surface="StartupFolder", Signal="Drift"
+| project FirstSeen, LastSeen, DurationDays, Surface, Signal, PathRisk="HIGH_RISK_PATH",
+          OrgDeviceCount, OrgUserCount=long(null),
+          ArtifactKey=ExamplePath, ArtifactName=FileName, ArtifactValue=ExampleHash, Normalized=FileKey, ExecPath="",
+          Devices, Users, Initiators;
+
+// ---------------------------
+// SURFACE 2B: STARTUP FOLDER RE-WRITE (FILE RECREATION / SELF-HEAL)
+// Detect same Startup artifact being repeatedly created/modified (or recreated after removal).
+// ---------------------------
+let Startup_Rewrite =
+DeviceFileEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| extend fp = tolower(FolderPath)
+| where fp has_any (StartupFolders)
+| extend FileKey = strcat(fp, "|", tolower(FileName))
+| extend FileHash = tostring(SHA1)
+| summarize
+    WriteCount = count(),
+    FirstWrite = min(Timestamp),
+    LastWrite  = max(Timestamp),
+    BurstWrites = countif(Timestamp >= ago(RewriteBurstWindow)),
+    Devices = make_set(DeviceName, 5),
+    Users   = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExampleHash = any(SHA1),
+    ExamplePath = any(FolderPath)
+  by FileKey, FileName, FileHash
+| where WriteCount >= RewriteThreshold or BurstWrites >= RewriteThreshold
+| extend DurationMinutes = datetime_diff("minute", LastWrite, FirstWrite)
+| extend Surface="StartupFolder", Signal="ReWrite"
+| project FirstSeen=FirstWrite, LastSeen=LastWrite, DurationDays=real(null), Surface, Signal, PathRisk="HIGH_RISK_PATH",
+          OrgDeviceCount=long(null), OrgUserCount=long(null),
+          ArtifactKey=ExamplePath, ArtifactName=FileName, ArtifactValue=ExampleHash, Normalized=FileKey, ExecPath="",
+          Devices, Users, Initiators,
+          WriteCount, BurstWrites, DurationMinutes;
+
+// ---------------------------
+// SURFACE 3: SERVICE PERSISTENCE (CREATION / RE-CREATION)
+// Uses process telemetry (sc.exe / powershell New-Service). Pair with SecurityEvent 7045 in Sentinel if available.
+// ---------------------------
+let Service_Create =
+DeviceProcessEvents
+| where Timestamp >= ago(DetectionLookback)
+| where FileName in~ ("sc.exe","powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_any (" create ", "New-Service", "sc create", "binPath=", " type= kernel", " type= own")
+| extend SvcName = extract(@"(?i)\bcreate\s+([a-zA-Z0-9_\-\.]+)", 1, ProcessCommandLine)
+| extend BinPath = extract(@"(?i)\bbinpath\s*=\s*(""[^""]+""|[^\s]+)", 1, ProcessCommandLine)
+| extend NormBin = NormalizeCmd(BinPath)
+| extend ArtifactHash = hash(strcat(tolower(coalesce(SvcName,"")), "|", NormBin))
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    EventCount = count(),
+    Devices = make_set(DeviceName, 5),
+    Users = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExampleCL = any(ProcessCommandLine)
+  by SvcName, BinPath, NormBin, ArtifactHash
+| extend Surface="Service", Signal="CreateOrUpdate"
+| extend PathRisk = iif(tolower(NormBin) has_any (WritableUserPaths), "HIGH_RISK_PATH", "NORMAL_PATH")
+| project FirstSeen, LastSeen, DurationDays=real(null), Surface, Signal, PathRisk,
+          OrgDeviceCount=long(null), OrgUserCount=long(null),
+          ArtifactKey="ServiceControlManager", ArtifactName=SvcName, ArtifactValue=BinPath, Normalized=NormBin, ExecPath=BinPath,
+          Devices, Users, Initiators, EventCount, ExampleCL;
+
+// “Re-create” heuristic: same service name created/updated multiple times quickly (self-heal)
+let Service_Recreate =
+Service_Create
+| where EventCount >= RewriteThreshold;
+
+// ---------------------------
+// SURFACE 4: SCHEDULED TASK PERSISTENCE (CREATE / RE-REGISTER)
+// Uses process telemetry for schtasks/Register-ScheduledTask.
+// ---------------------------
+let Task_Create =
+DeviceProcessEvents
+| where Timestamp >= ago(DetectionLookback)
+| where FileName in~ ("schtasks.exe","powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe")
+| where ProcessCommandLine has_any ("/create", "Register-ScheduledTask", "New-ScheduledTask", "schtasks")
+| extend TaskName = coalesce(
+    extract(@"(?i)\s/tn\s+(""[^""]+""|[^\s]+)", 1, ProcessCommandLine),
+    extract(@"(?i)Register-ScheduledTask\s+-TaskName\s+(""[^""]+""|[^\s]+)", 1, ProcessCommandLine)
+  )
+| extend TaskAction = coalesce(
+    extract(@"(?i)\s/tr\s+(""[^""]+""|[^\s]+)", 1, ProcessCommandLine),
+    extract(@"(?i)-Execute\s+(""[^""]+""|[^\s]+)", 1, ProcessCommandLine)
+  )
+| extend NormAction = NormalizeCmd(TaskAction)
+| extend ArtifactHash = hash(strcat(tolower(coalesce(TaskName,"")), "|", NormAction))
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    EventCount = count(),
+    Devices = make_set(DeviceName, 5),
+    Users = make_set(InitiatingProcessAccountName, 5),
+    Initiators = make_set(InitiatingProcessFileName, 5),
+    ExampleCL = any(ProcessCommandLine)
+  by TaskName, TaskAction, NormAction, ArtifactHash
+| extend Surface="ScheduledTask", Signal="CreateOrUpdate"
+| extend PathRisk = iif(tolower(NormAction) has_any (WritableUserPaths), "HIGH_RISK_PATH", "NORMAL_PATH")
+| project FirstSeen, LastSeen, DurationDays=real(null), Surface, Signal, PathRisk,
+          OrgDeviceCount=long(null), OrgUserCount=long(null),
+          ArtifactKey="TaskScheduler", ArtifactName=TaskName, ArtifactValue=TaskAction, Normalized=NormAction, ExecPath=TaskAction,
+          Devices, Users, Initiators, EventCount, ExampleCL;
+
+let Task_ReRegister =
+Task_Create
+| where EventCount >= RewriteThreshold;
+
+// ============================================================================
+// UNIFIED PERSISTENCE RISK ENGINE (SCORE + DIRECTIVES)
+// - Drift: rare across org
+// - ReWrite: self-healing / resilience
+// - PathRisk: writable paths boost
+// - Cross-surface correlation: same device appearing in multiple surfaces increases severity
+// ============================================================================
+let Unified =
+union
+  Registry_RunKey_Drift,
+  Registry_RunKey_Rewrite,
+  Startup_Drift,
+  Startup_Rewrite,
+  Service_Create,
+  Service_Recreate,
+  Task_Create,
+  Task_ReRegister;
+
+Unified
+| extend
+    // Base scoring by signal type (behavior)
+    Score_Signal = case(
+      Signal == "ReWrite", 8,
+      Signal == "Drift", 6,
+      Signal == "CreateOrUpdate", 4,
+      2
+    ),
+    // Rarity boosts (only available where we computed org prevalence)
+    Score_Rarity = case(
+      isnotempty(tostring(OrgDeviceCount)) and OrgDeviceCount <= 1, 4,
+      isnotempty(tostring(OrgDeviceCount)) and OrgDeviceCount <= OrgRareDeviceThreshold, 2,
+      0
+    ),
+    // Writable path boosts
+    Score_Path = iff(PathRisk == "HIGH_RISK_PATH", 3, 0)
+| extend RiskScore = Score_Signal + Score_Rarity + Score_Path
+| summarize
+    FirstSeen = min(FirstSeen),
+    LastSeen  = max(LastSeen),
+    MaxRiskScore = max(RiskScore),
+    Surfaces = make_set(Surface, 10),
+    Signals  = make_set(Signal, 10),
+    PathRisks = make_set(PathRisk, 10),
+    ArtifactKeys = make_set(ArtifactKey, 10),
+    ArtifactNames = make_set(ArtifactName, 10),
+    ArtifactValues = make_set(ArtifactValue, 10),
+    NormalizedSamples = make_set(Normalized, 5),
+    ExecSamples = make_set(ExecPath, 5),
+    Devices = make_set(tostring(Devices), 10),
+    Users   = make_set(tostring(Users), 10),
+    Initiators = make_set(tostring(Initiators), 10),
+    TotalEvents = sum(toint(coalesce(EventCount, 1)))
+  by tostring(ArtifactName)
+| extend SurfaceCount = array_length(Surfaces)
+| extend RiskScore = MaxRiskScore + iif(SurfaceCount >= 2, 4, 0) + iif(SurfaceCount >= 3, 6, 0)
+| extend Severity = case(
+    RiskScore >= 16, "CRITICAL",
+    RiskScore >= 11, "HIGH",
+    RiskScore >= 7,  "MEDIUM",
+    "LOW"
+)
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+      "CRITICAL: Multi-surface persistence behavior (drift/self-heal). Isolate host if active compromise suspected. Collect artifacts (RunKey/Startup/Task/Service), capture process tree, and validate signer + origin.",
+    Severity == "HIGH",
+      "HIGH: Strong persistence signal (rare and/or rewritten). Validate legitimacy (software install vs intrusion), pivot on initiating process/user, and check adjacent C2 + credential access activity.",
+    Severity == "MEDIUM",
+      "MEDIUM: Uncommon persistence behavior. Triage owner, path, and initiator. Confirm change control and scan related binary/script.",
+    "LOW: Review if unexpected in this environment."
+)
+| project
+    FirstSeen, LastSeen,
+    Severity, RiskScore,
+    Surfaces, Signals, PathRisks,
+    ArtifactNames, ArtifactKeys, ArtifactValues,
+    ExecSamples, NormalizedSamples,
+    Users, Initiators, TotalEvents,
+    HunterDirective
+| where Severity in ("MEDIUM","HIGH","CRITICAL")
+| order by RiskScore desc, LastSeen desc;
+
+// ============================================================================
+// INCIDENT RESPONSE / REMEDIATION (SOC RUNBOOK — APPLY WHEN FINDINGS ARE HIGH/CRITICAL)
+// ============================================================================
+// 1) Confirm persistence surface(s):
+//    - Registry: export the Run/RunOnce value(s) and capture the exact ValueData.
+//    - Startup: collect the file, hash, signer, ADS, and creation/modification timeline.
+//    - Scheduled Task: export task XML and capture action/trigger/author.
+//    - Service: capture service config (binPath, start type, account), and driver/service file on disk.
+//
+// 2) Containment:
+//    - If ReWrite is present (self-heal), assume an active “watchdog”: isolate host to stop regeneration.
+//    - Disable the scheduled task / service and remove persistence entries ONLY after forensic capture.
+//
+// 3) Forensics pivots:
+//    - Pivot across fleet by ExecSamples / hashes / initiating process names and command lines.
+//    - Check for adjacent TTPs: credential access, tampering, lateral movement, unusual outbound connections.
+//
+// 4) Remediation:
+//    - Remove persistence (RunKey/Startup/Task/Service) and delete/contain the referenced payload.
+//    - Reset affected credentials if user context is suspicious or if payload indicates theft.
+//    - Reimage if kernel/service persistence is confirmed or integrity is uncertain.
+//
+// 5) Prevention:
+//    - Tighten permissions on persistence locations; restrict user writes where possible.
+//    - WDAC / Smart App Control; block execution from user-writable paths.
+//    - Ensure tamper protection / EDR health enforcement and reduce local admin sprawl.
+// ============================================================================
