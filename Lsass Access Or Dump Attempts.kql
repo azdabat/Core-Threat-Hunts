@@ -1,0 +1,177 @@
+// ============================================================================
+// CORE_LSASS_ACCESS_OR_DUMP_ATTEMPT
+// Author: Ala Dabat
+// Audience: L2 SOC Analysts (Core+ Threat Hunt)
+// Purpose: Detect suspicious access to LSASS or memory dump attempts that
+//          commonly precede or follow Kerberoasting, PtH, or PtT activity.
+// Tactics: TA0006 Credential Access
+// Techniques: T1003.001 (LSASS Memory), T1003.002 (Security Account Manager)
+// Data: DeviceProcessEvents, DeviceFileEvents
+// ============================================================================
+
+let Lookback = 7d;
+
+// ------------------------------------------------------------------
+// 1. KNOWN TOOLS & LOLBINS USED FOR LSASS DUMPING
+// ------------------------------------------------------------------
+let DumpTools = dynamic([
+    "procdump.exe",
+    "rundll32.exe",
+    "taskmgr.exe",
+    "werfault.exe",
+    "comsvcs.dll",
+    "powershell.exe",
+    "pwsh.exe"
+]);
+
+let SuspiciousCommands = dynamic([
+    "lsass",
+    "minidump",
+    "dump",
+    "sekurlsa",
+    "comsvcs.dll",
+    "MiniDump",
+    "full"
+]);
+
+// ------------------------------------------------------------------
+// 2. SUSPICIOUS LSASS HANDLE ACCESS / PROCESS TAMPERING
+// ------------------------------------------------------------------
+let LsassProcessAccess =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType in (
+    "ProcessTampering",
+    "CreateRemoteThread",
+    "WriteProcessMemory",
+    "ProcessInjection"
+)
+| where ProcessName =~ "lsass.exe"
+| project
+    TimeGenerated = Timestamp,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionType,
+    Technique = "Direct LSASS Access";
+
+// ------------------------------------------------------------------
+// 3. COMMAND-LINE BASED LSASS DUMP ATTEMPTS
+// ------------------------------------------------------------------
+let LsassDumpCommands =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where InitiatingProcessFileName in~ (DumpTools)
+| where ProcessCommandLine has_any (SuspiciousCommands)
+| where ProcessCommandLine has "lsass"
+| project
+    TimeGenerated = Timestamp,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionType = "CommandLineDump",
+    Technique = "LSASS Dump via Command Line";
+
+// ------------------------------------------------------------------
+// 4. MEMORY DUMP FILE CREATION (ON DISK)
+// ------------------------------------------------------------------
+let LsassDumpFiles =
+DeviceFileEvents
+| where Timestamp >= ago(Lookback)
+| where FileName endswith ".dmp"
+| where FolderPath has_any ("\\temp\\", "\\users\\", "\\windows\\temp\\")
+| project
+    TimeGenerated = Timestamp,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    FileName,
+    FolderPath,
+    ActionType = "DumpFileCreated",
+    Technique = "LSASS Memory Dump File";
+
+// ------------------------------------------------------------------
+// 5. UNION & AGGREGATION (L2-FRIENDLY)
+// ------------------------------------------------------------------
+union LsassProcessAccess, LsassDumpCommands, LsassDumpFiles
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen  = max(TimeGenerated),
+    EventCount = count(),
+    TechniquesObserved = make_set(Technique, 5),
+    ToolsUsed = make_set(InitiatingProcessFileName, 5),
+    CommandLines = make_set(InitiatingProcessCommandLine, 5),
+    DumpFiles = make_set(FileName, 5),
+    Accounts = make_set(InitiatingProcessAccountName, 5)
+  by DeviceName
+
+// ------------------------------------------------------------------
+// 6. SEVERITY & L2 DIRECTIVES
+// ------------------------------------------------------------------
+| extend
+    Severity = case(
+        EventCount >= 3 and array_length(TechniquesObserved) >= 2, "HIGH",
+        EventCount >= 1, "MEDIUM",
+        "LOW"
+    ),
+    HuntingDirective = case(
+        Severity == "HIGH",
+        "HIGH: Multiple LSASS access or dump techniques observed. Strong indicator of credential dumping. Escalate to L3 immediately.",
+        Severity == "MEDIUM",
+        "MEDIUM: Suspicious LSASS access or dump attempt detected. Validate tool usage and investigate recent credential abuse signals.",
+        "LOW: Single low-confidence LSASS-related signal. Monitor for additional activity."
+    )
+
+// ------------------------------------------------------------------
+// 7. FINAL OUTPUT
+// ------------------------------------------------------------------
+| project
+    Severity,
+    HuntingDirective,
+    FirstSeen,
+    LastSeen,
+    DeviceName,
+    EventCount,
+    TechniquesObserved,
+    ToolsUsed,
+    Accounts,
+    CommandLines,
+    DumpFiles
+| order by Severity desc, LastSeen desc;
+
+// ============================================================================
+// L2 INCIDENT RESPONSE GUIDANCE (CORE+)
+// ============================================================================
+//
+// 1) VALIDATE
+//    - Confirm lsass.exe is the target process.
+//    - Confirm initiating tool is not an approved diagnostic or AV tool.
+//    - Check if activity aligns with troubleshooting or crash analysis.
+//
+// 2) QUICK CONTEXT CHECKS
+//    - Was the user an administrator?
+//    - Was this during a known support window?
+//    - Is the device a workstation (higher risk) or a DC/server?
+//
+// 3) ESCALATE TO L3 IF:
+//    - Multiple dump techniques are observed.
+//    - Dump files (.dmp) are created.
+//    - Activity correlates with Kerberoasting or PtH/PtT alerts.
+//    - The tool used is clearly offensive (procdump + lsass, comsvcs).
+//
+// 4) CONTAINMENT (IF CONFIRMED MALICIOUS)
+//    - Isolate the device.
+//    - Disable or reset credentials for affected users.
+//    - Remove dump files and malicious tools.
+//
+// 5) FOLLOW-UP
+//    - Hunt for lateral movement using compromised credentials.
+//    - Check for persistence on the device (services, tasks, run keys).
+//    - Validate LSASS protections (RunAsPPL, Credential Guard).
+//
+// ============================================================================
+// END
+// ============================================================================
