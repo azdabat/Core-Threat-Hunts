@@ -1,0 +1,339 @@
+// ============================================================================
+// L4_Userland_MaliciousLoader_Reputation_AND_Injection_Hunt_V3
+// Author: Ala Dabat
+//
+// PURPOSE
+// “Standard loader hunt” for generic implants/loaders (Rust/Go/custom C2):
+// - On-disk suspicious binary execution from user-writable paths
+// - PLUS modern evasion layers:
+//    (1) Process Injection correlation (fileless / in-memory)
+//    (2) Unsigned/Untrusted module loading (reflective / stealth load)
+//    (3) OPTIONAL Parent→Child Trust Inversion (low-rep injector → high-rep target)
+//    (4) OPTIONAL Cross-host hash prevalence scoring (rare hash boosts risk)
+//
+// TABLES
+// DeviceProcessEvents, DeviceImageLoadEvents, (optional Watchlist), (optional prevalence materialize)
+//
+// MITRE
+// T1204 User Execution | T1059 Execution | T1055 Process Injection | T1574.002 DLL Search Order/Side-Load
+// T1027 Obfuscation | T1562.001 Defense Evasion
+// ============================================================================
+
+let Lookback = 72h;
+let MinRisk  = 60;
+
+// ----------------------------
+// OPTIONAL TOGGLES (set false if you don’t have reliable telemetry)
+// ----------------------------
+let EnableTrustInversion = true;
+let EnablePrevalenceScoring = true;
+let PrevalenceLookback = 30d;           // for org-wide prevalence baseline
+let RareHashDeviceThreshold = 3;        // <= this many devices => rare => high risk
+let CommonHashDeviceThreshold = 200;    // >= this many devices => likely common => lower risk
+
+// ----------------------------
+// PATHS / BASELINE
+// ----------------------------
+let UserPaths = dynamic([
+  "\\Users\\","\\AppData\\","\\Temp\\","\\Downloads\\",
+  "/home/","/tmp/","/var/tmp/"
+]);
+
+let BenignSigners = dynamic([
+  "Microsoft Corporation","Google LLC","Apple Inc.",
+  "Slack Technologies","VMware, Inc.","Mozilla Corporation","GitHub, Inc."
+]);
+
+let DevHints = dynamic(["dev","build","ci","runner","jenkins","gitlab","staging"]);
+
+let SuspiciousArgs = dynamic([
+  "-enc","FromBase64String","Invoke-Expression","IEX",
+  "http://","https://","Invoke-WebRequest","wget","curl",
+  "certutil","bitsadmin",
+  "sliver","chisel","beacon","go-runner","rustc"
+]);
+
+// “High-rep targets” commonly abused as injection/hollowing hosts
+let HighRepTargets = dynamic([
+  "explorer.exe","svchost.exe","lsass.exe","winlogon.exe","services.exe","spoolsv.exe",
+  "dllhost.exe","rundll32.exe","msiexec.exe","wmiPrvSE.exe","RuntimeBroker.exe",
+  "chrome.exe","msedge.exe","firefox.exe","OneDrive.exe","Teams.exe"
+]);
+
+// ----------------------------
+// OPTIONAL THREAT INTEL WATCHLIST (does not gate detection)
+// ----------------------------
+let KnownImplantHashes =
+materialize(
+  _GetWatchlist("KnownImplantHashes")   // optional watchlist
+);
+
+// ----------------------------
+// OPTIONAL ORG-WIDE PREVALENCE BASELINE (hash prevalence)
+// NOTE: This is expensive in some tenants; keep the lookback reasonable.
+// ----------------------------
+let HashPrevalence =
+materialize(
+  DeviceProcessEvents
+  | where EnablePrevalenceScoring
+  | where Timestamp >= ago(PrevalenceLookback)
+  | where isnotempty(FileSha256)
+  | summarize Prevalence_DeviceCount = dcount(DeviceId) by FileSha256
+);
+
+// ----------------------------
+// INJECTION EVIDENCE (T1055 primitives)
+// We use ActionType signals (schema varies by tenant; keep broad).
+// ----------------------------
+let InjectionEvents =
+materialize(
+  DeviceProcessEvents
+  | where Timestamp >= ago(Lookback)
+  | where ActionType in (
+      "ProcessInjection","CreateRemoteThread","WriteProcessMemory",
+      "QueueUserAPC","ProcessTampering","ProcessHollowing"
+    )
+  | project
+      InjectTime = Timestamp,
+      DeviceId,
+      InjectorPid = InitiatingProcessId,
+      TargetPid   = ProcessId,
+      InjectionAction = ActionType
+);
+
+// Build “target process context” for injection targets (name/signature)
+// We try to resolve the target process row within a short window.
+let InjectionTargetContext =
+materialize(
+  InjectionEvents
+  | join kind=leftouter (
+      DeviceProcessEvents
+      | where Timestamp >= ago(Lookback)
+      | project
+          DeviceId,
+          TargetPid = ProcessId,
+          TargetProcessName = FileName,
+          TargetSigner = tostring(Signer),
+          TargetSignatureStatus = tostring(SignatureStatus),
+          TargetFolderPath = FolderPath,
+          TargetCmd = ProcessCommandLine,
+          TargetStartTime = Timestamp
+    ) on DeviceId, TargetPid
+  | summarize
+      FirstInjectTime = min(InjectTime),
+      AnyInjectAction = any(InjectionAction),
+      TargetNames = make_set(TargetProcessName, 10),
+      TargetSigners = make_set(TargetSigner, 10),
+      TargetSigStatuses = make_set(TargetSignatureStatus, 10),
+      TargetPids = make_set(TargetPid, 10)
+    by DeviceId, InjectorPid
+);
+
+// ----------------------------
+// UNSIGNED MODULE LOADS (reflective/ghost load style signal)
+// ----------------------------
+let UnsignedModuleLoads =
+materialize(
+  DeviceImageLoadEvents
+  | where Timestamp >= ago(Lookback)
+  | where FileSignatureStatus !in ("Valid","Trusted")
+  | project
+      ImageLoadTime = Timestamp,
+      DeviceId,
+      LoaderPid = InitiatingProcessId,
+      LoadedModule = FileName,
+      ModulePath = FolderPath,
+      ModuleSigStatus = tostring(FileSignatureStatus),
+      ModuleSigner = tostring(Signer)
+  | summarize
+      FirstUnsignedLoadTime = min(ImageLoadTime),
+      UnsignedLoadCount = count(),
+      SampleLoadedModules = make_set(LoadedModule, 5),
+      SampleModulePaths   = make_set(ModulePath, 5),
+      SampleModuleSig     = make_set(ModuleSigStatus, 5),
+      SampleModuleSigners = make_set(ModuleSigner, 5)
+    by DeviceId, LoaderPid
+);
+
+// ============================================================================
+// CORE LOADER EXECUTION (ON-DISK) + CORRELATION LAYERS
+// ============================================================================
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FolderPath has_any (UserPaths)
+| where FileName matches regex @"\.(exe|bin|dll)$"
+| where Signer !in~ (BenignSigners)
+| extend
+    HasLowReputation =
+      iif(isempty(Signer) or SignatureStatus !in ("Valid","Trusted"), 1, 0),
+    IsDevHost =
+      iif(DeviceName has_any (DevHints), 1, 0),
+    HasSuspiciousArgs =
+      iif(ProcessCommandLine has_any (SuspiciousArgs), 1, 0),
+    IsScriptParent =
+      iif(InitiatingProcessFileName in~ (
+          "powershell.exe","pwsh.exe","cmd.exe",
+          "bash","sh","python.exe","wscript.exe","node.exe","java.exe"
+      ), 1, 0)
+
+// --- Injection correlation (fileless / in-memory) ---
+| join kind=leftouter (InjectionTargetContext) on DeviceId, $left.ProcessId == $right.InjectorPid
+| extend HasInjectionSignal = iif(isnotempty(FirstInjectTime), 1, 0)
+
+// --- Parent→Child Trust Inversion (optional)
+// If a low-rep loader injects/tampers into a high-rep target, boost heavily.
+// We infer “high-rep target” from common process names and signature status when present.
+// ---
+| extend
+    TrustInversion =
+      iif(
+        EnableTrustInversion
+        and HasInjectionSignal == 1
+        and (
+          // any target name matches high-rep list
+          set_intersect(TargetNames, HighRepTargets) != dynamic([])
+          // OR signature indicates “Valid/Trusted” for target in context
+          or set_intersect(TargetSigStatuses, dynamic(["Valid","Trusted"])) != dynamic([])
+          // OR signer is Microsoft for the target (best-effort)
+          or set_has_element(TargetSigners, "Microsoft Corporation")
+        ),
+        1, 0
+      )
+
+// --- Unsigned / Untrusted module loads (reflective load layer) ---
+| join kind=leftouter (UnsignedModuleLoads) on DeviceId, $left.ProcessId == $right.LoaderPid
+| extend HasUnsignedModuleLoad = iif(isnotempty(FirstUnsignedLoadTime), 1, 0)
+
+// --- Threat Intel confirmation (optional) ---
+| join kind=leftouter KnownImplantHashes on FileSha256
+| extend IsKnownMalware = iif(isnotempty(Hash), 1, 0)
+
+// --- Cross-host hash prevalence scoring (optional) ---
+| join kind=leftouter HashPrevalence on FileSha256
+| extend
+    Prevalence_DeviceCount = toint(Prevalence_DeviceCount),
+    IsRareHash =
+      iif(EnablePrevalenceScoring and isnotempty(FileSha256) and Prevalence_DeviceCount <= RareHashDeviceThreshold, 1, 0),
+    IsCommonHash =
+      iif(EnablePrevalenceScoring and isnotempty(FileSha256) and Prevalence_DeviceCount >= CommonHashDeviceThreshold, 1, 0)
+
+// ============================================================================
+// RISK ENGINE (balanced: additive boosts + controlled prevalence dampening)
+// ============================================================================
+| extend RiskScore =
+      0
+    + iif(HasLowReputation == 1,        40, 0)
+    + iif(IsDevHost == 0,               20, 0)
+    + iif(HasSuspiciousArgs == 1,       20, 0)
+    + iif(IsScriptParent == 1,          10, 0)
+    + iif(HasInjectionSignal == 1,      60, 0)   // FILELESS / MEMORY PRIMITIVES
+    + iif(TrustInversion == 1,          40, 0)   // LOW-REP → HIGH-REP target (very strong)
+    + iif(HasUnsignedModuleLoad == 1,   30, 0)   // REFLECTIVE / GHOST DLL
+    + iif(IsKnownMalware == 1,          60, 0)   // TI CONFIRMATION
+    + iif(IsRareHash == 1,              25, 0)   // rare across org = higher suspicion
+    - iif(IsCommonHash == 1,            20, 0)   // common across org = reduce (not suppress)
+
+| where RiskScore >= MinRisk
+
+// ============================================================================
+// SEVERITY & HUNTER DIRECTIVES (intent-based, SOC-ready)
+// ============================================================================
+| extend Severity = case(
+    IsKnownMalware == 1,                          "CRITICAL",
+    TrustInversion == 1 and HasInjectionSignal==1,"CRITICAL",
+    HasInjectionSignal == 1,                      "CRITICAL",
+    RiskScore >= 110,                             "HIGH",
+                                                   "MEDIUM"
+),
+
+Hunter_Directive = case(
+  Severity == "CRITICAL",
+    "CRITICAL: Suspected implant/loader with in-memory execution characteristics.\n" +
+    "- Evidence: injection primitives and/or trust inversion into high-rep target; possible reflective load.\n" +
+    "- Action: isolate host; capture volatile context (process tree + target PIDs); pivot to DeviceNetworkEvents for C2; run SecretsRecon; hunt persistence.\n" +
+    "- If TrustInversion=1: prioritize target process integrity (svchost/explorer/etc.).",
+
+  Severity == "HIGH",
+    "HIGH: Low-rep execution from user-writable path with strong suspicious context.\n" +
+    "- Acquire binary (hash, signer, file origin); validate prevalence and whether host is truly dev.\n" +
+    "- Pivot: check unsigned module loads and any follow-on injection events. Review parent chain for RCE/stager.",
+
+  "MEDIUM: Suspicious userland execution.\n" +
+  "- Validate if internal tooling; if unknown, monitor for injection/module loads, staging, secrets access, and outbound comms."
+)
+
+| project
+    Timestamp,
+    DeviceName,
+    FileName,
+    FolderPath,
+    FileSha256,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    Signer,
+    SignatureStatus,
+    // Memory / stealth layers
+    HasInjectionSignal,
+    AnyInjectAction,
+    TargetPids,
+    TargetNames,
+    TargetSigStatuses,
+    TrustInversion,
+    HasUnsignedModuleLoad,
+    UnsignedLoadCount,
+    SampleLoadedModules,
+    SampleModulePaths,
+    // TI + prevalence
+    IsKnownMalware,
+    Prevalence_DeviceCount,
+    IsRareHash,
+    IsCommonHash,
+    // Final
+    RiskScore,
+    Severity,
+    Hunter_Directive
+| order by RiskScore desc, Timestamp desc;
+
+
+/*
+============================================================================
+INCIDENT RESPONSE / THREAT HUNTER IR FRAMEWORK (SOC RUNBOOK)
+============================================================================
+
+This hunt is designed for human-led investigation and rapid containment decisions.
+Use it as an L3/L4 “implant/loader confirmation” layer.
+
+1) IDENTIFY (Triage in 5–10 minutes)
+   - Confirm: user-writable path + low reputation + (injection OR trust inversion OR unsigned module load).
+   - If TrustInversion=1: record TargetNames/TargetPids immediately (likely host-process takeover).
+   - Note prevalence: rare hash on few devices increases suspicion; common hash reduces but does not clear.
+
+2) CONTAIN (Decision)
+   - CRITICAL: isolate host immediately.
+   - HIGH: isolate if combined with unknown signer + suspicious args + rare hash or unsigned module load.
+   - If TI hit: block hash/org-wide, isolate affected hosts.
+
+3) INVESTIGATE (Scope + Narrative)
+   - Process tree: identify parent chain and initial access source (RCE/stager/user execution).
+   - Injection: pivot on InjectorPid/TargetPids in DeviceProcessEvents around FirstInjectTime.
+   - Modules: pivot on SampleLoadedModules + SampleModulePaths for other hosts.
+   - Network: pivot to DeviceNetworkEvents for outbound connections from FileName and TargetNames.
+
+4) ERADICATE
+   - Remove payloads from disk (FolderPath).
+   - Remove persistence (scheduled tasks, Run keys, services) associated with parent chain and target processes.
+   - If injected into system processes: assume deeper compromise; consider reimage.
+
+5) RECOVER
+   - Reset affected credentials if SecretsRecon triggers or if dev tooling tokens likely exposed.
+   - Re-onboard/validate Defender health + sensor integrity; ensure telemetry is not degraded.
+
+6) LESSONS LEARNED / HARDENING
+   - WDAC/AppLocker: block execution from user-writable directories where feasible.
+   - ASR rules: harden against injection/tampering where supported.
+   - Reduce local admin; restrict script engines; validate IDE extension policies for dev fleets.
+   - Maintain a watchlist of known implant hashes; feed prevalence + TI into future tuning.
+
+============================================================================
+*/
