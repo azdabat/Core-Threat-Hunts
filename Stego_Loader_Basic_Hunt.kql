@@ -1,12 +1,10 @@
 // ============================================================================
-//  Core and more Primitive: Image-Based Stego Loader Chain
+//  Image-Based Stego Loader Chain (Fixed + Expanded PID Coverage)
 //  Author: Ala Dabat
-//  Version: 2025-12 (Strict Core) L1/L2 (Good for Threat Hunting)
+//  Version: 2025-12 (Strict Core) L1/L2 (Threat Hunting)
 //  Purpose:
-//    Minimal behavioural correlation for stego-style loaders where a user-facing
-//    app spawns a script/LOLBin which reads image files from Downloads/Temp and
-//    then makes outbound network connections shortly afterwards.
-//
+//    Correlate: User-facing app → script/LOLBin → image read (Downloads/Temp) → outbound network
+//    Now includes CHILD-PROC coverage (common in real stego loaders) while staying “core”.
 //  MITRE:
 //    TA0001 Initial Access      : T1566.001 (Spearphishing Attachment)
 //    TA0002 Execution           : T1059 (Command & Scripting Interpreter)
@@ -16,93 +14,165 @@
 
 let lookback = 7d;
 let TimeWindowMinutes = 5;
+let PreImageSkew = 2m;
 
-// User-facing parents (where the lure is likely opened)
+// User-facing parents (lure likely opened here)
 let UserFacingParents = dynamic([
-    "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
-    "chrome.exe","msedge.exe","iexplore.exe","firefox.exe"
+  "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+  "chrome.exe","msedge.exe","iexplore.exe","firefox.exe"
 ]);
 
-// Script / LOLBin-style loaders typically abused here
+// Script / LOLBin hosts commonly abused
 let ScriptHosts = dynamic([
-    "powershell.exe","pwsh.exe",
-    "wscript.exe","cscript.exe",
-    "mshta.exe","rundll32.exe"
+  "powershell.exe","pwsh.exe",
+  "wscript.exe","cscript.exe",
+  "mshta.exe","rundll32.exe"
 ]);
 
 // Image extensions commonly abused for stego payloads
 let ImageExt = dynamic([".png",".jpg",".jpeg",".bmp",".gif"]);
 
-// 1) Script / LOLBin spawned from user-facing app
+// ---- 1) Script / LOLBin spawned from user-facing app
 let ScriptFromUserApps =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName in~ (ScriptHosts)
 | where InitiatingProcessFileName in~ (UserFacingParents)
 | project
-    ScriptTime   = Timestamp,
+    ScriptTime      = Timestamp,
     DeviceId,
     DeviceName,
-    AccountName,
-    ScriptFile   = FileName,
-    ScriptCommand = ProcessCommandLine,
-    ParentImage  = InitiatingProcessFileName,
-    ProcessId;
+    AccountName     = tostring(AccountName),
+    ScriptFile      = tostring(FileName),
+    ScriptCommand   = tostring(ProcessCommandLine),
+    ParentImage     = tostring(InitiatingProcessFileName),
+    ScriptPid       = ProcessId;
 
-// 2) Same process reading image files from Downloads / Temp / browser caches
-let ImageReadsByScript =
+// ---- 2) Expand scope to include immediate children of the script host (common loader split)
+let ProcScope =
+ScriptFromUserApps
+| join kind=leftouter (
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | project
+        DeviceId,
+        ChildTime   = Timestamp,
+        ParentPid   = InitiatingProcessId,
+        ChildPid    = ProcessId,
+        ChildProc   = FileName,
+        ChildCmd    = ProcessCommandLine
+) on DeviceId, $left.ScriptPid == $right.ParentPid
+| extend
+    // Keep “strict core”: only include children created shortly after script start
+    ChildPid = iff(ChildTime between (ScriptTime .. ScriptTime + TimeWindowMinutes*1m), ChildPid, long(null))
+| extend Pids = pack_array(ScriptPid, ChildPid)
+| mv-expand Pids to typeof(long)
+| where isnotempty(Pids)
+| project
+    DeviceId, DeviceName, AccountName, ParentImage,
+    ScriptTime, ScriptFile, ScriptCommand,
+    RootScriptPid = ScriptPid,
+    ScopedPid = Pids;
+
+// ---- 3) Image reads by any scoped PID (root script or its child)
+let ImageReadsByScope =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
 | where ActionType in ("FileRead","FileCreated","FileModified")
-| extend FileExt = tolower(strcat(".", split(FileName, ".")[-1]))
-| where FileExt in~ (ImageExt)
 | where FolderPath has_any ("\\Downloads\\","\\Download\\","\\Temp\\","\\AppData\\Local\\Temp\\")
+| extend LowerName = tolower(FileName)
+| extend FileExt = extract(@"\.[^\.]+$", 0, LowerName)
+| where FileExt in~ (ImageExt)
 | project
-    ImageReadTime      = Timestamp,
+    ImageReadTime = Timestamp,
     DeviceId,
     InitiatingProcessId,
-    ImageFile          = FileName,
-    ImageFolder        = FolderPath;
+    ImageFile = FileName,
+    ImageFolder = FolderPath;
 
-// 3) Same script process then making outbound network calls shortly afterwards
-let NetFromScript =
+// ---- 4) Network from any scoped PID shortly after image read
+let NetFromScope =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where RemotePort in (80,443)
 | project
-    NetTime            = Timestamp,
+    NetTime = Timestamp,
     DeviceId,
     InitiatingProcessId,
     RemoteIP,
     RemoteUrl,
     RemotePort;
 
-// 4) Correlate: ScriptFromUserApps → ImageReads → Network connections (within time window)
-ScriptFromUserApps
-| join kind=inner (
-    ImageReadsByScript
-) on DeviceId, $left.ProcessId == $right.InitiatingProcessId
-| where ImageReadTime between (ScriptTime - 2m .. ScriptTime + TimeWindowMinutes * 1m)
-| join kind=inner (
-    NetFromScript
-) on DeviceId, $left.ProcessId == $right.InitiatingProcessId
-| where NetTime between (ImageReadTime .. ImageReadTime + TimeWindowMinutes * 1m)
+// ---- 5) Correlate: ScriptFromUserApps → (ProcScope) → ImageReads → Network
+ProcScope
+| join kind=inner (ImageReadsByScope) on DeviceId, $left.ScopedPid == $right.InitiatingProcessId
+| where ImageReadTime between (ScriptTime - PreImageSkew .. ScriptTime + TimeWindowMinutes*1m)
+| join kind=inner (NetFromScope) on DeviceId, $left.ScopedPid == $right.InitiatingProcessId
+| where NetTime between (ImageReadTime .. ImageReadTime + TimeWindowMinutes*1m)
 
-// 5) Aggregate per device+process chain
+// ---- 6) Aggregate per chain (device + root script PID)
 | summarize
     FirstScriptTime   = min(ScriptTime),
     LastActivityTime  = max(NetTime),
+    DeviceName        = any(DeviceName),
+    AccountName       = any(AccountName),
     ParentImage       = any(ParentImage),
     ScriptFile        = any(ScriptFile),
     ScriptCommand     = any(ScriptCommand),
-    DeviceName        = any(DeviceName),
-    AccountName       = any(AccountName),
+    RootScriptPid     = any(RootScriptPid),
+    ScopedPids        = make_set(ScopedPid, 10),
     ImageFiles        = make_set(ImageFile, 10),
     ImageFolders      = make_set(ImageFolder, 10),
     RemoteIPs         = make_set(RemoteIP, 10),
     RemoteUrls        = make_set(RemoteUrl, 10),
     RemotePorts       = make_set(RemotePort, 10),
     ImageReadEvents   = count()
-  by DeviceId, ProcessId
+  by DeviceId, RootScriptPid
+
+// ---- 7) Lightweight scoring for hunting triage (still L1/L2 core)
+| extend BaseScore = 5
+| extend Score =
+    BaseScore
+    + iif(ParentImage in~ ("outlook.exe","winword.exe","excel.exe","powerpnt.exe"), 2, 0)
+    + iif(ScriptFile in~ ("mshta.exe","rundll32.exe"), 1, 0)
+    + iif(array_length(RemoteUrls) >= 2 or array_length(RemoteIPs) >= 2, 1, 0)
+| extend RiskLevel = case(
+    Score >= 9, "Critical",
+    Score >= 7, "High",
+    Score >= 5, "Medium",
+    "Low"
+)
+| extend ChainId = tostring(hash_sha256(strcat(DeviceId,"|",tostring(RootScriptPid),"|",tostring(FirstScriptTime))))
+| extend HunterDirective = case(
+    RiskLevel == "Critical",
+        "CRITICAL: User-facing app spawned script/LOLBin that accessed image in Temp/Downloads and made outbound web traffic immediately. Treat as active stego-loader chain; isolate host and pivot to full process tree + network + file lineage.",
+    RiskLevel == "High",
+        "HIGH: Strong stego-loader behavioral chain. Validate user action (email/web), inspect image origin (Zone.Identifier), and review outbound domains/IPs + any follow-on child processes.",
+    RiskLevel == "Medium",
+        "MEDIUM: Suspicious chain; likely staging or benign automation. Pivot on ChainId, check prevalence of RemoteUrl/RemoteIP, and confirm the script’s command line intent.",
+    "LOW: Weak signal; use for hypothesis-driven hunting and enrichment (rare RemoteUrl/RemoteIP, unusual parent app, unusual image folder)."
+)
+| project
+    LastActivityTime,
+    FirstScriptTime,
+    ChainId,
+    DeviceName,
+    AccountName,
+    ParentImage,
+    ScriptFile,
+    RootScriptPid,
+    ScopedPids,
+    ImageFiles,
+    ImageFolders,
+    RemoteUrls,
+    RemoteIPs,
+    RemotePorts,
+    ImageReadEvents,
+    Score,
+    RiskLevel,
+    HunterDirective,
+    ScriptCommand
+| order by Score desc, LastActivityTime desc
+
 
 | order by LastActivityTime desc
