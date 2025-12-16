@@ -1,0 +1,196 @@
+// LOLBins – High Confidence Behavioural Detection
+// Author: Ala Dabat
+// Focus: LSASS dumping, AMSI bypass, encoded payloads, Defender tamper, proxy downloads
+// Scope: Low-volume, high-confidence behavioural triggers across common proxy binaries
+
+let Lookback = 7d;
+let MinRisk = 7;
+
+let LOLBins = dynamic([
+    "rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe","wscript.exe","cscript.exe",
+    "certutil.exe","bitsadmin.exe","schtasks.exe","taskkill.exe","pcalua.exe","forfiles.exe"
+]);
+
+let Ind_LSASS   = dynamic(["comsvcs.dll","MiniDump","lsass.dmp"]);
+let Ind_AMSI    = dynamic(["AmsiUtils","AmsiScanBuffer","amsiInitFailed","System.Management.Automation.AmsiUtils"]);
+let Ind_Encoded = dynamic(["-enc","-encodedcommand","FromBase64String","[Convert]::FromBase64String","IEX(","Invoke-Expression"]);
+let Ind_Defender = dynamic(["Set-MpPreference","DisableRealtimeMonitoring","DisableIOAVProtection","MpCmdRun.exe -RemoveDefinitions"]);
+let Ind_Proxy   = dynamic(["-urlcache","transfer"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (LOLBins)
+| where isnotempty(ProcessCommandLine)
+| extend
+    Indicator =
+        case (
+            // LSASS dump patterns
+            FileName =~ "rundll32.exe" and ProcessCommandLine has_any (Ind_LSASS)
+                or ProcessCommandLine has "lsass.dmp", "LSASS Dump",
+
+            // AMSI bypass behaviour
+            ProcessCommandLine has_any (Ind_AMSI), "AMSI Bypass",
+
+            // Encoded or obfuscated payload execution
+            ProcessCommandLine has_any (Ind_Encoded), "Encoded Payload",
+
+            // Defender tamper attempts
+            ProcessCommandLine has_any (Ind_Defender), "Defender Tamper",
+
+            // LOLBin-based remote download
+            FileName in~ ("certutil.exe","bitsadmin.exe")
+                and ProcessCommandLine has_any (Ind_Proxy), "Proxy Download",
+
+            // Other suspicious LOLBin execution
+            ProcessCommandLine has_any (Ind_LSASS + Ind_AMSI + Ind_Encoded + Ind_Defender + Ind_Proxy),
+                "Suspicious LOLBin",
+
+            // Default
+            ""
+        )
+| where Indicator != ""
+| extend
+    Risk =
+        case (
+            Indicator == "LSASS Dump",           10,
+            Indicator == "AMSI Bypass",          9,
+            Indicator == "Encoded Payload",      9,
+            Indicator == "Defender Tamper",      8,
+            Indicator == "Proxy Download",       7,
+                                                 5
+        )
+| where Risk >= MinRisk
+| extend
+    MITRE =
+        case (
+            Indicator == "LSASS Dump",      "T1003.001; T1218",
+            Indicator == "AMSI Bypass",     "T1562.001; T1218",
+            Indicator == "Encoded Payload", "T1027; T1218",
+            Indicator == "Defender Tamper", "T1562.001; T1489",
+            Indicator == "Proxy Download",  "T1105; T1218",
+                                             "T1218"
+        ),
+    AnalystNotes =
+        case (
+            Indicator == "LSASS Dump",
+                "Possible LSASS memory access via LOLBin. Review process tree, memory access, credential use.",
+            Indicator == "AMSI Bypass",
+                "AMSI bypass activity. Check surrounding PowerShell or script execution.",
+            Indicator == "Encoded Payload",
+                "Obfuscated or encoded payload execution. Decode command line and inspect spawned processes.",
+            Indicator == "Defender Tamper",
+                "Defender configuration modification attempt. Review device health and follow-on events.",
+            Indicator == "Proxy Download",
+                "Remote download via certutil/bitsadmin. Retrieve downloaded file and validate hash.",
+            "Suspicious LOLBin behaviour."
+        )
+| project
+    Timestamp,
+    DeviceName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountUpn,
+    Indicator,
+    Risk,
+    MITRE,
+    AnalystNotes
+| order by Timestamp desc
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (LolBins)
+| where isnotempty(ProcessCommandLine)
+| where ProcessCommandLine has_any (HighRiskTokens)
+// reduce obvious background noise from core service accounts
+| where InitiatingProcessAccountName !in~ ("SYSTEM","LOCAL SERVICE","NETWORK SERVICE")
+| extend
+    IndicatorType =
+        case(
+            // LSASS dumping via rundll32/comsvcs or explicit lsass.dmp reference
+            (FileName =~ "rundll32.exe"
+                and ProcessCommandLine has_any ("comsvcs.dll","MiniDump"))
+                or ProcessCommandLine has "lsass.dmp",
+                "LSASS Dump",
+
+            // AMSI bypass strings
+            ProcessCommandLine has_any ("AmsiUtils","AmsiScanBuffer","amsiInitFailed","System.Management.Automation.AmsiUtils"),
+                "AMSI Bypass",
+
+            // Encoded / obfuscated payload execution
+            ProcessCommandLine has_any ("-enc","-encodedcommand","FromBase64String","[Convert]::FromBase64String","IEX(","Invoke-Expression"),
+                "Encoded / Obfuscated Payload",
+
+            // Defender configuration tampering
+            ProcessCommandLine has_any ("Set-MpPreference","DisableRealtimeMonitoring","DisableIOAVProtection","MpCmdRun.exe -RemoveDefinitions"),
+                "Defender Tamper",
+
+            // Proxy-style download via certutil/bitsadmin
+            FileName in~ ("certutil.exe","bitsadmin.exe")
+                and ProcessCommandLine has_any ("-urlcache","transfer"),
+                "Proxy Download (certutil/bitsadmin)",
+
+            // Fallback
+            "Suspicious LOLBin Usage"
+        ),
+    RiskScore =
+        case(
+            IndicatorType == "LSASS Dump",                    10,
+            IndicatorType == "AMSI Bypass",                   9,
+            IndicatorType == "Encoded / Obfuscated Payload",  9,
+            IndicatorType == "Defender Tamper",               8,
+            IndicatorType == "Proxy Download (certutil/bitsadmin)", 7,
+            5
+        ),
+    MITRE_Tactics =
+        case(
+            IndicatorType == "LSASS Dump",                    "Credential Access; Defense Evasion",
+            IndicatorType == "AMSI Bypass",                   "Defense Evasion",
+            IndicatorType == "Encoded / Obfuscated Payload",  "Defense Evasion; Execution",
+            IndicatorType == "Defender Tamper",               "Defense Evasion; Impact",
+            IndicatorType == "Proxy Download (certutil/bitsadmin)", "Execution; Defense Evasion",
+                                                                 "Defense Evasion"
+        ),
+    MITRE_Techniques =
+        case(
+            IndicatorType == "LSASS Dump",                    "T1003.001; T1218",
+            IndicatorType == "AMSI Bypass",                   "T1562.001; T1218",
+            IndicatorType == "Encoded / Obfuscated Payload",  "T1027; T1218; T1059",
+            IndicatorType == "Defender Tamper",               "T1562.001; T1489",
+            IndicatorType == "Proxy Download (certutil/bitsadmin)", "T1105; T1218",
+                                                                 "T1218"
+        ),
+    HunterNotes =
+        case(
+            IndicatorType == "LSASS Dump",
+                strcat("CRITICAL: Possible LSASS dump via ", FileName,
+                       ". Pivot to DeviceFileEvents for *.dmp creation and review lateral movement / credential reuse."),
+            IndicatorType == "AMSI Bypass",
+                "HIGH: AMSI bypass attempt. Review preceding / following PowerShell or script activity on this host.",
+            IndicatorType == "Encoded / Obfuscated Payload",
+                strcat("HIGH: Encoded or obfuscated payload executed by ", FileName,
+                       ". Decode the command line, inspect child processes and outbound connections."),
+            IndicatorType == "Defender Tamper",
+                "HIGH: Potential tampering with Microsoft Defender. Check Defender health, recent detections and follow-on persistence.",
+            IndicatorType == "Proxy Download (certutil/bitsadmin)",
+                "MODERATE: File download via certutil/bitsadmin. Identify downloaded file, obtain hash and check against TI/sandbox.",
+            "Suspicious LOLBin chain. Review full process tree, parent command-line and concurrent alerts for this host."
+        )
+// production gating
+| where RiskScore >= MinRiskScore
+| project
+    Timestamp,
+    DeviceName,
+    ProcessName      = FileName,
+    ProcessCommandLine,
+    ParentProcess    = InitiatingProcessFileName,
+    ParentCommand    = InitiatingProcessCommandLine,
+    Account          = InitiatingProcessAccountUpn,
+    IndicatorType,
+    RiskScore,
+    MITRE_Tactics,
+    MITRE_Techniques,
+    HunterNotes,
+    RuleName         = "LOLBins_LSASS_AMSI_Encoded_V1"
+| order by RiskScore desc, Timestamp desc
