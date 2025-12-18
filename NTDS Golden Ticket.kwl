@@ -1,0 +1,133 @@
+======================================================================
+// HUNT: CORE+_NTDS_VSS_DCSYNC_CHAIN
+// Author: Ala Dabat
+// Audience: L2/L2.5 Threat Hunters (CORE+)
+// Purpose: Tight behavioural chain: NTDS/VSS tooling OR NTDS file access
+//          correlated with suspicious LDAP/SMB/RPC ports soon after.
+// Notes: Uses IsServer (DeviceInfo) not hostname patterns.
+// ============================================================================
+
+let lookback = 7d;
+let corrWindow = 15m;
+
+// ---- Server classification (robust in MDE) ----
+let DeviceInventory =
+DeviceInfo
+| summarize arg_max(Timestamp, *) by DeviceId
+| extend IsServer = DeviceType =~ "Server"
+| project DeviceId, DeviceName, IsServer;
+
+// ---- Minimal suspicious tooling anchors ----
+let ToolNames = dynamic(["ntdsutil.exe","vssadmin.exe","esentutl.exe","wbadmin.exe"]);
+let ProcCmdSignals = dynamic(["ntds","ntdsutil","ac i ntds","create shadow","delete shadows","shadowcopy","ifm","install from media"]);
+let SuspiciousNetPorts = dynamic([135,139,389,445,636,3268,3269]);
+
+let ProcSignals =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ToolNames)
+   or ProcessCommandLine has_any (ProcCmdSignals)
+| extend Account = coalesce(InitiatingProcessAccountName, AccountName)
+| project
+    SignalTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    Account,
+    SignalType = "Process",
+    ProcName = FileName,
+    ProcCmd = ProcessCommandLine,
+    ParentProc = InitiatingProcessFileName,
+    ParentCmd  = InitiatingProcessCommandLine;
+
+let FileSignals =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName =~ "ntds.dit" or FolderPath has @"\Windows\NTDS\"
+| where ActionType in ("FileCreated","FileCopied","FileRead","FileRenamed","FileModified")
+| extend Account = tostring(InitiatingProcessAccountName)
+| project
+    SignalTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    Account,
+    SignalType = "File",
+    FileAction = ActionType,
+    FileName,
+    FolderPath,
+    FileProc = InitiatingProcessFileName,
+    FileCmd  = InitiatingProcessCommandLine;
+
+let NetSignals =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "ConnectionSuccess"
+| where RemotePort in (SuspiciousNetPorts)
+| extend Account = tostring(InitiatingProcessAccountUpn)
+| project
+    NetTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    Account,
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    NetProc = InitiatingProcessFileName,
+    NetCmd  = InitiatingProcessCommandLine;
+
+// ---- Correlate: Process/File signal -> Network within window (same device + account) ----
+let StageA =
+union isfuzzy=true
+    (ProcSignals | project DeviceId, DeviceName, Account, SignalTime, SignalType, Evidence=pack("ProcName",ProcName,"ProcCmd",ProcCmd,"ParentProc",ParentProc)),
+    (FileSignals | project DeviceId, DeviceName, Account, SignalTime, SignalType, Evidence=pack("FileName",FileName,"FolderPath",FolderPath,"FileProc",FileProc,"FileCmd",FileCmd));
+
+StageA
+| join kind=inner NetSignals on DeviceId, DeviceName
+| where NetTime between (SignalTime .. SignalTime + corrWindow)
+| join kind=leftouter DeviceInventory on DeviceId
+| extend IsServer = coalesce(IsServer, false)
+| summarize
+    FirstSeen = min(SignalTime),
+    LastSeen  = max(NetTime),
+    IsServer  = any(IsServer),
+    SignalTypes = make_set(SignalType, 5),
+    NetPorts    = make_set(RemotePort, 10),
+    RemoteIPs   = make_set(RemoteIP, 10),
+    RemoteUrls  = make_set(RemoteUrl, 10),
+    Evidence    = make_list(Evidence, 10),
+    NetSample   = any(pack("NetProc",NetProc,"NetCmd",NetCmd))
+  by DeviceName, Account
+| extend Severity = case(
+    IsServer and set_has_element(SignalTypes,"File"), "CRITICAL",
+    IsServer and set_has_element(SignalTypes,"Process"), "HIGH",
+    set_has_element(SignalTypes,"File"), "HIGH",
+    "MEDIUM"
+)
+| extend KillChainStage = "Credential Access / Domain Discovery (NTDS/VSS/DCSync candidate)"
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+      "CRITICAL: Server-host chain. NTDS path access and/or NTDS/VSS tooling correlated with LDAP/SMB/RPC shortly after. Treat as domain compromise candidate; escalate to L3 immediately.",
+    Severity == "HIGH",
+      "HIGH: NTDS/VSS tool or NTDS path access correlated with suspicious directory/SMB ports. Validate backup/DR change windows; if not expected, escalate to L3.",
+    "MEDIUM: Weak-but-interesting correlation. Use as pivot lead; validate whether this is admin/backup tooling or reconnaissance."
+)
+| project FirstSeen, LastSeen, Severity, DeviceName, IsServer, Account, SignalTypes, NetPorts, RemoteIPs, RemoteUrls, NetSample, Evidence, KillChainStage, HunterDirective
+| order by Severity asc, LastSeen desc
+;
+
+// -----------------------------------------------------------------------------
+// IR FRAMEWORK (CORE+) — Use in triage (do not automate from hunt output)
+// -----------------------------------------------------------------------------
+// 1) IDENTIFY
+//    - Confirm chain: (NTDS/VSS tooling OR NTDS path access) + network to 389/636/3268/3269/445/135 within 15m.
+//    - Check whether host is a server (IsServer=true). Server hits are priority.
+// 2) VALIDATE
+//    - Compare against documented backup/DR tooling and change windows.
+//    - Inspect Evidence/NetSample for secretsdump/dcsync indicators (python, impacket strings, dcsync).
+// 3) CONTAIN (IF UNEXPECTED)
+//    - Escalate to L3 immediately for deep pivots.
+//    - If active C2 or repeated LDAP/SMB bursts: isolate device via MDE and collect investigation package.
+// 4) INVESTIGATE
+//    - Pivot on RemoteIP across tenant; pivot on DeviceName for additional suspicious process creation.
+// 5) ERADICATE/RECOVER
+//    - If confirmed: rotate privileged creds; consider KRBTGT rotation (requires major incident process).
+// -----------------------------------------------------------------------------
