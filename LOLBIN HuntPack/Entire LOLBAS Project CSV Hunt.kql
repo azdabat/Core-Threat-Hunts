@@ -1,0 +1,138 @@
+// ============================================================================
+// Rule: L2.5_LOLBAS_Feed_Driven_Execution_Hunt
+// Enhancements:
+//   - Confidence column (Low / Medium / High)
+//   - ChainId for multi-LOLBIN attack correlation
+//
+// Purpose:
+//   Feed-driven detection for LOLBAS-documented Windows binaries
+//   using an external CSV source as the authoritative list.
+//
+// Data:
+//   DeviceProcessEvents + external LOLBAS CSV
+//
+// Author: Ala Dabat
+// ============================================================================
+
+let lookback = 7d;
+
+// ---------------------------------------------------------------------------
+// EXTERNAL LOLBAS FEED (replace with your mirrored CSV if needed)
+// ---------------------------------------------------------------------------
+let LOLBAS =
+externaldata(
+    Name:string,
+    Type:string,
+    Description:string,
+    Commands:string,
+    Full_Path:string,
+    Usecase:string
+)
+[@"https://raw.githubusercontent.com/LOLBAS-Project/LOLBAS/master/LOLBins.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+// ---------------------------------------------------------------------------
+// NORMALIZE LOLBAS DATA
+// ---------------------------------------------------------------------------
+let LOLBAS_Normalized =
+LOLBAS
+| extend
+    Binary = tolower(coalesce(Name, extract(@"([^\\\/]+)$", 1, Full_Path))),
+    AbuseCategory = coalesce(Usecase, Type, "Unknown"),
+    HasDownloadHint = Commands has_any ("http", "https", "ftp", "download"),
+    HasScriptHint   = Commands has_any ("javascript", "vbscript", "powershell", "mshta"),
+    HasPersistHint  = Commands has_any ("schtasks", "reg add", "sc create", "service"),
+    HasDLLHint      = Commands has ".dll"
+| where isnotempty(Binary)
+| project Binary, AbuseCategory, Description,
+          HasDownloadHint, HasScriptHint, HasPersistHint, HasDLLHint;
+
+// ---------------------------------------------------------------------------
+// PROCESS TELEMETRY + JOIN
+// ---------------------------------------------------------------------------
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| extend Proc = tolower(FileName)
+| join kind=inner LOLBAS_Normalized on $left.Proc == $right.Binary
+
+// ---------------------------------------------------------------------------
+// CHEAP BEHAVIORAL GATES (CPU SAFE)
+// ---------------------------------------------------------------------------
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "javascript","vbscript","scrobj",
+    ".dll",
+    "-enc","frombase64string","iex",
+    "/create","/tn","sc create","reg add"
+)
+
+// ---------------------------------------------------------------------------
+// CONTEXTUAL SIGNALS
+// ---------------------------------------------------------------------------
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("javascript:","vbscript:","scrobj.dll"),
+    HasEncoded = ProcessCommandLine has_any ("-enc","frombase64string"),
+    HasDLL = ProcessCommandLine has ".dll",
+    IsPersistence = ProcessCommandLine has_any ("schtasks","/create","/tn","sc create","reg add"),
+    SuspiciousParent = InitiatingProcessFileName in~ (
+        "cmd.exe","powershell.exe","pwsh.exe",
+        "wscript.exe","cscript.exe",
+        "winword.exe","excel.exe","outlook.exe","powerpnt.exe"
+    )
+
+// ---------------------------------------------------------------------------
+// RISK SCORING (L2.5 BALANCED)
+// ---------------------------------------------------------------------------
+| extend RiskScore =
+    0
+    + iif(HasNet and HasDownloadHint, 40, 0)
+    + iif(HasScript and HasScriptHint, 40, 0)
+    + iif(HasDLL and HasDLLHint, 30, 0)
+    + iif(IsPersistence and HasPersistHint, 40, 0)
+    + iif(HasEncoded, 30, 0)
+    + iif(SuspiciousParent, 20, 0)
+
+// ---------------------------------------------------------------------------
+// CONFIDENCE CLASSIFICATION (ANALYST-FACING)
+// ---------------------------------------------------------------------------
+| extend Confidence = case(
+    RiskScore >= 80, "High",
+    RiskScore between (60 .. 79), "Medium",
+    "Low"
+)
+| where RiskScore >= 50
+
+// ---------------------------------------------------------------------------
+// CHAIN CORRELATION (MULTI-LOLBIN ATTACKS)
+// - 30 minute bins per device
+// - Same ChainId = same attack chain
+// ---------------------------------------------------------------------------
+| extend ChainWindow = bin(TimeGenerated, 30m)
+| extend ChainId = hash(strcat(DeviceName, "|", tostring(ChainWindow)))
+
+// ---------------------------------------------------------------------------
+// ANALYST OUTPUT
+// ---------------------------------------------------------------------------
+| extend Hunter_Directive = case(
+    Confidence == "High" and HasNet,
+        "CRITICAL: LOLBAS binary performing remote execution or payload retrieval",
+    Confidence == "High" and IsPersistence,
+        "CRITICAL: LOLBAS binary attempting persistence",
+    Confidence == "Medium" and HasScript,
+        "HIGH: Script-based execution via LOLBAS binary",
+    Confidence == "Medium" and HasDLL,
+        "HIGH: DLL-based proxy execution via LOLBAS binary",
+    "Suspicious LOLBAS-documented binary execution"
+)
+
+| summarize
+    EventCount = count(),
+    MaxRisk = max(RiskScore),
+    Confidence = any(Confidence),
+    SampleCLI = any(ProcessCommandLine),
+    LOLBAS_Description = any(Description),
+    LOLBAS_UseCase = any(AbuseCategory)
+    by DeviceName, FileName, ChainId, Hunter_Directive
+
+| where not(EventCount > 25 and MaxRisk < 70)
