@@ -1,0 +1,191 @@
+// ============================================================================
+// Hunt: L2.5_Unauthorized_RMM_Activity_LOLRMM
+// Author: Ala Dabat
+//
+// Feed:
+//   https://lolrmm.io/api/rmm_tools.csv  (AUTHORITATIVE SOURCE)
+//
+// Detection model (aligned with LOLRMM official logic):
+//   1. Detect network connections to known RMM infrastructure
+//   2. Exclude tenant-approved RMMs
+//   3. Correlate with optional process execution + follow-on file drops
+//   4. Score + confidence for SOC triage
+// ============================================================================
+
+let lookback = 7d;
+let corrWindow = 15m;
+
+// ----------------------------
+// Tenant-approved RMM domains
+// ----------------------------
+let ApprovedRMM = dynamic([
+  "nomachine.com",
+  "ivanti.com",
+  "getgo.com"
+]);
+
+// ----------------------------
+// Load LOLRMM tools feed
+// ----------------------------
+let RMMTools =
+externaldata(
+  Name:string,
+  Category:string,
+  Description:string,
+  Author:string,
+  Created:string,
+  LastModified:string,
+  Website:string,
+  Filename:string,
+  OriginalFileName:string,
+  PEDescription:string,
+  Product:string,
+  Privileges:string,
+  Free:string,
+  Verification:string,
+  SupportedOS:string,
+  Capabilities:string,
+  Vulnerabilities:string,
+  InstallationPaths:string,
+  Artifacts:string,
+  Detections:string,
+  References:string,
+  Acknowledgement:string
+)
+[@"https://lolrmm.io/api/rmm_tools.csv"]
+with (format="csv", ignoreFirstRecord=true)
+| where SupportedOS has "Windows";
+
+// ----------------------------
+// Extract RMM infrastructure domains (OFFICIAL INTENT)
+// ----------------------------
+let RMM_Domains =
+RMMTools
+| where isnotempty(Website)
+| extend Domain = tolower(
+    replace_regex(Website, @"^https?://", "")
+)
+| extend Domain = split(Domain, "/")[0]
+| where Domain !has "github.com"
+| summarize by Domain;
+
+// ----------------------------
+// Network detection (PRIMARY SIGNAL)
+// ----------------------------
+let RMM_Network =
+DeviceNetworkEvents
+| where Timestamp > ago(lookback)
+| where ActionType == "ConnectionSuccess"
+| extend RemoteUrlLower = tolower(RemoteUrl)
+| where isnotempty(RemoteUrlLower)
+| where RemoteUrlLower has_any (RMM_Domains)
+| where not(RemoteUrlLower has_any (ApprovedRMM))
+| project
+    NetTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    RemoteUrl = RemoteUrlLower,
+    RemoteIP,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine;
+
+// ----------------------------
+// Optional: process confirmation (SECONDARY SIGNAL)
+// ----------------------------
+let RMM_Artifacts =
+RMMTools
+| extend ArtifactList = split(replace_string(tostring(Artifacts), ";", ","), ",")
+| mv-expand ArtifactList to typeof(string)
+| extend Artifact = tolower(trim(" ", ArtifactList))
+| extend Artifact = replace_string(Artifact, "*", "")
+| where Artifact matches regex @"\.(exe|dll|msi|ps1|bat|cmd)$"
+| summarize by Artifact;
+
+let RMM_Process =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend ProcLower = tolower(FileName)
+| where ProcLower in (RMM_Artifacts)
+| project
+    ProcTime = Timestamp,
+    DeviceId,
+    RmmProc = ProcLower,
+    RmmCmd = ProcessCommandLine,
+    RmmParent = InitiatingProcessFileName,
+    RmmAccount = strcat(AccountDomain, "\\", AccountName);
+
+// ----------------------------
+// Optional: follow-on file drops
+// ----------------------------
+let RiskExt = dynamic([".exe",".dll",".ps1",".bat",".cmd",".vbs",".hta",".jse",".js",".cpl"]);
+let FileDrops =
+DeviceFileEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("FileCreated","FileModified")
+| extend FileExt = tolower(strcat(".", split(FileName, ".")[-1]))
+| where FileExt in~ (RiskExt)
+| project
+    FileTime = Timestamp,
+    DeviceId,
+    DroppedFile = FileName,
+    DropPath = FolderPath,
+    DropProc = InitiatingProcessFileName;
+
+// ----------------------------
+// Correlation + scoring
+// ----------------------------
+RMM_Network
+| join kind=leftouter RMM_Process on DeviceId
+| where isnull(ProcTime) or ProcTime between (NetTime - corrWindow .. NetTime + corrWindow)
+| join kind=leftouter FileDrops on DeviceId
+| where isnull(FileTime) or FileTime between (NetTime .. NetTime + corrWindow)
+
+| extend Score =
+    0
+    + iif(isnotempty(RemoteUrl), 4, 0)
+    + iif(isnotempty(RmmProc), 3, 0)
+    + iif(isnotempty(DroppedFile), 4, 0)
+    + iif(InitiatingProcessFileName in~ (
+        "winword.exe","excel.exe","outlook.exe","powerpnt.exe",
+        "powershell.exe","pwsh.exe","cmd.exe","mshta.exe"
+      ), 2, 0)
+
+| extend Confidence = case(
+    Score >= 10, "High",
+    Score between (7 .. 9), "Medium",
+    "Low"
+)
+
+| extend ChainId = hash(strcat(DeviceName, "|", tostring(bin(NetTime, 30m))))
+
+| extend HunterDirective = case(
+    Confidence == "High",
+      "CRITICAL: Unsanctioned RMM infrastructure with execution and/or payload activity",
+    Confidence == "Medium",
+      "HIGH: Unsanctioned RMM infrastructure — validate authorization and scope",
+    "MEDIUM: RMM domain contact observed — confirm legitimacy"
+)
+
+// ----------------------------
+// Analyst output
+// ----------------------------
+| summarize
+    FirstSeen = min(NetTime),
+    LastSeen = max(coalesce(FileTime, NetTime)),
+    Confidence = any(Confidence),
+    Score = max(Score),
+
+    RmmDomains = make_set(RemoteUrl, 20),
+    RemoteIPs = make_set(RemoteIP, 20),
+
+    RmmProcs = make_set(RmmProc, 20),
+    SampleRmmCmd = any(RmmCmd),
+    Parents = make_set(coalesce(RmmParent, InitiatingProcessFileName), 20),
+    Accounts = make_set(RmmAccount, 20),
+
+    DroppedFiles = make_set(DroppedFile, 20),
+    DropPaths = make_set(DropPath, 20),
+
+    HunterDirective = any(HunterDirective)
+  by DeviceId, DeviceName, ChainId
+| order by Score desc, FirstSeen desc
