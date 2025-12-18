@@ -5,66 +5,106 @@
 // Author: Ala Dabat 
 
 let lookback = 24h;
+let preWindow = 5m;
 
-// --- EXPANDED TARGET PROCESSES ---
+// --- CORE LOLBINS ---
 let TargetProcs = dynamic([
-    "regsvr32.exe","mshta.exe","rundll32.exe","installutil.exe","regasm.exe","regsvcs.exe", // Original LOLBINs
-
-    // New LOLBINs for Ingress/Execution:
-    "certutil.exe", // Used for downloading/decoding payloads
-    "bitsadmin.exe", // Used for downloading/transferring files
-    "msiexec.exe", // Used for running installation files/scripts
-    "forfiles.exe", // Used for executing commands across files
-    "mavinject.exe", // Used for process injection
-
-    // New LOLBINs for Discovery/Evasion:
-    "taskmgr.exe", // Sometimes used to start suspicious processes
-    "at.exe", "schtasks.exe", // Used for persistence/time-based execution
-    "wmic.exe" // Used for discovery/lateral movement (added for completeness)
+    "regsvr32.exe","mshta.exe","rundll32.exe","installutil.exe",
+    "regasm.exe","regsvcs.exe","certutil.exe","bitsadmin.exe",
+    "msiexec.exe","schtasks.exe","wmic.exe"
 ]);
 
-let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
-let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe",
+    "wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe"
+]);
 
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp",
+    "\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+
+// PROCESS SIGNAL
+let ProcSignals =
 DeviceProcessEvents
 | where TimeGenerated > ago(lookback)
 | where FileName in~ (TargetProcs)
-| where ProcessCommandLine has_any ("http","ftp","scrobj","javascript","vbscript",".dll","/i","/u","Uninstallation", // Original Payload Keywords
-                                     "download","decode","urlcache", // New keywords for downloaders (certutil, bitsadmin)
-                                     "/r /t","create /tn" // New keywords for persistence (schtasks)
-                                   )
+| where ProcessCommandLine has_any (
+    "http","https","ftp","scrobj","javascript","vbscript",".dll",
+    "download","decode","urlcache","frombase64string","-enc",
+    "/i","/u","/qn","schtasks","/create","/tn"
+)
 | extend
-    IsRundll32 = FileName =~ "rundll32.exe",
     HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
-    HasScript = ProcessCommandLine has_any ("scrobj.dll","javascript:","vbscript:","wscript.shell"),
+    HasScript = ProcessCommandLine has_any ("scrobj.dll","javascript:","vbscript:"),
+    HasEncoded = ProcessCommandLine has_any ("-enc","frombase64string"),
     BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
-    WeirdExport = IsRundll32 and ProcessCommandLine matches regex @"(?i),(#\d+|run|start|dllregisterserver|entry|main)",
+    IsRundll32 = FileName =~ "rundll32.exe",
+    WeirdExport = IsRundll32 and ProcessCommandLine matches regex @"(?i),(#\d+|run|start|entry|main|dllregisterserver)",
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = FileName in~ ("certutil.exe","bitsadmin.exe")
+        and ProcessCommandLine has_any ("download","urlcache","http"),
+    IsPersistence = FileName in~ ("schtasks.exe","at.exe","sc.exe")
+        and ProcessCommandLine has_any ("create","/create","/tn"),
 
-    // --- NEW BEHAVIORAL FLAGS ---
-    IsDownloader = FileName in~ ("certutil.exe", "bitsadmin.exe") and ProcessCommandLine has_any ("download", "urlcache", "retrieve"),
-    IsPersistence = FileName in~ ("schtasks.exe", "at.exe") and ProcessCommandLine has_any ("create", "/r /t")
+    // --- L3 ADDITIONS ---
+    Masquerade = isnotempty(OriginalFileName) and tolower(OriginalFileName) !contains tolower(FileName),
+    HighIntegrity = InitiatingProcessIntegrityLevel in ("System","High")
+;
+
+// NETWORK / EXFIL SIGNAL
+let NetSignals =
+DeviceNetworkEvents
+| where TimeGenerated > ago(lookback)
+| where InitiatingProcessFileName in~ (TargetProcs)
+| extend
+    ExfilPattern =
+        RemotePort in (21,22,53,443,8080,8443) and
+        (SentBytes > 500000 or Protocol =~ "Dns"),
+    Remote = coalesce(RemoteIP, RemoteUrl)
+| project DeviceName, TimeGenerated, Remote, RemoteIP, RemoteUrl, ExfilPattern;
+
+// JOIN + RISK ENGINE
+
+ProcSignals
+| join kind=leftouter NetSignals on DeviceName
 | extend RiskScore =
     0
-    // Increased score for network-related activity (download/remote execution)
     + iif(HasNet or IsDownloader, 60, 0)
-    + iif(HasScript, 50, 0)
-    
-    // Core LOLBIN and DLL abuse
+    + iif(HasScript or HasEncoded, 50, 0)
     + iif(BadDLLPath, 30, 0)
     + iif(WeirdExport, 20, 0)
-    
-    // High-Confidence Triggers
-    + iif(BadParent, 20, 0) // Executed by a suspicious process
-    + iif(IsPersistence, 40, 0) // Attempting to establish persistence
-| where RiskScore >= 50
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + iif(Masquerade, 30, 0)
+    + iif(HighIntegrity, 40, 0)
+    + iif(ExfilPattern, 40, 0)
+| where RiskScore >= 70
+
+// L3 HUNTER DIRECTIVES (FLOW EMBEDDED)
+
 | extend Hunter_Directive = case(
-    HasNet or IsDownloader, "CRITICAL: Remote File Download/Script Execution via LOLBIN",
-    IsPersistence, "HIGH: LOLBIN used to establish Scheduled Task/Persistence",
-    HasScript, "Remote/scriptlet execution",
-    BadDLLPath or WeirdExport, "Local DLL loader from non-system path",
+    HasNet and HighIntegrity,
+        "CRITICAL: LOLBIN executed with network access at SYSTEM integrity — isolate host immediately.",
+    Masquerade,
+        "CRITICAL: Signed LOLBIN masquerading (OriginalFileName mismatch).",
+    ExfilPattern,
+        "HIGH: Possible data exfiltration via LOLBIN outbound traffic.",
+    IsPersistence,
+        "HIGH: LOLBIN used to establish persistence.",
+    HasScript or HasEncoded,
+        "HIGH: Script or encoded payload execution via LOLBIN.",
+    BadDLLPath or WeirdExport,
+        "MEDIUM-HIGH: DLL proxy execution from non-system path.",
     "Suspicious LOLBIN activity"
 )
-| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+
+| summarize
+    Count = count(),
+    MaxRisk = max(RiskScore),
+    SampleCLI = any(ProcessCommandLine),
+    RemoteSeen = any(Remote),
+    Integrity = any(InitiatingProcessIntegrityLevel)
     by DeviceName, FileName, Hunter_Directive
-| where not(Count > 20 and MaxRisk < 70) // Retain your noise suppression filter
+| where not(Count > 20 and MaxRisk < 80)
