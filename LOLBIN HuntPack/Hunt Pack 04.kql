@@ -1,0 +1,52 @@
+// ============================================================================
+// HUNT PACK 04/10 — Ingress Tool Transfer (Download Cradles)
+// Binaries: certutil.exe, bitsadmin.exe, curl.exe, wget.exe, ftp.exe, tftp.exe, powershell.exe
+// Notes: Focused and fast; avoids “universal” keyword sprawl.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["certutil.exe","bitsadmin.exe","curl.exe","wget.exe","ftp.exe","tftp.exe","powershell.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    // certutil
+    "-urlcache","-split","-f","decode","encode",
+    // bitsadmin
+    "/transfer","/addfile","/setnotifycmdline","/resume",
+    // curl/wget
+    " -o "," --output "," -OutFile ","--remote-name",
+    // powershell download cradles
+    "invoke-webrequest","iwr","invoke-restmethod","irm","downloadstring","new-object net.webclient"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("downloadstring","iex","-enc","frombase64string"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = HasNet,
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    HasNet or IsDownloader, "CRITICAL: Ingress tool transfer via LOLBIN downloader",
+    HasScript, "HIGH: Download + immediate execution pattern (cradle/encoded/script)",
+    BadParent, "MEDIUM: Downloader spawned by suspicious parent",
+    "Suspicious downloader activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
