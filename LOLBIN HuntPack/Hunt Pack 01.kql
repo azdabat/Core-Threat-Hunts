@@ -1,12 +1,15 @@
 // ============================================================================
-// HUNT PACK 01/10 — .NET Build/Compile Execution (AWL Bypass / Fileless)
-// Binaries: msbuild.exe, csc.exe, csi.exe, ieexec.exe, installutil.exe, regasm.exe, regsvcs.exe
-// Notes: Covers your “services missing” list for build/compile execution vectors.
+// HUNT PACK 01/10 (UPDATED) — .NET Build/Compile Execution + PCWRun
+// Binaries: msbuild.exe, csc.exe, csi.exe, ieexec.exe, installutil.exe, regasm.exe, pcwrun.exe
+// Fixes:
+//   - Adds PCWRun.exe high-fidelity "-s <target>" execution pattern
+// LOLBAS includes PresentationHost/msxsl etc; PCWRun is often referenced in LOL technique discussions
+// but we keep detection extremely strict to avoid noise.
 // ============================================================================
 
 let lookback = 7d;
 
-let TargetProcs = dynamic(["msbuild.exe","csc.exe","csi.exe","ieexec.exe","installutil.exe","regasm.exe","regsvcs.exe"]);
+let TargetProcs = dynamic(["msbuild.exe","csc.exe","csi.exe","ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe"]);
 let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
@@ -14,26 +17,32 @@ DeviceProcessEvents
 | where TimeGenerated > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // MSBuild / .NET compile & exec patterns
+    // MSBuild / .NET build exec
     ".csproj",".vbproj",".proj",".targets","/t:","/p:","/m",
+
     // CSC patterns
     "-target:","-reference:","-r:","/unsafe","/platform","-out:",
-    // C# Interactive
+
+    // C# interactive
     ".csx","-script",
-    // IEExec ClickOnce / manifest execution
+
+    // IEExec ClickOnce/manifest exec
     ".application",".manifest",
-    // InstallUtil / RegAsm / RegSvcs execution pivots
-    "/u","uninstall","/logfile=","/logtoconsole",
-    "codebase","/tlb"
+
+    // InstallUtil/RegAsm patterns
+    "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
+
+    // PCWRun execution broker
+    "pcwrun.exe"," -s "
 )
 | extend
     HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
-    HasScript = ProcessCommandLine has_any ("javascript:","vbscript:","scrobj.dll"),
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
     BadDLLPath = (ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs),
-    IsRundll32 = FileName =~ "rundll32.exe",
     WeirdExport = bool(false),
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
-    IsDownloader = FileName in~ ("msbuild.exe","ieexec.exe") and HasNet,
+    PcwRunBroker = FileName =~ "pcwrun.exe" and ProcessCommandLine has " -s ",
+    IsDownloader = (FileName =~ "ieexec.exe" and HasNet),
     IsPersistence = bool(false)
 | extend RiskScore =
     0
@@ -42,11 +51,12 @@ DeviceProcessEvents
     + iif(BadDLLPath, 30, 0)
     + iif(WeirdExport, 20, 0)
     + iif(BadParent, 20, 0)
-    + iif(IsPersistence, 40, 0)
+    + iif(PcwRunBroker, 60, 0)
 | where RiskScore >= 50
 | extend Hunter_Directive = case(
+    PcwRunBroker, "CRITICAL: PCWRun execution broker (-s ...) — validate child target immediately",
     HasNet or IsDownloader, "CRITICAL: Remote execution / build execution via .NET toolchain",
-    HasScript, "HIGH: Script-assisted execution via .NET toolchain",
+    HasScript, "HIGH: Script/encoded execution via .NET toolchain",
     BadDLLPath, "MEDIUM-HIGH: DLL/Artifact referenced from suspicious directory",
     BadParent, "MEDIUM: .NET execution spawned by suspicious parent",
     "Suspicious .NET toolchain activity"
