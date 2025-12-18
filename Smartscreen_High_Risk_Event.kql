@@ -1,19 +1,52 @@
-// ---------------------------------------------------------------------------
-//  SmartScreen High-Risk Events (Initial Access / User Execution)
-//    - Flags executions / URLs where SmartScreen intervened.
-//    - Good early-warning surface for phishing + malware delivery.
-//    Tactics: TA0001 (Initial Access), TA0002 (Execution)
-// ---------------------------------------------------------------------------
+// ==================================================================================================
+// Rule: L2_Core_Hunt_SmartScreen_User_Bypass_VT
+// Author: Ala Dabat
+// Version: 2025-12
+// Type: L2 Threat Hunting (User-Assisted Risk)
+// Purpose:
+//   Surface SmartScreen warnings and user bypasses and PRE-FORMAT VirusTotal
+//   lookup URLs so analysts can instantly validate URLs/files.
+//   This rule does NOT assert compromise.
+//
+// MITRE:
+//   TA0001 Initial Access : T1566.001 (Spearphishing Link / Attachment)
+// ==================================================================================================
+
+let lookback = 7d;
+
 DeviceEvents
 | where Timestamp >= ago(lookback)
-| where ActionType in ("SmartScreenAppWarning", "SmartScreenUrlWarning")
-| extend SmartScreenTrigger = iff(ActionType == "SmartScreenUrlWarning", RemoteUrl, FileName)
-| extend ReasonForTrigger = tostring(parse_json(AdditionalFields).Experience)
+| where ActionType in~ ("SmartScreenUrlWarning","SmartScreenAppWarning")
+| extend
+    IsUserBypass = AdditionalFields has_any ("Override","Bypass","UserAllowed","RunAnyway"),
+    TargetUrl = tostring(RemoteUrl),
+    TargetFile = tostring(FileName)
+| extend
+    VirusTotalUrl = iff(
+        isnotempty(TargetUrl),
+        strcat("https://www.virustotal.com/gui/url/", url_encode(TargetUrl)),
+        ""
+    ),
+    VirusTotalFile = iff(
+        isnotempty(TargetFile),
+        strcat("https://www.virustotal.com/gui/search/", TargetFile),
+        ""
+    )
 | project
     Timestamp,
     DeviceName,
+    AccountName,
     ActionType,
-    SmartScreenTrigger,
-    ReasonForTrigger,
-    InitiatingProcessFileName,
-    InitiatingProcessCommandLine
+    IsUserBypass,
+    TargetUrl,
+    VirusTotalUrl,
+    TargetFile,
+    VirusTotalFile,
+    InitiatingProcessFileName
+| extend RiskContext = case(
+    IsUserBypass == true, "User bypassed SmartScreen protection",
+    "SmartScreen warning (no bypass observed)"
+)
+| extend HunterDirective =
+    "L2 HUNT: Open VirusTotalUrl or VirusTotalFile. Review detections, domain age, redirect chains, and prevalence. Escalate only if VT or CTI confirms malicious intent."
+| order by IsUserBypass desc, Timestamp desc
