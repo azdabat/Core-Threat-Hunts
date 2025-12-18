@@ -1,0 +1,56 @@
+// ============================================================================
+// RARE PACK A — XBAP / XSL / CHM / ClickOnce / Defender Download Abuse
+// Binaries: PresentationHost.exe, msxsl.exe, hh.exe, dfsvc.exe, ieexec.exe, MpCmdRun.exe, verclsid.exe
+// Goal: Near-zero noise by requiring highly specific abuse patterns.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["presentationhost.exe","msxsl.exe","hh.exe","dfsvc.exe","ieexec.exe","mpcmdrun.exe","verclsid.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // PresentationHost (XBAP / remote URL)
+    ".xbap","http","https","-launchapplication","presentationhost.exe",
+
+    // MSXSL XSL execution (local/remote)
+    ".xsl",".xml","msxsl.exe",
+
+    // HH (CHM / ms-its)
+    ".chm","ms-its:","hh.exe",
+
+    // ClickOnce / manifests
+    ".application",".manifest","dfsvc","ieexec",
+
+    // Defender tool download abuse
+    "mpcmdrun.exe","-downloadfile","-url","-path",
+
+    // Verclsid DLL load
+    "verclsid.exe","/i ",".dll","/s ","/c "
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = (FileName in~ ("presentationhost.exe","mpcmdrun.exe","dfsvc.exe","ieexec.exe") and HasNet)
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(BadParent, 20, 0)
+    + iif(FileName =~ "msxsl.exe" and ProcessCommandLine has ".xsl", 60, 0)
+    + iif(FileName =~ "hh.exe" and (ProcessCommandLine has ".chm" or ProcessCommandLine has "ms-its:"), 60, 0)
+    + iif(FileName =~ "verclsid.exe" and ProcessCommandLine has ".dll", 60, 0)
+| where RiskScore >= 70
+| extend Hunter_Directive = case(
+    FileName =~ "presentationhost.exe" and HasNet, "CRITICAL: PresentationHost remote payload fetch / XBAP execution",
+    FileName =~ "msxsl.exe", "CRITICAL: MSXSL XSL execution (T1220 proxy execution)",
+    FileName =~ "hh.exe", "HIGH: CHM execution via hh.exe (ms-its / remote CHM)",
+    FileName =~ "mpcmdrun.exe" and ProcessCommandLine has "-downloadfile", "HIGH: Defender utility used to download a file",
+    FileName =~ "verclsid.exe", "HIGH: verclsid COM validation abused for DLL execution",
+    "Suspicious RARE LOLBIN execution"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 10 and MaxRisk < 85)
