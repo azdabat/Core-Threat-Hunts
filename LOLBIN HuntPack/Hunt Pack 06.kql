@@ -1,31 +1,38 @@
 // ============================================================================
-// HUNT PACK 06/10 — Ransomware-Adjacent Defense Evasion
+// HUNT PACK 06/10 (UPDATED) — Ransomware-Adjacent Defense Evasion (Recovery Inhibition / Log Tamper)
 // Binaries: vssadmin.exe, wevtutil.exe, bcdedit.exe, wbadmin.exe, fsutil.exe, cipher.exe, netsh.exe
-// Notes: Directly covers vssadmin + wevtutil clear logs + boot/security tamper patterns.
+// Fixes:
+//   - Adds wevtutil "cl" clear-log + other high-signal log tamper verbs
+//   - Adds legacy bcedit.exe as alias in case it appears (your list)
 // ============================================================================
 
 let lookback = 7d;
 
-let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
-let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
+let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","bcedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
 | where TimeGenerated > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // VSS deletion
+    // VSS deletion (recovery inhibition)
     "delete shadows","delete shadowcopies","shadows /all","/quiet",
-    // Event log clearing
-    " wevtutil cl ","clear-log",
+
+    // Event log tamper (HIGH fidelity)
+    " wevtutil cl "," wevtutil.exe cl ","clear-log"," sl "," set-log ",
+
     // Boot/security tampering
-    "bcdedit","set","bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks",
-    // Backup deletion / inhibit recovery
+    "bcdedit","bcedit","set","bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks",
+
+    // Backup deletion
     "wbadmin delete","catalog","systemstatebackup",
-    // FS/attr tamper
+
+    // FS/attr tamper / wipe
     "fsutil","usn","deletejournal","setzerodata","behavior set",
     "cipher /w",
-    // Firewall / network tamper
+
+    // Firewall/network tamper
     "netsh advfirewall","firewall set","set allprofiles state off"
 )
 | extend
@@ -35,7 +42,7 @@ DeviceProcessEvents
     WeirdExport = bool(false),
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
     IsDownloader = bool(false),
-    IsPersistence = FileName =~ "bcdedit.exe" and ProcessCommandLine has_any ("set","bootstatuspolicy","recoveryenabled")
+    IsPersistence = (FileName in~ ("bcdedit.exe","bcedit.exe") and ProcessCommandLine has " set ")
 | extend RiskScore =
     0
     + iif(HasNet or IsDownloader, 60, 0)
@@ -44,11 +51,13 @@ DeviceProcessEvents
     + iif(WeirdExport, 20, 0)
     + iif(BadParent, 20, 0)
     + iif(IsPersistence, 40, 0)
+    + iif(FileName =~ "wevtutil.exe" and ProcessCommandLine has " cl ", 60, 0)
+    + iif(FileName =~ "vssadmin.exe" and ProcessCommandLine has "delete", 60, 0)
 | where RiskScore >= 50
 | extend Hunter_Directive = case(
     FileName =~ "vssadmin.exe", "CRITICAL: Shadow copy deletion (ransomware recovery inhibition)",
-    FileName =~ "wevtutil.exe", "CRITICAL: Event log clearing / tamper",
-    FileName =~ "bcdedit.exe", "HIGH: Boot/security configuration tamper",
+    FileName =~ "wevtutil.exe" and ProcessCommandLine has " cl ", "CRITICAL: Event log cleared via wevtutil (anti-forensics)",
+    FileName in~ ("bcdedit.exe","bcedit.exe"), "HIGH: Boot/security configuration tamper",
     FileName =~ "wbadmin.exe", "HIGH: Backup deletion / recovery inhibition",
     FileName =~ "netsh.exe", "HIGH: Firewall/network tamper",
     "HIGH: Defense evasion / recovery inhibition via LOLBIN"
