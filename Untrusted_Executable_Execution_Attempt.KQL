@@ -1,0 +1,77 @@
+// ============================================================================
+// L2_COREPLUS_Untrusted_Executable_Execution_Attempt
+// Author: Ala Dabat
+// Type: Threat Hunt (NOT scheduled analytic)
+// Audience: L2 / L2.5 SOC, Threat Hunters
+//
+// Focus:
+//   - ASR untrusted executable block/audit
+//   - High-risk parent context (user-facing apps, scripts, LOLBins)
+//   - Tenant-local rarity (no FileProfile dependency)
+// ============================================================================
+
+let lookback = 14d;
+let detection_window = 24h;
+let rarity_threshold = 5;
+
+// High-risk parents (user-facing + script engines)
+let HighRiskParents = dynamic([
+  "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+  "chrome.exe","msedge.exe","firefox.exe",
+  "powershell.exe","pwsh.exe","cmd.exe",
+  "wscript.exe","cscript.exe","mshta.exe","rundll32.exe"
+]);
+
+// ------------------------------------------------------------------
+// 1) ASR untrusted executable execution attempts
+// ------------------------------------------------------------------
+let AsrExecAttempts =
+DeviceEvents
+| where Timestamp >= ago(detection_window)
+| where ActionType in ("AsrUntrustedExecutableAudited","AsrUntrustedExecutableBlocked")
+| extend FileHash = coalesce(SHA256, SHA1, InitiatingProcessSHA256)
+| project
+    EventTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    FileName,
+    FolderPath,
+    FileHash,
+    ParentProcess = InitiatingProcessParentFileName,
+    ParentCommandLine = InitiatingProcessCommandLine;
+
+// ------------------------------------------------------------------
+// 2) Tenant-local rarity (cheap prevalence)
+// ------------------------------------------------------------------
+let TenantRarity =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| summarize SeenOnDevices = dcount(DeviceId) by SHA256
+| where SeenOnDevices <= rarity_threshold;
+
+// ------------------------------------------------------------------
+// 3) Correlate + score
+// ------------------------------------------------------------------
+AsrExecAttempts
+| join kind=leftouter TenantRarity on $left.FileHash == $right.SHA256
+| extend
+    IsRare = iif(coalesce(SeenOnDevices,0) <= rarity_threshold, 1, 0),
+    HighRiskParent = iif(ParentProcess in~ (HighRiskParents), 1, 0)
+| extend RiskScore =
+      (HighRiskParent * 40)
+    + (IsRare * 40)
+    + 20   // ASR execution intent anchor
+| where RiskScore >= 60
+| extend HunterDirective =
+    "L2 TRIAGE: ASR blocked/audited an execution attempt. Validate parent process, confirm user intent, and pivot on file hash + device for additional activity. Escalate to L3 if binary is unknown or parent chain is suspicious."
+| project
+    EventTime,
+    DeviceName,
+    FileName,
+    FolderPath,
+    ParentProcess,
+    ParentCommandLine,
+    SeenOnDevices,
+    RiskScore,
+    HunterDirective
+| order by RiskScore desc, EventTime desc;
