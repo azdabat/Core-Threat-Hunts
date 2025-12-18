@@ -1,0 +1,55 @@
+// ============================================================================
+// RARE PACK B — Package Install / Staging / Compression & Copy Tricks
+// Binaries: dism.exe, pkgmgr.exe, makecab.exe, expand.exe, esentutl.exe, replace.exe, appinstaller.exe
+// Goal: Near-zero noise by requiring install-from-url/cab ops or network copy patterns.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["dism.exe","pkgmgr.exe","makecab.exe","expand.exe","esentutl.exe","replace.exe","appinstaller.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // DISM / PKGMGR install abuse
+    "dism","/online","/add-package","/packagepath:","http","https",".cab",
+    "pkgmgr","/iu:",".cab",
+
+    // MakeCab / Expand staging
+    "makecab",".cab",
+    "expand","-f:*",".cab",
+
+    // Esentutl network copy patterns
+    "esentutl","/y ","/d ","/o","\\\\",
+
+    // Replace DLL replacement
+    "replace.exe",".dll","\\system32","\\syswow64",
+
+    // AppInstaller remote
+    "appinstaller","http","https",".appinstaller",".msix",".msixbundle"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://|\\\\)",
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = HasNet
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(BadParent, 20, 0)
+    + iif(FileName in~ ("dism.exe","pkgmgr.exe") and ProcessCommandLine has_any ("http","https",".cab","/add-package","/packagepath:"), 60, 0)
+    + iif(FileName in~ ("makecab.exe","expand.exe") and ProcessCommandLine has ".cab", 40, 0)
+    + iif(FileName =~ "replace.exe" and ProcessCommandLine has ".dll", 60, 0)
+| where RiskScore >= 70
+| extend Hunter_Directive = case(
+    FileName in~ ("dism.exe","pkgmgr.exe") and ProcessCommandLine has_any ("http","https"), "CRITICAL: Package install from remote source (CAB) via DISM/PKGMGR",
+    FileName =~ "appinstaller.exe" and ProcessCommandLine has_any ("http","https"), "HIGH: AppInstaller remote package execution/install",
+    FileName =~ "replace.exe" and ProcessCommandLine has ".dll", "HIGH: DLL replacement attempt via replace.exe",
+    FileName in~ ("makecab.exe","expand.exe"), "MEDIUM-HIGH: Payload staging via CAB compression/expand",
+    FileName =~ "esentutl.exe" and ProcessCommandLine has "\\\\", "HIGH: Esentutl copying from network path",
+    "Suspicious RARE LOLBIN staging/install activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 10 and MaxRisk < 85)
