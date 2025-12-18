@@ -2,7 +2,7 @@
 // Purpose: Detect remote execution, file download, and credential/system configuration abuse via a wider set of LOLBINs.
 // Data: DeviceProcessEvents
 // MITRE: T1218 (Signed Binary Proxy Execution), T1105 (Ingress Tool Transfer), T1548 (Abuse Elevation Control)
-// Author: Ala Dabat (Expanded by AI)
+// Author: Ala Dabat 
 
 let lookback = 24h;
 
