@@ -1,0 +1,53 @@
+// ============================================================================
+// HUNT PACK 03/10 — INF-Based Execution (CMSTP / InfDefaultInstall + friends)
+// Binaries: cmstp.exe, infdefaultinstall.exe, regsvr32.exe, mshta.exe, rundll32.exe, control.exe, odbcconf.exe
+// Notes: Covers your “cmstp /s /ni” + “infdefaultinstall .inf” execution cases.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["cmstp.exe","infdefaultinstall.exe","regsvr32.exe","mshta.exe","rundll32.exe","control.exe","odbcconf.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // INF execution
+    ".inf","infdefaultinstall","setupapi","install",
+    // CMSTP silent install switches
+    "/s","/ni",".cms",".inf",
+    // Scriptlet pivots commonly paired
+    "scrobj","javascript","vbscript",
+    // DLL/CPL
+    ".dll",".cpl"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("scrobj.dll","javascript:","vbscript:","wscript.shell"),
+    BadDLLPath = (ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs),
+    IsRundll32 = FileName =~ "rundll32.exe",
+    WeirdExport = IsRundll32 and ProcessCommandLine matches regex @"(?i),(#\d+|run|start|dllregisterserver|entry|main)",
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = (FileName =~ "cmstp.exe" or FileName =~ "mshta.exe" or FileName =~ "regsvr32.exe") and HasNet,
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    HasNet or IsDownloader, "CRITICAL: Remote-triggered INF/CMSTP/Proxy execution chain",
+    HasScript, "HIGH: Script-assisted INF/Proxy execution",
+    ProcessCommandLine has ".inf", "HIGH: INF-based execution (CMSTP/InfDefaultInstall)",
+    BadDLLPath or WeirdExport, "MEDIUM-HIGH: DLL/CPL proxy execution from non-system path",
+    "Suspicious INF/proxy execution activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
