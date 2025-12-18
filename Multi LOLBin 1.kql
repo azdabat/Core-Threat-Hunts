@@ -1,0 +1,51 @@
+// ============================================================================
+// HUNT: L3_LOLBIN_Execution_Scout_7D
+// Purpose:
+//   Low-cost 7-day scout to identify hosts showing
+//   high-risk LOLBIN execution patterns worth deeper hunting.
+// Data: DeviceProcessEvents
+// MITRE: T1218, T1105, T1059
+// Author: Ala Dabat
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "mshta.exe","wscript.exe","cscript.exe",
+    "rundll32.exe","regsvr32.exe",
+    "installutil.exe","regasm.exe","regsvcs.exe",
+    "certutil.exe","bitsadmin.exe","curl.exe","wget.exe",
+    "msiexec.exe","wmic.exe","forfiles.exe",
+    "schtasks.exe","sc.exe","at.exe"
+]);
+
+let CheapIndicators = dynamic([
+    "http","https","ftp",
+    ".dll","javascript","vbscript",
+    "download","urlcache",
+    "-enc","frombase64string",
+    "schtasks","/create","sc create"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (CheapIndicators)
+| extend SignalClass = case(
+    FileName in~ ("certutil.exe","bitsadmin.exe","curl.exe","wget.exe"),
+        "Downloader",
+    FileName in~ ("rundll32.exe","regsvr32.exe","installutil.exe"),
+        "ProxyExecution",
+    FileName in~ ("schtasks.exe","sc.exe","at.exe"),
+        "Persistence",
+    "Mixed"
+)
+| summarize
+    EventCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    SampleCLI = any(ProcessCommandLine),
+    SignalClasses = make_set(SignalClass)
+    by DeviceName
+| where EventCount >= 2
