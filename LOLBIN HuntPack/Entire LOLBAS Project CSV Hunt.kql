@@ -1,5 +1,6 @@
 // ============================================================================
 // Rule: L2.5_LOLBAS_Feed_Driven_Execution_Hunt
+// Still WORK IN PROGRESS.  Should work but use for short periods i.e. 24 hours CPU intensive
 // Enhancements:
 //   - Confidence column (Low / Medium / High)
 //   - ChainId for multi-LOLBIN attack correlation
@@ -14,7 +15,7 @@
 // Author: Ala Dabat
 // ============================================================================
 
-let lookback = 7d;
+let lookback = 1d;
 
 // ---------------------------------------------------------------------------
 // EXTERNAL LOLBAS FEED (replace with your mirrored CSV if needed)
