@@ -1,0 +1,48 @@
+// ============================================================================
+// HUNT PACK 08/10 — Local Credential/Secret Hunting (Discovery-to-CredAccess)
+// Binaries: findstr.exe, find.exe, attrib.exe, type.exe, more.com, cmd.exe, powershell.exe
+// Notes: You called out find/findstr/attrib/systeminfo — this pack handles “cred hunting” patterns.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["findstr.exe","find.exe","attrib.exe","type.exe","more.com","cmd.exe","powershell.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+let CredHuntTerms = dynamic([
+    "password","passwd","pwd","secret","token","apikey","api_key","bearer","authorization",
+    "connectionstring","connstring","client_secret","privatekey","BEGIN RSA","BEGIN PRIVATE KEY"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (CredHuntTerms)
+   or (FileName =~ "attrib.exe" and ProcessCommandLine has_any ("-h","-s","+h","+s"))
+| extend
+    HasNet = bool(false),
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + 40 // credential-hunting terms are rare & high-signal
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    FileName in~ ("findstr.exe","find.exe"), "HIGH: Possible credential/secret string hunting",
+    FileName =~ "attrib.exe", "MEDIUM-HIGH: Attribute tamper (staging/evasion precursor)",
+    "Suspicious local data hunting"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 50 and MaxRisk < 80)
