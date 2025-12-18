@@ -1,0 +1,78 @@
+// ============================================================================
+// ENDPOINT_KERBEROS_SVC_RECON_PORT88
+// Author: Ala Dabat
+// Audience: L2/L3 Threat Hunters (Companion to CORE_KERBEROASTING_TGS_ANOMALY)
+// Purpose:
+//   Identify endpoint-side Kerberos reconnaissance or service account targeting
+//   by detecting anomalous Kerberos (port 88) traffic patterns from non-server
+//   systems, often preceding or accompanying Kerberoasting.
+//
+// Tactics:
+//   TA0006 Credential Access
+//   TA0008 Lateral Movement
+//
+// Techniques:
+//   T1558.003 Kerberoasting
+//   T1046 Network Service Discovery
+//
+// Data:
+//   DeviceNetworkEvents (MDE)
+// ============================================================================
+
+let Lookback = 24h;
+
+// Optional allowlist of known servers that legitimately generate Kerberos traffic
+let KnownKerberosServers = dynamic([
+    "DC01","DC02","DC03"
+]);
+
+DeviceNetworkEvents
+| where Timestamp >= ago(Lookback)
+| where RemotePort == 88
+| where ActionType in ("ConnectionSuccess","InboundConnectionAccepted")
+| where not(DeviceName in~ (KnownKerberosServers))
+
+// Exclude domain controllers as sources
+| where not(InitiatingProcessFileName in~ ("lsass.exe","services.exe","svchost.exe"))
+
+// Aggregate per endpoint
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    KerberosConnectionCount = count(),
+    TargetDCs = make_set(RemoteDeviceName, 10),
+    SourceProcesses = make_set(InitiatingProcessFileName, 10),
+    SourceAccounts = make_set(InitiatingProcessAccountName, 10)
+  by DeviceId, DeviceName
+
+// Heuristic thresholds (L2-safe)
+| where
+    KerberosConnectionCount >= 50
+    or array_length(TargetDCs) >= 2
+
+| extend
+    Severity = case(
+        KerberosConnectionCount >= 200, "HIGH",
+        KerberosConnectionCount >= 100, "MEDIUM",
+        "LOW"
+    )
+
+| extend HuntingDirective = case(
+    Severity == "HIGH",
+    "HIGH: Endpoint generating high-volume Kerberos traffic to DCs. Possible Kerberoasting or service account abuse. Pivot to DC-side 4769 logs and inspect endpoint for Kerberos tooling.",
+    Severity == "MEDIUM",
+    "MEDIUM: Elevated Kerberos activity from endpoint. Validate if this is a legitimate admin or automation host.",
+    "LOW: Slight increase in Kerberos traffic. Baseline the host role."
+)
+
+| project
+    Severity,
+    HuntingDirective,
+    FirstSeen,
+    LastSeen,
+    DeviceName,
+    KerberosConnectionCount,
+    TargetDCs,
+    SourceProcesses,
+    SourceAccounts
+| order by Severity desc, KerberosConnectionCount desc, LastSeen desc;
