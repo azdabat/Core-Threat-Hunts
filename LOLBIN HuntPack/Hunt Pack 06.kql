@@ -1,0 +1,58 @@
+// ============================================================================
+// HUNT PACK 06/10 — Ransomware-Adjacent Defense Evasion
+// Binaries: vssadmin.exe, wevtutil.exe, bcdedit.exe, wbadmin.exe, fsutil.exe, cipher.exe, netsh.exe
+// Notes: Directly covers vssadmin + wevtutil clear logs + boot/security tamper patterns.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // VSS deletion
+    "delete shadows","delete shadowcopies","shadows /all","/quiet",
+    // Event log clearing
+    " wevtutil cl ","clear-log",
+    // Boot/security tampering
+    "bcdedit","set","bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks",
+    // Backup deletion / inhibit recovery
+    "wbadmin delete","catalog","systemstatebackup",
+    // FS/attr tamper
+    "fsutil","usn","deletejournal","setzerodata","behavior set",
+    "cipher /w",
+    // Firewall / network tamper
+    "netsh advfirewall","firewall set","set allprofiles state off"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = FileName =~ "bcdedit.exe" and ProcessCommandLine has_any ("set","bootstatuspolicy","recoveryenabled")
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    FileName =~ "vssadmin.exe", "CRITICAL: Shadow copy deletion (ransomware recovery inhibition)",
+    FileName =~ "wevtutil.exe", "CRITICAL: Event log clearing / tamper",
+    FileName =~ "bcdedit.exe", "HIGH: Boot/security configuration tamper",
+    FileName =~ "wbadmin.exe", "HIGH: Backup deletion / recovery inhibition",
+    FileName =~ "netsh.exe", "HIGH: Firewall/network tamper",
+    "HIGH: Defense evasion / recovery inhibition via LOLBIN"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
