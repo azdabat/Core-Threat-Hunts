@@ -1,85 +1,66 @@
 // ============================================================================
-// Vulnerable or Malicious Kernel Driver Load — LOLDrivers.io Enriched (V2)
-// Author: Ala Dabat 
-// Purpose: Detect kernel drivers with known exploitation history being loaded using both SHA256 and File Name matching.
-// Data Source: https://www.loldrivers.io/api/drivers.csv (live external feed)
+// L2 CORE+ Hunt: BYOVD Driver Load Exposure
+// Author: Ala Dabat
+// see L3 rule for suspicious parent process
+// Audience: L2 / L2.5 Threat Hunters
+// Purpose:
+//   Identify known malicious or vulnerable kernel drivers loaded on endpoints.
+//   This hunt answers: "Do we have BYOVD exposure?" — not "Is this exploited?"
 // ============================================================================
 
-// --- Load external feed ---
+// --- External LOLDrivers feed ---
 let VulnerableDriverData = externaldata (
-    Id:string, Author:string, Created:string, Command:string, Description:string,
-    Usecase:string, Category:string, Privileges:string, MitreID:string,
-    OperatingSystem:string, Resources:string, DriverInfo:string, ContactPerson:string,
-    HandleReference:string, DetectionMethod:string, MD5_Hashes:string, SHA1_Hashes:string,
-    SHA256_Hashes:string, PublisherInfo:string, CompanyInfo:string, VulnerabilityDetails:string,
-    MD5_Authentihash:string, SHA256_Authentihash:string, SHA1_Authentihash:string,
-    VerificationStatus:string, TagsInfo:string
+    Id:string, Category:string, Privileges:string, MitreID:string,
+    SHA256_Hashes:string, TagsInfo:string, PublisherInfo:string, CompanyInfo:string
 )["https://www.loldrivers.io/api/drivers.csv"]
 with (format="csv", ignoreFirstRecord=true);
 
-// --- Normalise and expand values from the repository ---
-let VulnerableDriversNormalized =
+// --- Normalize driver hashes and filenames ---
+let LOLDrivers =
 VulnerableDriverData
 | extend
-    IndividualSHA256 = split(SHA256_Hashes, ', '),
-    IndividualTags = split(TagsInfo, ', ')
-| mv-expand IndividualSHA256, IndividualTags to typeof(string)
+    Hashes = split(SHA256_Hashes, ", "),
+    Tags   = split(TagsInfo, ", ")
+| mv-expand Hashes, Tags
 | extend
-    NormalizedSHA256 = trim(" ", tolower(IndividualSHA256)),
-    NormalizedFileName = trim_end(".sys", trim_end(".sys", tolower(IndividualTags))) // Normalise file name tags
+    NormalizedSHA256 = tolower(trim(" ", Hashes)),
+    NormalizedFileName = trim_end(".sys", tolower(trim(" ", Tags)))
 | where isnotempty(NormalizedSHA256) or isnotempty(NormalizedFileName)
-| project Id, Category, Privileges, MitreID, NormalizedSHA256, NormalizedFileName, PublisherInfo, CompanyInfo, VulnerabilityDetails;
+| project Category, Privileges, MitreID, NormalizedSHA256, NormalizedFileName,
+          PublisherInfo, CompanyInfo;
 
-// --- Get driver loads from MDE telemetry ---
-let LoadedDrivers =
+// --- Driver loads observed in MDE ---
 DeviceEvents
+| where Timestamp >= ago(7d)
 | where ActionType has "DriverLoad"
 | extend
-    NormalizedDeviceSHA256 = trim(" ", tolower(SHA256)),
-    NormalizedDeviceFileName = trim_end(".sys", tolower(FileName)); // Normalize device file name for matching
-
-// --- Match kernel loads to LOLDrivers database (Union of Hash and File Name Matches) ---
-// 1. Primary Match: SHA256 Hash
-let HashMatches = LoadedDrivers
-| where isnotempty(NormalizedDeviceSHA256)
-| join kind=inner VulnerableDriversNormalized
-    on $left.NormalizedDeviceSHA256 == $right.NormalizedSHA256;
-
-// 2. Secondary Match: File Name (Tags) - only include unique matches not found by hash
-let FileNameMatches = LoadedDrivers
-| where isnotempty(NormalizedDeviceFileName)
-| join kind=inner VulnerableDriversNormalized
-    on $left.NormalizedDeviceFileName == $right.NormalizedFileName
-| anti-join (HashMatches) on Timestamp, DeviceName, NormalizedDeviceSHA256; // Exclude results already found by hash
-
-// Combine both detection methods
-HashMatches
-| union FileNameMatches
-| where not(
-    // Improved Exclusion Logic: Reduce noise for known trusted vendors in the 'Vulnerable Driver' category
-    Category =~ "Vulnerable Driver" and CompanyInfo has_any ("Microsoft Corporation", "Google LLC", "Apple Inc.")
+    DeviceSHA256 = tolower(SHA256),
+    DeviceFileName = trim_end(".sys", tolower(FileName))
+| join kind=inner LOLDrivers
+    on $left.DeviceSHA256 == $right.NormalizedSHA256
+    or $left.DeviceFileName == $right.NormalizedFileName
+| summarize arg_max(Timestamp, *) by DeviceName, DeviceSHA256
+| extend RiskLevel = case(
+    Category =~ "Malicious Driver", "HIGH",
+    Category =~ "Vulnerable Driver", "MEDIUM",
+    "LOW"
 )
-| summarize arg_max(Timestamp, *) by DeviceName, NormalizedDeviceSHA256, NormalizedDeviceFileName
-| extend VT_Domain = iff(
-        isnotempty(NormalizedDeviceSHA256),
-        strcat("https://www.virustotal.com/gui/file/", NormalizedDeviceSHA256),
-        ""
-    )
-// --- Hunter Directives (Unchanged but using the richer data context) ---
 | extend HunterDirective = case(
-        Category =~ "Malicious Driver",
-        "CRITICAL: Known malicious kernel driver loaded. Isolate host immediately. Collect full forensic image. Expect privilege escalation, EDR tampering, or rootkit behaviour.",
-        Category =~ "Vulnerable Driver" and Privileges has_any ("Kernel","Driver","SYSTEM"),
-        "HIGH: Vulnerable kernel driver providing arbitrary read/write or privilege escalation. Validate process tree. Check for unsigned loaders and suspicious parent processes.",
-        Category =~ "Vulnerable Driver",
-        "MEDIUM: Driver with known vulnerabilities observed. Review usage context. Validate software legitimacy. Cross-reference expected vendor.",
-        "LOW: Driver appears in LOLDrivers repository but marked low-risk. Review if required but likely benign unless paired with suspicious parent process activity."
-    )
-| extend KillChain = case(
-        Category =~ "Malicious Driver", "Defense Evasion → Privilege Escalation",
-        Category =~ "Vulnerable Driver", "Privilege Escalation",
-        "Driver Load"
-    )
-| project Timestamp, DeviceName, FileName, Category, Privileges, MitreID,
-        NormalizedDeviceSHA256, VT_Domain, PublisherInfo, CompanyInfo,
-        VulnerabilityDetails, KillChain, HunterDirective
+    RiskLevel == "HIGH",
+        "HIGH: Known malicious kernel driver observed. Validate host role and escalate to L3 for exploitation assessment.",
+    RiskLevel == "MEDIUM",
+        "MEDIUM: Vulnerable driver loaded. Confirm business justification and patch/update status.",
+    "LOW: Driver present in LOLDrivers dataset but low risk. Monitor only."
+)
+| project
+    Timestamp,
+    DeviceName,
+    FileName,
+    Category,
+    Privileges,
+    MitreID,
+    PublisherInfo,
+    CompanyInfo,
+    RiskLevel,
+    HunterDirective
+| order by Timestamp desc
