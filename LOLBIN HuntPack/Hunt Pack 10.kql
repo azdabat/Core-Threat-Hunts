@@ -1,0 +1,52 @@
+// ============================================================================
+// HUNT PACK 10/10 — Developer / Debugger Execution & Injection Adjacent
+// Binaries: cdb.exe, windbg.exe, procdump.exe, werfault.exe, taskmgr.exe, mavinject.exe, dllhost.exe
+// Notes: You asked for cdb.exe explicitly; this pack isolates “rare but dangerous” dev tools.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["cdb.exe","windbg.exe","procdump.exe","werfault.exe","taskmgr.exe","mavinject.exe","dllhost.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // Debugger common flags / attach
+    "-p "," -pn ",".dump","!","-c ",
+    // ProcDump/WERFault LSASS targeting (cred access)
+    "lsass","-ma","-mp",
+    // MavInject
+    "/INJECTRUNNING","/RUNNING",
+    // DLLHost odd invocations
+    " /Processid:",".dll"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + iif(ProcessCommandLine has "lsass", 60, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    ProcessCommandLine has "lsass", "CRITICAL: Debug/diagnostic tooling targeting LSASS (possible credential dump)",
+    FileName in~ ("cdb.exe","windbg.exe"), "HIGH: Debugger execution (rare on endpoints) — validate legitimacy",
+    FileName =~ "mavinject.exe", "HIGH: Injection utility execution — validate parent & target",
+    "Suspicious dev/debug/diagnostic LOLBIN activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 80)
