@@ -1,0 +1,60 @@
+// ============================================================================
+// RARE PACK C — UAC Bypass / OS Utility Abuse / Low-Signal Recon Triggers
+// Binaries: ATBroker.exe, ClipUp.exe, gpscript.exe, msinfo32.exe, pcalua.exe, time.exe, tracert.exe
+// Goal: Near-zero noise: require known-abuse flags or unusual remote usage.
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["atbroker.exe","clipup.exe","gpscript.exe","msinfo32.exe","pcalua.exe","time.exe","tracert.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    // ATBroker start abuse
+    "atbroker.exe","/start",
+
+    // ClipUp unusual embedding/server usage
+    "clipup.exe","-embedding","-servername:",
+
+    // gpscript logon triggers
+    "gpscript","/logon","/startup",
+
+    // msinfo32 report collection (often recon)
+    "msinfo32","/report","/categories",
+
+    // pcalua execution broker
+    "pcalua.exe","-a ",
+
+    // time used with UNC (NTLM relay bait)
+    "time \\\\",
+
+    // tracert command chaining indicator (rare to see in corp endpoints)
+    "tracert"," && "," start "
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://|\\\\)",
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false)
+| extend RiskScore =
+    0
+    + iif(HasNet, 60, 0)
+    + iif(BadParent, 20, 0)
+    + iif(FileName =~ "clipup.exe" and ProcessCommandLine has "-servername:", 60, 0)
+    + iif(FileName =~ "atbroker.exe" and ProcessCommandLine has "/start", 60, 0)
+    + iif(FileName =~ "pcalua.exe" and ProcessCommandLine has "-a ", 40, 0)
+| where RiskScore >= 70
+| extend Hunter_Directive = case(
+    FileName =~ "time.exe" and ProcessCommandLine has "\\\\", "HIGH: time \\\\host used (possible NTLM relay / auth coercion signal)",
+    FileName =~ "atbroker.exe", "HIGH: ATBroker execution broker (/start) — investigate UAC bypass patterns",
+    FileName =~ "clipup.exe", "HIGH: ClipUp embedding/server usage — rare; validate context",
+    FileName =~ "pcalua.exe", "MEDIUM-HIGH: Program Compatibility Assistant execution broker (-a)",
+    FileName =~ "gpscript.exe", "MEDIUM-HIGH: Group Policy script trigger (logon/startup)",
+    FileName =~ "msinfo32.exe", "MEDIUM: Recon collection (msinfo32 report/categories)",
+    "Suspicious RARE OS utility execution"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 10 and MaxRisk < 85)
