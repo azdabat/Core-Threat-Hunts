@@ -1,12 +1,9 @@
 // ============================================================================
-// CORE_KERBEROASTING_TGS_ANOMALY
+// CORE_KERBEROASTING_TGS_ANOMALY (PRODUCTION-HARDENED)
 // Author: Ala Dabat
 // Audience: L2 SOC Analysts (Core+ Threat Hunt)
-// Purpose: Detect potential Kerberoasting by identifying anomalous volumes
-//          of Kerberos TGS requests (4769), especially using weak encryption
-//          (RC4) and unusual service account access patterns.
-// Tactics: TA0006 Credential Access | TA0008 Lateral Movement
-// Techniques: T1558.003 (Kerberoasting)
+// Purpose: Detect potential Kerberoasting via anomalous 4769 (TGS) volumes,
+//          weak encryption (RC4), and spike vs baseline.
 // Data: SecurityEvent (EventID 4769)
 // ============================================================================
 
@@ -14,20 +11,19 @@ let Lookback = 24h;
 let BaselineLookback = 7d;
 
 // ------------------------------------------------------------------
-// 1. BASELINE — Normal TGS request volume per Service Account
+// 1) BASELINE — Daily average TGS requests per service account
+//     (Force to real early; avoid divide-by-zero later.)
 // ------------------------------------------------------------------
 let BaselineTGS =
 SecurityEvent
 | where TimeGenerated between (ago(BaselineLookback)..ago(Lookback))
 | where EventID == 4769
-| extend
-    ServiceAccount = tostring(EventData.ServiceName)
-| summarize
-    BaselineRequests = count()
-  by ServiceAccount;
+| extend ServiceAccount = tostring(EventData.ServiceName)
+| summarize BaselineRequests = count() by ServiceAccount
+| extend BaselineDailyAvg = real(BaselineRequests) / 7.0;
 
 // ------------------------------------------------------------------
-// 2. RECENT TGS REQUESTS — Last 24 hours
+// 2) RECENT — Last 24h TGS requests
 // ------------------------------------------------------------------
 let RecentTGS =
 SecurityEvent
@@ -41,7 +37,7 @@ SecurityEvent
     DomainController = Computer;
 
 // ------------------------------------------------------------------
-// 3. AGGREGATE — Per Service Account
+// 3) AGGREGATE — Per service account
 // ------------------------------------------------------------------
 RecentTGS
 | summarize
@@ -50,44 +46,47 @@ RecentTGS
     RequestCount = count(),
     RequestingUsers = make_set(RequestingUser, 10),
     SourceIPs = make_set(ClientIP, 10),
-    RC4Count = countif(TicketEncryptionType == "0x17")
+    RC4Count = countif(TicketEncryptionType == "0x17"),
+    DCs = make_set(DomainController, 10)
   by ServiceAccount
 
 // ------------------------------------------------------------------
-// 4. CORRELATE WITH BASELINE
+// 4) JOIN BASELINE + SAFE SPIKE RATIO
 // ------------------------------------------------------------------
+| extend CurrentCountReal = real(RequestCount)
 | join kind=leftouter (BaselineTGS) on ServiceAccount
 | extend
-    BaselineRequests = coalesce(BaselineRequests, 0),
-    SpikeRatio = iff(BaselineRequests == 0, real(RequestCount), real(RequestCount) / real(BaselineRequests))
+    // If missing baseline, treat as small non-zero baseline to prevent crash
+    BaselineDailyAvg = coalesce(BaselineDailyAvg, 1.0),
+    // Spike ratio uses real / real only
+    SpikeRatio = CurrentCountReal / BaselineDailyAvg
 
 // ------------------------------------------------------------------
-// 5. FILTER — L2-SAFE KERBEROASTING SIGNALS
+// 5) FILTER — L2-safe Kerberoasting signals
 // ------------------------------------------------------------------
 | where
-    // Either a strong RC4 signal or a clear spike
     RC4Count >= 5
-    or (RequestCount >= 20 and SpikeRatio >= 3)
+    or (RequestCount >= 20 and SpikeRatio >= 3.0)
 
 // ------------------------------------------------------------------
-// 6. SEVERITY & L2 DIRECTIVES
+// 6) SEVERITY + DIRECTIVES
 // ------------------------------------------------------------------
 | extend
     Severity = case(
-        RC4Count >= 10 and SpikeRatio >= 5, "HIGH",
-        RC4Count >= 5 or SpikeRatio >= 3, "MEDIUM",
+        RC4Count >= 10 and SpikeRatio >= 5.0, "HIGH",
+        RC4Count >= 5 or SpikeRatio >= 3.0, "MEDIUM",
         "LOW"
     ),
     HuntingDirective = case(
         Severity == "HIGH",
-        "HIGH: Strong Kerberoasting signal. Service account received a spike of TGS requests, including RC4-encrypted tickets. Escalate to L3 for credential exposure investigation.",
+        "HIGH: Strong Kerberoasting signal (4769 spike + RC4). Pivot to DC-side 4769/4768 patterns, identify requester host(s), rotate service account if confirmed, enforce AES-only.",
         Severity == "MEDIUM",
-        "MEDIUM: Elevated TGS activity for a service account. Validate if this aligns with legitimate service usage or testing. Monitor for escalation.",
-        "LOW: Slight increase in TGS requests. Likely benign but worth baseline validation."
+        "MEDIUM: Elevated TGS activity. Validate service account role, requester population, and timing. Watch for repeat spikes or abnormal source hosts.",
+        "LOW: Minor increase. Baseline expected access patterns; promote if repeated or paired with other signals."
     )
 
 // ------------------------------------------------------------------
-// 7. FINAL OUTPUT
+// 7) OUTPUT
 // ------------------------------------------------------------------
 | project
     Severity,
@@ -96,43 +95,10 @@ RecentTGS
     LastSeen,
     ServiceAccount,
     RequestCount,
-    BaselineRequests,
+    BaselineDailyAvg,
     SpikeRatio,
     RC4Count,
     RequestingUsers,
-    SourceIPs
+    SourceIPs,
+    DCs
 | order by Severity desc, RequestCount desc, LastSeen desc;
-
-// ============================================================================
-// L2 INCIDENT RESPONSE GUIDANCE (CORE+)
-// ============================================================================
-//
-// 1) VALIDATE
-//    - Confirm EventID 4769 (Kerberos TGS request).
-//    - Confirm ServiceAccount is a real service (not a user account).
-//    - Check if the service account is expected to receive frequent tickets.
-//
-// 2) QUICK CONTEXT CHECKS
-//    - Is the activity during business hours?
-//    - Is there a known deployment, scan, or maintenance window?
-//    - Are RequestingUsers expected to access this service?
-//
-// 3) ESCALATE TO L3 IF:
-//    - RC4Count continues to increase.
-//    - Multiple different users request tickets for the same service rapidly.
-//    - SpikeRatio remains elevated over multiple hours/days.
-//    - Source IPs include unusual workstations or non-server systems.
-//
-// 4) CONTAINMENT (IF CONFIRMED MALICIOUS)
-//    - Rotate the affected service account password immediately.
-//    - Enforce AES-only encryption on the service account (disable RC4).
-//    - Review recent authentication activity by the service account.
-//
-// 5) FOLLOW-UP
-//    - Check for lateral movement using the service account.
-//    - Review LSASS access or memory dump attempts on requester hosts.
-//    - Ensure service accounts are marked as "Account is sensitive and cannot be delegated" where appropriate.
-//
-// ============================================================================
-// END
-// ============================================================================
