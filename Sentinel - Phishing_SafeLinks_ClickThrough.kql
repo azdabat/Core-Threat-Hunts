@@ -1,0 +1,121 @@
+// ======================================================================
+// SAFE LINKS BYPASS HUNT (L3)
+// Purpose: Identify users who actively ignored Microsoft security warnings 
+//          to access potential phishing sites.
+// ======================================================================
+
+let Lookback = 7d;
+
+// ------------------------------
+// SECTION 1: THE TRIGGER
+// Hunter Value: Isolates high-intent user risk. 
+// "ClickThrough" means the user saw the red warning page and clicked "Continue anyway".
+// ------------------------------
+let Clicks =
+UrlClickEvents
+| where Timestamp >= ago(Lookback)
+// "ClickThrough" = User bypassed the warning block.
+// "ClickAllowed" = User clicked, and Microsoft initially thought it was fine (but might be wrong).
+| where ActionType in ("ClickThrough", "ClickAllowed")
+| where Url has "safelinks.protection.outlook.com"
+| project 
+    ClickTime = Timestamp,
+    UserPrincipalName, 
+    RecipientEmailAddress,
+    Url, 
+    OriginalUrl = tostring(UrlOriginal), 
+    ActionType, 
+    ClickVerdict,
+    NetworkMessageId, 
+    DeviceId, 
+    IPAddress;
+
+// ------------------------------
+// SECTION 2: THE VECTOR (Email)
+// Hunter Value: Provides the "Phish Context". 
+// Was this a known Phish (ThreatTypes > 0) or a zero-day?
+// ------------------------------
+let EmailContext =
+EmailEvents
+| where Timestamp >= ago(Lookback)
+| project NetworkMessageId, SenderFromAddress, Subject, ThreatTypes, DeliveryAction;
+
+// ------------------------------
+// SECTION 3: THE ASSET (Device)
+// Hunter Value: Determines containment options. 
+// If the device is Unmanaged (OnboardingStatus != Onboarded), you cannot isolate it via EDR.
+// ------------------------------
+let DeviceCtx =
+DeviceInfo
+| where Timestamp >= ago(Lookback)
+| summarize arg_max(Timestamp, *) by DeviceId
+| project DeviceId, DeviceName, OnboardingStatus, OSPlatform;
+
+// ------------------------------
+// SECTION 4: THE IDENTITY (User)
+// Hunter Value: VIP check. Is this a High Value Target (Finance/Exec)?
+// ------------------------------
+let IdentityCtx =
+IdentityInfo
+| summarize arg_max(TimeGenerated, *) by AccountUPN
+| project AccountUPN, AccountDisplayName, Department, JobTitle;
+
+// ------------------------------
+// SECTION 5: THE SESSION (Login)
+// Hunter Value: "Did they give up credentials?"
+// CRITICAL FIX: We aggregate Signins FIRST to prevent row explosion.
+// We only care if they successfully signed in from that IP *around* the click time.
+// ------------------------------
+let LoginCtx =
+SigninLogs
+| where TimeGenerated >= ago(Lookback)
+| where ResultType == 0 // Success only
+| summarize 
+    LoginCount = count(), 
+    LastLoginTime = max(TimeGenerated),
+    AppsUsed = make_set(AppDisplayName) 
+  by UserPrincipalName, IPAddress;
+
+// ------------------------------
+// SECTION 6: CORRELATION
+// ------------------------------
+Clicks
+| join kind=inner (EmailContext) on NetworkMessageId
+| join kind=leftouter (DeviceCtx) on DeviceId
+| join kind=leftouter (IdentityCtx) on $left.UserPrincipalName == $right.AccountUPN
+// Join Login Context on IP + User to see if they logged in from the phishing IP
+| join kind=leftouter (LoginCtx) on UserPrincipalName, IPAddress
+
+// ------------------------------
+// SECTION 7: SCORING MODEL
+// Hunter Value: Prioritizes "Active Failure" over "Passive Click".
+// ------------------------------
+| extend Score = 0
+    + iif(ActionType == "ClickThrough", 50, 0)          // HUGE RISK: User ignored warning
+    + iif(isnotempty(ThreatTypes), 30, 0)               // Microsoft knew it was bad
+    + iif(ClickVerdict == "Malicious", 20, 0)           // Verdict confirmed malicious
+    + iif(LoginCount > 0, 15, 0)                        // User logged in from same IP (Cred Harvest Risk)
+    + iif(OnboardingStatus != "Onboarded", 10, 0)       // Device unmanaged (Blind spot)
+
+// ------------------------------
+// SECTION 8: SEVERITY GATING
+// ------------------------------
+| extend Severity = case(
+    Score >= 50, "Critical",
+    Score >= 30, "High",
+    Score >= 15, "Medium",
+    "Low"
+)
+
+// ------------------------------
+// SECTION 9: HUMAN-READABLE OUTPUT
+// Hunter Value: The "Directive" tells the L1 Analyst exactly what to do without guessing.
+// ------------------------------
+| extend HunterDirective = strcat(
+    "SEVERITY: ", Severity, ". ",
+    "User ", UserPrincipalName, 
+    case(
+        ActionType == "ClickThrough", " ACTIVELY BYPASSED SECURITY WARNING ", 
+        " clicked a link "
+    ),
+    "to access ",
