@@ -1,0 +1,43 @@
+// ============================================================================
+//  Browser Extension Threat Detection 
+// Scenarios: Policy Force Install, Known Malicious ID, and CRX Drops
+// ============================================================================
+let lookback = 7d;
+// 1) MOCK: Malicious Extension Feed (Awesome-Lists replacement)
+let MockFeed = datatable(FeedExtensionID:string, metadata_type:string, browser_extension:string)
+[
+    "aapocclgjoghfcdmcnncicajhdnfbni8", "malicious", "Chat-GPT-Hacker-Stealer",
+    "fancypantsid12345678901234567890", "vulnerable", "AdBlock-Plus-Fake"
+];
+// 2) MOCK: Telemetry (Combining File and Registry behaviors)
+let MockTelemetry = union
+(print Type="REG", Timestamp=datetime(2025-12-19 22:00:00), DeviceId="HR-WKSTN-01", FileName="", FolderPath="", RegistryKey="ExtensionInstallForcelist", RegistryData="aapocclgjoghfcdmcnncicajhdnfbni8", Method="PolicyForceInstall"),
+(print Type="FILE", Timestamp=datetime(2025-12-19 22:10:00), DeviceId="FIN-WKSTN-05", FileName="manifest.json", FolderPath=@"C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Default\Extensions\fancypantsid12345678901234567890\", RegistryKey="", RegistryData="", Method="ManifestWrite"),
+(print Type="FILE", Timestamp=datetime(2025-12-19 23:00:00), DeviceId="IT-LAPTOP-02", FileName="installer.crx", FolderPath=@"C:\Downloads\", RegistryKey="", RegistryData="", Method="CRXInstaller");
+// ---------------------------------------------------------------------------
+// 3) DETECTION ENGINE
+// ---------------------------------------------------------------------------
+let BehaviourEvents = MockTelemetry
+| extend ExtractedID = case(
+    Method == "PolicyForceInstall", tostring(RegistryData),
+    Method == "ManifestWrite", extract(@"Extensions\\([a-z0-9]{32})\\", 1, FolderPath),
+    Method == "CRXInstaller", extract(@"([a-z0-9]{32})", 1, FileName),
+    ""
+)
+| where isnotempty(ExtractedID);
+// Join and Score
+BehaviourEvents
+| join kind=leftouter (MockFeed) on $left.ExtractedID == $right.FeedExtensionID
+| extend IsFeedMatched = iif(isnotempty(FeedExtensionID), 1, 0)
+| extend BehaviourWeight = case(Method == "PolicyForceInstall", 3, Method == "ManifestWrite", 2, 1)
+| extend FeedWeight = case(metadata_type == "malicious", 3, metadata_type == "vulnerable", 1, 0)
+| extend TotalScore = tolong(BehaviourWeight) + tolong(FeedWeight)
+// 4) OUTPUT
+| extend Severity = case(TotalScore >= 5, "CRITICAL", TotalScore >= 3, "HIGH", "MEDIUM")
+| extend HunterDirective = case(
+    Severity == "CRITICAL", "CRITICAL: Known malicious extension force-installed via policy! Potential enterprise-wide compromise.",
+    Severity == "HIGH", "HIGH: Malicious file activity in browser extension directories. Review manifest permissions.",
+    "MEDIUM: Unusual extension installation method. Confirm legitimacy."
+)
+| project Severity, TotalScore, DeviceId, ExtractedID, browser_extension, Method, HunterDirective
+| order by TotalScore desc
