@@ -1,10 +1,6 @@
 // ============================================================================
-// HUNT PACK 01/10 (UPDATED) — .NET Build/Compile Execution + PCWRun
+// HUNT PACK 01/10 — .NET Build/Compile Execution + PCWRun (CORE)
 // Binaries: msbuild.exe, csc.exe, csi.exe, ieexec.exe, installutil.exe, regasm.exe, pcwrun.exe
-// Fixes:
-//   - Adds PCWRun.exe high-fidelity "-s <target>" execution pattern
-// LOLBAS includes PresentationHost/msxsl etc; PCWRun is often referenced in LOL technique discussions
-// but we keep detection extremely strict to avoid noise.
 // ============================================================================
 
 let lookback = 7d;
@@ -14,30 +10,19 @@ let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // MSBuild / .NET build exec
     ".csproj",".vbproj",".proj",".targets","/t:","/p:","/m",
-
-    // CSC patterns
     "-target:","-reference:","-r:","/unsafe","/platform","-out:",
-
-    // C# interactive
     ".csx","-script",
-
-    // IEExec ClickOnce/manifest exec
     ".application",".manifest",
-
-    // InstallUtil/RegAsm patterns
     "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
-
-    // PCWRun execution broker
-    "pcwrun.exe"," -s "
+    " -s "
 )
 | extend
     HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
-    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex","downloadstring"),
     BadDLLPath = (ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs),
     WeirdExport = bool(false),
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
