@@ -1,10 +1,6 @@
 // ============================================================================
-// HUNT PACK 09/10 (UPDATED) — Remote Execution / Lateral + WMIC XSL Proxy Execution
+// HUNT PACK 09/10 — Remote Execution / Lateral + WMIC XSL Proxy Execution (CORE)
 // Binaries: wmic.exe, winrs.exe, winrm.cmd, sc.exe, schtasks.exe, powershell.exe, cmd.exe
-// Fixes:
-//   - Adds WMIC XSL remote format execution (wmic os get /format:http://*.xsl)
-//   - Keeps it high-fidelity to stay near-zero noise
-// References: MITRE notes XSL abuse via WMIC/MSXSL (T1220). :contentReference[oaicite:4]{index=4}
 // ============================================================================
 
 let lookback = 7d;
@@ -14,20 +10,13 @@ let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscrip
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // WMIC remote exec
     "/node:","process call create",
-
-    // WMIC XSL proxy execution (high fidelity)
     " os get ","/format:","format:"," .xsl ","http","https",
-
-    // WinRM / WinRS
     "winrs","-r:","-u:","-p:","invoke-command","new-pssession",
     "winrm invoke","Create","Win32_Process",
-
-    // Service/task remote execution
     "sc \\\\","create","binpath=",
     "schtasks /create","/s ","/u ","/p ","/tn ","/tr "
 )
@@ -37,13 +26,10 @@ DeviceProcessEvents
     BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
     WeirdExport = bool(false),
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
-
-    // WMIC XSL detector
     WmicXsl = FileName =~ "wmic.exe"
         and ProcessCommandLine has_any ("os get","/format:","format:")
         and ProcessCommandLine has ".xsl"
         and ProcessCommandLine has_any ("http","https"),
-
     IsDownloader = bool(false),
     IsPersistence = ProcessCommandLine has_any ("schtasks /create","sc \\\\","create")
 | extend RiskScore =
