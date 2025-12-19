@@ -1,0 +1,54 @@
+// ============================================================================
+// HUNT PACK 05/10 — Scheduled Task / Service Persistence (EVASION-AWARE)
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["schtasks.exe","at.exe","sc.exe","reg.exe","wmic.exe","powershell.exe","cmd.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig = isnotempty(OrigLower)
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "/create","/tn","/tr","/sc","/ru","/rp","/f",
+    "/interactive","/every",
+    "create","binpath=","start=","obj=",
+    "reg add","\\run","\\runonce","\\image file execution options","\\services",
+    "process call create","/node:","startup","service",
+    "scheduledtasks","new-scheduledtask","register-scheduledtask"
+)
+| extend
+    IsMasqueraded = HasOrig and FileLower != OrigLower,
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = true
+| extend RiskScore =
+    0
+    + iif(IsMasqueraded, 50, 0)
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    IsMasqueraded, "CRITICAL: Masqueraded persistence LOLBIN (OriginalFileName mismatch)",
+    IsPersistence, "HIGH: Task/Service/Registry persistence attempt via LOLBIN",
+    HasScript, "HIGH: Persistence attempt with encoded/script staging",
+    BadParent, "MEDIUM: Persistence initiated by suspicious parent",
+    "Suspicious persistence activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
