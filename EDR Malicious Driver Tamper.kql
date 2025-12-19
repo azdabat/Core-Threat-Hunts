@@ -1,0 +1,60 @@
+// =============================================================================
+// Suspicious Driver Load Chain (Driver drop -> Load -> Tamper)
+// Author: Ala Dabat
+// Purpose: Detect malicious driver loading patterns with tampering indicators
+// Hunter Directive: Investigate driver lifecycle from creation to load with EDR tampering
+// =============================================================================
+
+let Lookback = 2d;
+let CreateToLoadWindow = 1h;
+let MaxGlobalPrevalence = 50;
+
+// Low-prevalence driver creation
+let LowPrevDrivers =
+    DeviceFileEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "FileCreated"
+    | where FileName endswith_cs ".sys"
+    | where FolderPath has_any ("\\Temp\\", "\\Users\\", "\\AppData\\", "\\ProgramData\\", "\\Windows\\Temp\\")
+    | invoke FileProfile(SHA1, 1000)
+    | where isnull(GlobalPrevalence) or GlobalPrevalence <= MaxGlobalPrevalence
+    | project DeviceId, DeviceName, FileName, FolderPath, SHA1, CreatedTime=Timestamp, GlobalPrevalence;
+
+// Driver loads
+let DriverLoads =
+    DeviceEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "DriverLoad"
+    | project DeviceId, LoadTime=Timestamp, LoadedFileName=FileName;
+
+// Tampering events
+let TamperEvents =
+    DeviceEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "TamperingAttempt"
+    | project DeviceId, TamperTime=Timestamp, TamperDetails=AdditionalFields;
+
+// Correlate the chain
+LowPrevDrivers
+| join kind=inner (DriverLoads) on DeviceId
+| where LoadTime between (CreatedTime .. CreatedTime + CreateToLoadWindow)
+| join kind=leftouter (TamperEvents) on DeviceId
+| where TamperTime between (LoadTime .. LoadTime + 30m)
+| extend HunterDirective = strcat(
+    "CRITICAL: Investigate suspicious driver '", FileName, "' loaded from ", FolderPath, 
+    ". Driver created at ", format_datetime(CreatedTime,'u'), " and loaded at ", format_datetime(LoadTime,'u'),
+    iif(isnotnull(TamperTime), " with EDR tampering detected.", " No tampering detected."),
+    " Global prevalence: ", tostring(GlobalPrevalence), ". Check for driver signing and review system for persistence mechanisms."
+)
+| project 
+    DeviceName, 
+    FileName, 
+    FolderPath, 
+    SHA1,
+    CreatedTime, 
+    LoadTime, 
+    TamperTime,
+    GlobalPrevalence,
+    HunterDirective,
+    RuleName = "Suspicious Driver Load Chain"
+| order by CreatedTime desc;
