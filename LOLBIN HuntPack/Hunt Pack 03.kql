@@ -1,8 +1,6 @@
 // ============================================================================
-// HUNT PACK 03/10 (UPDATED) — INF-Based Execution (CMSTP / InfDefaultInstall + proxy pivots)
+// HUNT PACK 03/10 — INF-Based Execution (CMSTP / InfDefaultInstall + proxy pivots) (CORE)
 // Binaries: cmstp.exe, infdefaultinstall.exe, regsvr32.exe, mshta.exe, rundll32.exe, control.exe, odbcconf.exe
-// Fixes:
-//   - Adds CMSTP /s /ni and /au remote INF patterns (high fidelity, low noise)
 // ============================================================================
 
 let lookback = 7d;
@@ -12,19 +10,12 @@ let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // INF execution
     ".inf","infdefaultinstall",
-
-    // CMSTP (high fidelity)
     "cmstp.exe"," /s "," /ni "," /au ",
-
-    // Scriptlet / proxy pivots often paired
     "scrobj","javascript","vbscript",
-
-    // DLL/CPL execution pivots
     ".dll",".cpl"
 )
 | extend
@@ -34,11 +25,8 @@ DeviceProcessEvents
     IsRundll32 = FileName =~ "rundll32.exe",
     WeirdExport = IsRundll32 and ProcessCommandLine matches regex @"(?i),(#\d+|run|start|dllregisterserver|entry|main|shellexec_rundll)",
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
-
-    // CMSTP specific flags (near-zero noise)
     CmstpSilent = FileName =~ "cmstp.exe" and ProcessCommandLine has_all (" /s "," /ni "),
     CmstpRemoteInf = FileName =~ "cmstp.exe" and (ProcessCommandLine has " /au " or HasNet),
-
     IsDownloader = (FileName =~ "cmstp.exe" and CmstpRemoteInf) or ((FileName =~ "mshta.exe" or FileName =~ "regsvr32.exe") and HasNet),
     IsPersistence = bool(false)
 | extend RiskScore =
