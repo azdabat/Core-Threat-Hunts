@@ -1,0 +1,141 @@
+// ======================================================================
+// Safe Links Bypass / Click-Through Detection – L3 Native Rule
+// Author: Ala Dabat 
+// Purpose: Detect users who click through Safe Links warning pages
+// MITRE: T1566.002 (Spearphishing Link), T1204 (User Execution)
+// ======================================================================
+
+let lookback = 7d;
+
+// ------------------------------
+// Core event: Safe Links click-through
+// ------------------------------
+let Clicks =
+UrlClickEvents
+| where TimeGenerated >= ago(lookback)
+| where Url has "safelinks.protection.outlook.com"
+| where ActionType in ("ClickAllowed", "ClickThrough")
+| extend OriginalUrl = tostring(UrlOriginal)
+| project TimeGenerated, UserPrincipalName, RecipientEmailAddress,
+          Url, OriginalUrl, ActionType, ClickVerdict,
+          NetworkMessageId, DeviceId, IPAddress;
+
+// ------------------------------
+// Email context
+// ------------------------------
+let EmailContext =
+EmailEvents
+| project NetworkMessageId, SenderFromAddress, Subject, ThreatTypes;
+
+// ------------------------------
+// Device context
+// ------------------------------
+let DeviceCtx =
+DeviceInfo
+| summarize arg_max(TimeGenerated, *) by DeviceId
+| project DeviceId, DeviceName, OnboardingStatus;
+
+// ------------------------------
+// Identity context
+// ------------------------------
+let IdentityCtx =
+IdentityInfo
+| summarize arg_max(TimeGenerated, *) by AccountUPN
+| project AccountUPN, AccountDisplayName, Department;
+
+// ------------------------------
+// Sign-in context
+// ------------------------------
+let LoginCtx =
+SigninLogs
+| where TimeGenerated >= ago(lookback)
+| project UserPrincipalName, IPAddress,
+          AppDisplayName, ClientAppUsed, ConditionalAccessStatus;
+
+// ------------------------------
+// Join everything
+// ------------------------------
+Clicks
+| join kind=leftouter EmailContext on NetworkMessageId
+| join kind=leftouter DeviceCtx on DeviceId
+| join kind=leftouter IdentityCtx on $left.UserPrincipalName == $right.AccountUPN
+| join kind=leftouter LoginCtx on $left.UserPrincipalName == $right.UserPrincipalName
+                                    and $left.IPAddress == $right.IPAddress
+
+// ------------------------------
+// Behaviour scoring (no TI)
+// ------------------------------
+| extend Score =
+    0
+    + iif(ActionType == "ClickThrough", 20, 0)            // ignored warning
+    + iif(isnotempty(ThreatTypes), 20, 0)                 // email had known threat
+    + iif(ConditionalAccessStatus == "failure", 5, 0)     // risky login?
+    + iif(ClientAppUsed !in ("Browser","Mobile App"), 5, 0) // non-standard client
+    + iif(isempty(DeviceId), 10, 0)                       // unknown device
+    + iif(OnboardingStatus != "Onboarded", 10, 0)         // unmanaged device
+;
+
+// ------------------------------
+// Severity classification
+// ------------------------------
+| extend Severity = case(
+    Score >= 40, "High",
+    Score >= 25, "Medium",
+    Score >= 10, "Low",
+    "Informational"
+);
+
+// ------------------------------
+// Hunter Directives
+// ------------------------------
+| extend HuntingDirectives = strcat(
+    "Severity=", Severity,
+    "; User=", UserPrincipalName,
+    "; Device=", DeviceName,
+    "; OriginalUrl=", OriginalUrl,
+    "; Sender=", SenderFromAddress,
+    "; Subject=", Subject,
+    "; ThreatTypes=", ThreatTypes,
+    "; Reason=",
+        case(
+            ActionType == "ClickThrough", "User clicked through Safe Links warning. ",
+            "User clicked Safe Links rewritten URL. "
+        ),
+        iif(isnotempty(ThreatTypes), "Original email flagged with threat type. ", ""),
+        iif(OnboardingStatus != "Onboarded", "Device not fully onboarded. ", ""),
+        iif(ClientAppUsed !in ("Browser","Mobile App"), "Non-browser app used. ", ""),
+    "; RecommendedNextSteps=",
+        case(
+            Severity == "High",
+                "Contact user immediately, review full email, inspect target URL, isolate device if phishing kit or credential capture identified.",
+            Severity == "Medium",
+                "Review the email and URL content, validate if user was phished. Check recent sign-in events and session tokens.",
+            "Baseline user behaviour or educate user on avoiding suspicious URLs."
+        )
+)
+
+// ------------------------------
+// Final projection
+// ------------------------------
+| project
+    Timestamp = TimeGenerated,
+    Severity,
+    Score,
+    UserPrincipalName,
+    AccountDisplayName,
+    Department,
+    DeviceName,
+    OnboardingStatus,
+    ActionType,
+    ClickVerdict,
+    OriginalUrl,
+    Url,
+    SenderFromAddress,
+    Subject,
+    ThreatTypes,
+    AppDisplayName,
+    ClientAppUsed,
+    ConditionalAccessStatus,
+    IPAddress,
+    HuntingDirectives
+| order by Timestamp desc
