@@ -1,0 +1,28 @@
+let TorExitNodes = externaldata(dest_ip:string) 
+["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/TOR/only_tor_exit_nodes_IP_list.csv"]
+with (format="csv", ignoreFirstRecord=true);
+let TorIPs = TorExitNodes | distinct dest_ip;
+
+DeviceNetworkEvents
+| where RemoteIP in (TorIPs)
+| extend Direction = iif(ConnectionDirection == "Outbound", "Outbound to Tor", "Inbound from Tor")
+| extend VT_Link = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+| summarize 
+    FirstSeen=min(Timestamp), LastSeen=max(Timestamp),
+    Count=count(), Processes=make_set(InitiatingProcessFileName),
+    Cmds=make_set(InitiatingProcessCommandLine),
+    Accounts=make_set(InitiatingProcessAccountName),
+    Ports=make_set(RemotePort)
+  by DeviceName, RemoteIP, Direction
+| extend MITRE_Tactics="TA0011: C2, TA0010: Exfiltration, TA0007: Discovery",
+         MITRE_Techniques="T1090: Proxy, T1071: Application Layer Protocol, T1573: Encrypted Channel"
+| extend HuntingDirectives = pack_array(
+    strcat("1. Investigate why ",DeviceName," is talking to Tor (Direction=",Direction,")."),
+    strcat("2. Processes observed: ", array_join(Processes, ", ")),
+    strcat("3. Command lines: ", array_join(Cmds, " | ")),
+    "4. Is Tor officially sanctioned for this user/team?",
+    "5. Pivot by hash/filepath of processes across estate.",
+    strcat("6. Check reputation of IP: ", VT_Link),
+    "7. Review DeviceLogonEvents around session for anomalous logins.",
+    "8. Consider capture of memory + network PCAP if unexpected."
+)
