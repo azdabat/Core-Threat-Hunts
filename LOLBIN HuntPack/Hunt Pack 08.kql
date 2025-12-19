@@ -1,7 +1,6 @@
 // ============================================================================
-// HUNT PACK 08/10 — Local Credential/Secret Hunting (Discovery-to-CredAccess)
+// HUNT PACK 08/10 — Local Credential/Secret Hunting (Discovery-to-CredAccess) (CORE)
 // Binaries: findstr.exe, find.exe, attrib.exe, type.exe, more.com, cmd.exe, powershell.exe
-// Notes: You called out find/findstr/attrib/systeminfo — this pack handles “cred hunting” patterns.
 // ============================================================================
 
 let lookback = 7d;
@@ -16,7 +15,7 @@ let CredHuntTerms = dynamic([
 ]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (CredHuntTerms)
    or (FileName =~ "attrib.exe" and ProcessCommandLine has_any ("-h","-s","+h","+s"))
@@ -36,7 +35,7 @@ DeviceProcessEvents
     + iif(WeirdExport, 20, 0)
     + iif(BadParent, 20, 0)
     + iif(IsPersistence, 40, 0)
-    + 40 // credential-hunting terms are rare & high-signal
+    + 40
 | where RiskScore >= 50
 | extend Hunter_Directive = case(
     FileName in~ ("findstr.exe","find.exe"), "HIGH: Possible credential/secret string hunting",
