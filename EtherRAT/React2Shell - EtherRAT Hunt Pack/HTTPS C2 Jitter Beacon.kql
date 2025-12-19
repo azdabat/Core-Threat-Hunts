@@ -1,0 +1,90 @@
+// ============================================================================
+// Rule Name: HTTPS C2 Jitter Beacon Hunt (Low CPU)
+// Author: Ala Dabat
+// Purpose:
+//   Hunt for outbound HTTPS connections from endpoints that:
+//     - Repeatedly contact the same IP/host over port 443
+//     - Send very small payloads
+//     - Show semi-regular timing with light jitter (typical beaconing)
+// Data Sources: DeviceNetworkEvents
+// MITRE: TA0011 Command and Control, TA0005 Defense Evasion
+// Notes:
+//   - Designed for low CPU use in large estates
+//   - Only one summarize() per device/IP/process
+// ============================================================================
+
+let lookback = 24h;
+let min_connections = 20;     // exclude low-volume noise
+let max_payload_bytes = 50000; // remove bulk data transfers
+
+// Stage 1 — Outbound HTTPS flows (non-browser)
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 443
+| where Protocol == "Tcp"
+| where isnotempty(RemoteIP)
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","teams.exe")
+| extend TotalBytes = tolong(SentBytes) + tolong(ReceivedBytes)
+| where TotalBytes <= max_payload_bytes
+| project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessParentFileName, TotalBytes;
+
+// Stage 2 — Interval statistics
+Net
+| sort by DeviceId, RemoteIP, InitiatingProcessFileName asc, Timestamp asc
+| extend PrevTime = prev(Timestamp),
+         IntervalSec = datetime_diff("second", Timestamp, PrevTime)
+| where IntervalSec > 0
+| summarize
+    ConnectionCount       = count(),
+    AvgIntervalSec        = avg(IntervalSec),
+    MinIntervalSec        = min(IntervalSec),
+    MaxIntervalSec        = max(IntervalSec),
+    StdDevIntervalSec     = stdev(IntervalSec),
+    AvgBytes              = avg(TotalBytes),
+    FirstSeen             = min(Timestamp),
+    LastSeen              = max(Timestamp),
+    SampleProcess         = any(InitiatingProcessFileName),
+    SampleCommand         = any(InitiatingProcessCommandLine),
+    SampleParent          = any(InitiatingProcessParentFileName)
+  by DeviceName, RemoteIP
+
+// Stage 3 — Noise control + scoring
+| where ConnectionCount >= min_connections
+| extend
+    JitterRatio = iif(AvgIntervalSec > 0, StdDevIntervalSec / AvgIntervalSec, 0.0),
+    BeaconScore =
+          iif(AvgIntervalSec between (10 .. 3600), 20, 0)       // typical beacon window
+        + iif(JitterRatio between (0.02 .. 0.50), 20, 0)        // C2 jitter
+        + iif(AvgBytes <= 5000, 10, 0)                          // very small payloads
+        + iif(ConnectionCount >= 40, 10, 0),
+
+    Severity = case(
+        BeaconScore >= 45, "HIGH",
+        BeaconScore >= 30, "MEDIUM",
+        BeaconScore >= 20, "LOW",
+        "INFO"
+    ),
+
+    KillChain = "TA0011 — Command & Control"
+
+// Projection
+| project
+    Severity,
+    BeaconScore,
+    DeviceName,
+    RemoteIP,
+    ConnectionCount,
+    AvgIntervalSec,
+    StdDevIntervalSec,
+    JitterRatio,
+    AvgBytes,
+    SampleProcess,
+    SampleCommand,
+    SampleParent,
+    FirstSeen,
+    LastSeen,
+    KillChain
+| order by BeaconScore desc, ConnectionCount desc
