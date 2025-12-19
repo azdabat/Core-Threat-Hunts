@@ -1,0 +1,59 @@
+// ============================================================================
+// HUNT PACK 06/10 — Ransomware-Adjacent Defense Evasion (EVASION-AWARE)
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","bcedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig = isnotempty(OrigLower)
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "delete shadows","delete shadowcopies","shadows /all","/quiet",
+    " wevtutil cl "," wevtutil.exe cl ","clear-log"," sl "," set-log ",
+    "bcdedit","bcedit","set","bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks",
+    "wbadmin delete","catalog","systemstatebackup",
+    "fsutil","usn","deletejournal","setzerodata","behavior set",
+    "cipher /w",
+    "netsh advfirewall","firewall set","set allprofiles state off"
+)
+| extend
+    IsMasqueraded = HasOrig and FileLower != OrigLower,
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = (FileLower in~ ("bcdedit.exe","bcedit.exe") and ProcessCommandLine has " set ")
+| extend RiskScore =
+    0
+    + iif(IsMasqueraded, 50, 0)
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + iif((FileLower == "wevtutil.exe" or OrigLower == "wevtutil.exe") and ProcessCommandLine has " cl ", 60, 0)
+    + iif((FileLower == "vssadmin.exe" or OrigLower == "vssadmin.exe") and ProcessCommandLine has "delete", 60, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    IsMasqueraded, "CRITICAL: Masqueraded defense-evasion LOLBIN (OriginalFileName mismatch)",
+    (FileLower == "vssadmin.exe" or OrigLower == "vssadmin.exe"), "CRITICAL: Shadow copy deletion (ransomware recovery inhibition)",
+    (FileLower == "wevtutil.exe" or OrigLower == "wevtutil.exe") and ProcessCommandLine has " cl ", "CRITICAL: Event log cleared via wevtutil (anti-forensics)",
+    FileLower in~ ("bcdedit.exe","bcedit.exe") or OrigLower in~ ("bcdedit.exe","bcedit.exe"), "HIGH: Boot/security configuration tamper",
+    (FileLower == "wbadmin.exe" or OrigLower == "wbadmin.exe"), "HIGH: Backup deletion / recovery inhibition",
+    (FileLower == "netsh.exe" or OrigLower == "netsh.exe"), "HIGH: Firewall/network tamper",
+    "HIGH: Defense evasion / recovery inhibition via LOLBIN"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
