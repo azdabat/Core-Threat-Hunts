@@ -1,7 +1,6 @@
 // ============================================================================
-// HUNT PACK 04/10 — Ingress Tool Transfer (Download Cradles)
+// HUNT PACK 04/10 — Ingress Tool Transfer (Download Cradles) (CORE)
 // Binaries: certutil.exe, bitsadmin.exe, curl.exe, wget.exe, ftp.exe, tftp.exe, powershell.exe
-// Notes: Focused and fast; avoids “universal” keyword sprawl.
 // ============================================================================
 
 let lookback = 7d;
@@ -11,17 +10,13 @@ let SuspiciousParents = dynamic(["cmd.exe","winword.exe","excel.exe","outlook.ex
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
     "http","https","ftp",
-    // certutil
     "-urlcache","-split","-f","decode","encode",
-    // bitsadmin
     "/transfer","/addfile","/setnotifycmdline","/resume",
-    // curl/wget
     " -o "," --output "," -OutFile ","--remote-name",
-    // powershell download cradles
     "invoke-webrequest","iwr","invoke-restmethod","irm","downloadstring","new-object net.webclient"
 )
 | extend
