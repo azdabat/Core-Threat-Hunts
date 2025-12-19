@@ -3,49 +3,29 @@
 // Binaries: msbuild.exe, csc.exe, csi.exe, ieexec.exe, installutil.exe, regasm.exe, pcwrun.exe
 // ============================================================================
 
-let lookback = 7d;
-
-let TargetProcs = dynamic(["msbuild.exe","csc.exe","csi.exe","ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe"]);
+let lookback = 30d;
+let TargetProcs = dynamic(["msbuild.exe","csc.exe","csi.exe","ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe","powershell.exe"]);
 let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
-
 DeviceProcessEvents
 | where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
-| where ProcessCommandLine has_any (
-    ".csproj",".vbproj",".proj",".targets","/t:","/p:","/m",
-    "-target:","-reference:","-r:","/unsafe","/platform","-out:",
-    ".csx","-script",
-    ".application",".manifest",
-    "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
-    " -s "
-)
+// Step 1: Create the base logic flags
 | extend
-    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
-    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex","downloadstring"),
-    BadDLLPath = (ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs),
-    WeirdExport = bool(false),
-    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
-    PcwRunBroker = FileName =~ "pcwrun.exe" and ProcessCommandLine has " -s ",
+    HasNet = (ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript = (ProcessCommandLine has_any ("-enc","frombase64string","iex","downloadstring")),
+    BadDLLPath = ((ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs)),
+    BadParent = (InitiatingProcessFileName in~ (SuspiciousParents)),
+    PcwRunBroker = (FileName =~ "pcwrun.exe" and ProcessCommandLine has " -s ")
+// Step 2: Now that Step 1 is "finished," we can use those flags
+| extend 
     IsDownloader = (FileName =~ "ieexec.exe" and HasNet),
-    IsPersistence = bool(false)
-| extend RiskScore =
-    0
-    + iif(HasNet or IsDownloader, 60, 0)
-    + iif(HasScript, 50, 0)
-    + iif(BadDLLPath, 30, 0)
-    + iif(WeirdExport, 20, 0)
-    + iif(BadParent, 20, 0)
-    + iif(PcwRunBroker, 60, 0)
-| where RiskScore >= 50
-| extend Hunter_Directive = case(
-    PcwRunBroker, "CRITICAL: PCWRun execution broker (-s ...) — validate child target immediately",
-    HasNet or IsDownloader, "CRITICAL: Remote execution / build execution via .NET toolchain",
-    HasScript, "HIGH: Script/encoded execution via .NET toolchain",
-    BadDLLPath, "MEDIUM-HIGH: DLL/Artifact referenced from suspicious directory",
-    BadParent, "MEDIUM: .NET execution spawned by suspicious parent",
-    "Suspicious .NET toolchain activity"
-)
-| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
-    by DeviceName, FileName, Hunter_Directive
-| where not(Count > 20 and MaxRisk < 70)
+    RiskScore = 0 
+        + iif(HasNet, 60, 0) 
+        + iif(HasScript, 50, 0) 
+        + iif(BadDLLPath, 30, 0) 
+        + iif(BadParent, 20, 0) 
+        + iif(PcwRunBroker, 60, 0)
+| where RiskScore >= 40
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, RiskScore
+| order by RiskScore desc
