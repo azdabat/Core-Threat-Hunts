@@ -1,7 +1,6 @@
 // ============================================================================
-// HUNT PACK 10/10 — Developer / Debugger Execution & Injection Adjacent
+// HUNT PACK 10/10 — Developer / Debugger Execution & Injection Adjacent (CORE)
 // Binaries: cdb.exe, windbg.exe, procdump.exe, werfault.exe, taskmgr.exe, mavinject.exe, dllhost.exe
-// Notes: You asked for cdb.exe explicitly; this pack isolates “rare but dangerous” dev tools.
 // ============================================================================
 
 let lookback = 7d;
@@ -11,16 +10,12 @@ let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // Debugger common flags / attach
     "-p "," -pn ",".dump","!","-c ",
-    // ProcDump/WERFault LSASS targeting (cred access)
     "lsass","-ma","-mp",
-    // MavInject
     "/INJECTRUNNING","/RUNNING",
-    // DLLHost odd invocations
     " /Processid:",".dll"
 )
 | extend
