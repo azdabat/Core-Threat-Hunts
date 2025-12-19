@@ -1,7 +1,6 @@
 // ============================================================================
-// HUNT PACK 07/10 — AD & Domain Recon (Discovery)
+// HUNT PACK 07/10 — AD & Domain Recon (Discovery) (CORE)
 // Binaries: dsquery.exe, dsget.exe, nltest.exe, net.exe, net1.exe, whoami.exe, systeminfo.exe
-// Notes: Covers the recon tools you listed; tuned for suspicious recon verbs.
 // ============================================================================
 
 let lookback = 7d;
@@ -11,16 +10,12 @@ let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
-| where TimeGenerated > ago(lookback)
+| where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    // dsquery/dsget
     "dsquery","dsget","user","group","computer","server","subnet","ou","site","-limit","-name","-samid",
-    // nltest
     "/dclist:","/domain_trusts","/trusted_domains","/dsgetdc:",
-    // net/net1
     "user","group","localgroup","accounts","share","view","use","start","stop",
-    // whoami/systeminfo
     "/all","/priv","/groups","systeminfo"
 )
 | extend
@@ -39,7 +34,7 @@ DeviceProcessEvents
     + iif(WeirdExport, 20, 0)
     + iif(BadParent, 20, 0)
     + iif(IsPersistence, 40, 0)
-    + 30 // Recon pack is inherently “low-signal / high-intent”; bump baseline to avoid missing it
+    + 30
 | where RiskScore >= 50
 | extend Hunter_Directive = case(
     FileName in~ ("dsquery.exe","dsget.exe","nltest.exe"), "HIGH: AD / domain reconnaissance",
