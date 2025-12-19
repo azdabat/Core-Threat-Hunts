@@ -1,0 +1,107 @@
+// ============================================================================
+// L3_TrustedParent_LOLBin_InMemoryInjection_Chain_V1_1
+// Author: Ala Dabat
+// NOTE: Hunt-first (not production tested yet)
+// Purpose:
+//   Detect in-memory injection chains where trusted user-facing apps (Office/Browsers)
+//   spawn LOLBins which then perform injection/tampering into high-value system processes.
+//   Adds secondary evidence: Ghost module loads + rapid outbound beacon.
+// Data:
+//   DeviceProcessEvents, DeviceImageLoadEvents, DeviceNetworkEvents
+// Tactics:
+//   TA0002 Execution | TA0005 Defense Evasion | TA0011 Command & Control
+// Techniques:
+//   T1055 (Process Injection), T1218 (LOLBins), T1620 (Reflective Loading), T1105 (Ingress), T1071 (C2)
+// ============================================================================
+
+let lookback = 7d;
+let ChainWindow = 2m;          // immediate post-spawn behavior
+let BeaconWindow = 5m;         // allow a slightly wider window for first comms
+let SuspiciousPorts = dynamic([4444, 1337, 8443, 8081, 9001]);
+
+// ----------------------------
+// MODE (Hunt default)
+// ----------------------------
+let EnableAllowlist = false;
+
+// --- Core LOLBins (execution / loader glue) ---
+let ExecutionLOLBins = dynamic([
+  "powershell.exe","pwsh.exe","rundll32.exe","regsvr32.exe",
+  "mshta.exe","wscript.exe","cscript.exe","cmd.exe","msiexec.exe","schtasks.exe"
+]);
+
+// --- Trusted / user-facing parents abused for “inheritance camouflage” ---
+let TrustedParents = dynamic([
+  "explorer.exe","chrome.exe","msedge.exe","firefox.exe",
+  "winword.exe","excel.exe","outlook.exe","powerpnt.exe",
+  "teams.exe","onedrive.exe","slack.exe","acrord32.exe"
+]);
+
+// --- High-value injection targets (raise confidence when targeted) ---
+let HighValueTargets = dynamic([
+  "lsass.exe","winlogon.exe","csrss.exe","services.exe","svchost.exe","explorer.exe",
+  "spoolsv.exe","smss.exe","taskhostw.exe","runtimebroker.exe","sihost.exe","conhost.exe",
+  "dllhost.exe","wmiPrvSE.exe","WerFault.exe","MsMpEng.exe","MsSense.exe"
+]);
+
+// --- Writable / attacker-favored module paths (context, not IOC) ---
+let WritableUserPaths = dynamic([
+  @"\users\", @"\appdata\", @"\programdata\", @"\windows\temp\", @"\temp\", @"\windows\tasks\"
+]);
+
+// --- Optional allowlist (tenant-specific) ---
+let AllowedParentCmdlinePatterns = dynamic([
+  "officeclicktorun","microsoft office","chrome.exe --type=utility","msedge.exe --type=utility"
+]);
+let AllowedAccounts = dynamic(["svc-build","svc-it","buildagent","runner"]);
+
+let IsAllowlistedSpawn = (
+  EnableAllowlist
+  and (
+    InitiatingProcessCommandLine has_any (AllowedParentCmdlinePatterns)
+    or InitiatingProcessAccountName has_any (AllowedAccounts)
+  )
+);
+
+// ============================================================================
+// CAPABILITY PROBES (Tenant-aware feature inference)
+// ============================================================================
+
+let HasInjectionTelemetry =
+toscalar(
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where ActionType in ("CreateRemoteThread","WriteProcessMemory","QueueUserAPC","ProcessTampering","ProcessInjection","ProcessHollowing")
+  | summarize c = count()
+  | project c > 0
+);
+
+let HasImageLoadTelemetry =
+toscalar(
+  DeviceImageLoadEvents
+  | where Timestamp >= ago(lookback)
+  | summarize c = count()
+  | project c > 0
+);
+
+let HasNetworkTelemetry =
+toscalar(
+  DeviceNetworkEvents
+  | where Timestamp >= ago(lookback)
+  | summarize c = count()
+  | project c > 0
+);
+
+// ============================================================================
+// PHASE 1 — Abnormal Process Tree (Trusted Parent -> LOLBin)
+// ============================================================================
+
+let SuspiciousSpawn =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ExecutionLOLBins)
+| where InitiatingProcessFileName in~ (TrustedParents)
+| where not(IsAllowlistedSpawn)
+| project
+    SpawnTime = Timestamp,
+    DeviceId, DeviceName
