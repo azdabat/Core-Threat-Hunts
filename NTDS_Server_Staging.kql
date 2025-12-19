@@ -1,0 +1,137 @@
+// ============================================================================
+// SERVER_NTDS_STAGING_L3 — NTDS/SAM/SYSTEM Staging & Movement (Non-DC Servers)
+// Author: Ala Dabat
+// Purpose: Catch post-extraction movement/staging of NTDS or registry hives
+//          on ANY server (excluding DCs): admin shares, suspicious dirs, copy tools.
+// Scope: Servers excluding Domain Controllers (medium fidelity; correlation-driven).
+// Data: DeviceInfo, DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents (optional)
+// MITRE: T1105 (Ingress Tool Transfer / Staging), T1021.002 (SMB Admin Shares), T1003.*
+// ============================================================================
+
+let lookback = 7d;
+let ChainWindow = 20m;
+let EnableAllowlist = true;
+
+let SuspiciousDestDirs = dynamic([
+  "\\Users\\Public\\","\\ProgramData\\","\\Windows\\Temp\\","\\Temp\\",
+  "\\Downloads\\","\\Desktop\\","\\AppData\\Local\\Temp\\","\\AppData\\Roaming\\"
+]);
+
+let CopyTools = dynamic([
+  "robocopy.exe","xcopy.exe","copy.exe","move.exe","cmd.exe",
+  "powershell.exe","pwsh.exe","rundll32.exe","wscript.exe","cscript.exe"
+]);
+
+let ArtifactIndicators = dynamic([
+  "ntds.dit","\\Windows\\NTDS\\","\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy",
+  "sam.save","system.save","security.save","HKLM\\SAM","HKLM\\SYSTEM","HKLM\\SECURITY",
+  "\\System32\\config\\"
+]);
+
+let AllowedAccounts = dynamic(["svc-backup","backupsvc","svc-veeam","svc-netbackup","svc-rubrik"]);
+let AllowedProcs = dynamic(["VeeamAgent.exe","Veeam.Backup.exe","wbengine.exe","backupexec.exe","NetBackup.exe","AcronisAgent.exe","rubrik.exe"]);
+
+let Servers =
+DeviceInfo
+| summarize arg_max(Timestamp, *) by DeviceId
+| extend DeviceTagsStr = tostring(DeviceTags)
+| extend IsServer = iff(DeviceType =~ "Server", true, false)
+| extend IsDC =
+    iff(
+        (DeviceTagsStr has "DomainController")
+        or (DeviceName matches regex @"(?i)\bDC\d{0,3}\b")
+        or (DeviceName startswith "DC" and IsServer),
+        true,
+        false
+    )
+| where IsServer == true and IsDC == false
+| project DeviceId, DeviceName;
+
+let IsAllowlisted = (EnableAllowlist and (AccountName in~ (AllowedAccounts) or InitiatingProcessFileName in~ (AllowedProcs)));
+
+let FileStaging =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| join kind=inner (Servers) on DeviceId
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileCopied")
+| extend Name=tostring(FileName), Path=tostring(FolderPath)
+| extend IsNTDS = (Name =~ "ntds.dit") or (Path has "\\Windows\\NTDS\\") or (Path has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy")
+| extend IsHive = Name matches regex @"(?i)^(sam|system|security)\.(save|bak|tmp|old)$" or (Path has "\\System32\\config\\")
+| extend IsAdminShare = Path startswith @"\\" and Path has_any (dynamic(["ADMIN$","C$","D$","E$"]))
+| extend IsSuspDest = Path has_any (SuspiciousDestDirs)
+| where IsNTDS or IsHive or (IsAdminShare and Name has_any (dynamic(["ntds","dit","sam","system","security"])))
+| where InitiatingProcessFileName !in~ ("TiWorker.exe","MsMpEng.exe","Sense.exe","svchost.exe")
+| extend FileScore =
+    10
+  + iif(IsNTDS, 60, 0)
+  + iif(IsHive, 45, 0)
+  + iif(IsAdminShare, 35, 0)
+  + iif(IsSuspDest and (IsNTDS or IsHive), 30, 0)
+| project
+    FileTs=Timestamp, DeviceId, DeviceName,
+    AccountName=tostring(InitiatingProcessAccountName),
+    Proc=tostring(InitiatingProcessFileName),
+    Parent=tostring(InitiatingProcessParentFileName),
+    Cmd=tostring(InitiatingProcessCommandLine),
+    FileName=Name, FolderPath=Path,
+    IsNTDS, IsHive, IsAdminShare, IsSuspDest,
+    FileScore;
+
+let ProcStaging =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| join kind=inner (Servers) on DeviceId
+| where FileName in~ (CopyTools)
+| where not(IsAllowlisted)
+| extend Cmd=tostring(ProcessCommandLine)
+| extend Parent=tostring(InitiatingProcessFileName)
+| extend HasArtifacts = Cmd has_any (ArtifactIndicators)
+| extend HasAdminShare = Cmd has @"\\ADMIN$" or Cmd matches regex @"(?i)\\\\[^\\]+\\" and Cmd has_any (dynamic(["\\C$","\\D$","\\E$"]))
+| extend HasShadowCopy = Cmd has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy"
+| extend ProcScore =
+    10
+  + iif(HasArtifacts, 35, 0)
+  + iif(HasAdminShare, 30, 0)
+  + iif(HasShadowCopy, 35, 0)
+  + iif(FileName in~ ("powershell.exe","pwsh.exe") and (Cmd has_any (dynamic(["Copy-Item","robocopy","xcopy","move","cp","copy"]))), 15, 0)
+| where ProcScore >= 30
+| project
+    ProcTs=Timestamp, DeviceId, DeviceName, AccountName,
+    Parent, Process=FileName, Cmd,
+    HasArtifacts, HasAdminShare, HasShadowCopy,
+    ProcScore;
+
+ProcStaging
+| join kind=leftouter (FileStaging) on DeviceId
+| where FileTs between (ProcTs - ChainWindow .. ProcTs + ChainWindow) or isempty(FileTs)
+| extend TotalScore = todouble(ProcScore) + todouble(coalesce(FileScore, 0))
+| summarize
+    FirstSeen=min(coalesce(ProcTs, FileTs)),
+    LastSeen=max(coalesce(ProcTs, FileTs)),
+    MaxScore=max(TotalScore),
+    ProcCount=count(),
+    Procs=make_set(Process, 15),
+    Parents=make_set(Parent, 15),
+    SampleCmd=any(Cmd),
+    Files=make_set(strcat(FolderPath,"\\",FileName), 15)
+  by DeviceId, DeviceName, AccountName
+| extend Severity = case(
+    MaxScore >= 110, "HIGH",
+    MaxScore >= 75,  "MEDIUM",
+    "LOW"
+)
+| extend HuntingDirective = case(
+    Severity == "HIGH",
+    "HIGH: Non-DC server shows NTDS/hive artifact staging + copy/admin share patterns. Identify source host (likely DC), trace operator account, check recent SMB sessions, isolate if unapproved, and hunt for exfil/persistence.",
+    Severity == "MEDIUM",
+    "MEDIUM: Potential NTDS/hive movement on server. Validate backup/DR workflows; pivot to SMB connections and recent file writes in Temp/Public/ProgramData.",
+    "LOW: Weak staging indicator. Baseline and watch for recurrence or correlation with DC dump activity."
+)
+| project
+    Severity, HuntingDirective,
+    FirstSeen, LastSeen,
+    DeviceName, AccountName,
+    MaxScore, ProcCount,
+    Procs, Parents, Files,
+    SampleCmd
+| order by MaxScore desc, LastSeen desc;
