@@ -1,0 +1,60 @@
+// ============================================================================
+// HUNT PACK 09/10 — Remote Execution / Lateral + WMIC XSL Proxy Execution (EVASION-AWARE)
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["wmic.exe","winrs.exe","winrm.cmd","sc.exe","schtasks.exe","powershell.exe","cmd.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig = isnotempty(OrigLower)
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "/node:","process call create",
+    " os get ","/format:","format:"," .xsl ","http","https",
+    "winrs","-r:","-u:","-p:","invoke-command","new-pssession",
+    "winrm invoke","Create","Win32_Process",
+    "sc \\\\","create","binpath=",
+    "schtasks /create","/s ","/u ","/p ","/tn ","/tr "
+)
+| extend
+    IsMasqueraded = HasOrig and FileLower != OrigLower,
+    HasNet = ProcessCommandLine has_any ("\\\\","/s ","-r:","/node:") or (ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    WmicXsl = (FileLower == "wmic.exe" or OrigLower == "wmic.exe")
+        and ProcessCommandLine has_any ("os get","/format:","format:")
+        and ProcessCommandLine has ".xsl"
+        and ProcessCommandLine has_any ("http","https"),
+    IsDownloader = bool(false),
+    IsPersistence = ProcessCommandLine has_any ("schtasks /create","sc \\\\","create")
+| extend RiskScore =
+    0
+    + iif(IsMasqueraded, 50, 0)
+    + iif(HasNet, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + iif(WmicXsl, 70, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    IsMasqueraded, "CRITICAL: Masqueraded lateral LOLBIN (OriginalFileName mismatch)",
+    WmicXsl, "CRITICAL: WMIC XSL proxy execution (/format:http(s)://*.xsl) — code execution likely",
+    HasNet and HasScript, "CRITICAL: Remote execution + encoded/script staging (lateral movement likely)",
+    HasNet, "HIGH: Remote execution / management lateral signal",
+    IsPersistence, "HIGH: Remote task/service creation attempt",
+    "Suspicious remote management activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 50 and MaxRisk < 70)
