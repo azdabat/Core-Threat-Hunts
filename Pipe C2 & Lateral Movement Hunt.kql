@@ -1,0 +1,160 @@
+// Named Pipe C2 & Lateral Movement Hunt (High-Fidelity)
+// Author: Ala Dabat
+// Focus: C2 frameworks, PsExec/RemCom-style lateral movement, privilege escalation & persistence via named pipes
+
+let lookback = 7d;
+
+// High-signal pipe patterns (keep this list tight on purpose)
+let HighRiskPipes = dynamic([
+    // Cobalt Strike / implants
+    @"\MSSE-", @"\status_", @"\msagent_", @"\postex_", @"\postex_ssh_", @"\beacon", @"\pipetst",
+    // Sliver / PoshC2 / Covenant / Empire
+    @"\sliver", @"\sliver-", @"\sliverpipe",
+    @"\jaccdpqnvbrrxlaf", @"\Posh", @"\poshc2",
+    @"\gruntsvc", @"\gruntsvc_", @"\gruntsvcs", @"\covenant", @"\empire", @"\empire_", @"\emppipe",
+    // Tooling & dumpers
+    @"\lsadump", @"\cachedump", @"\wceservicepipe",
+    // APT / campaigns
+    @"\583da945-62af-10e8-4902-a8f205c72b2e", // SUNBURST
+    @"\NamePipe_MoreWindows",                  // RedLeaves
+    @"\46a676ab7f179e511e30dd2dc41bd388"       // Project Sauron
+]);
+
+// Medium-risk pipes (frameworks / remote exec likely to generate some grey noise)
+let MediumRiskPipes = dynamic([
+    @"\remcom", @"\RemCom_", @"\RemCom_stdin", @"\RemCom_stdout", @"\RemCom_stderr",
+    @"\PSEXESVC", @"\PSEXEC", @"\csexec",
+    @"\meter_", @"\metepreter", @"\mspipe"
+]);
+
+// Baseline exclusions (tune per tenant)
+let BaselineAccounts = dynamic(["NT AUTHORITY\\SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"]);
+let BaselinePipeFragments = dynamic([
+    "sql", "eventlog", "winsock", "lsass", "spooler" // examples only – refine from local baselines
+]);
+
+// --- Named Pipe Events (MDE DeviceEvents) ---
+let PipeEvents_raw =
+DeviceEvents
+| where TimeGenerated >= ago(lookback)
+| where ActionType == "NamedPipeEvent"
+| extend F = parse_json(AdditionalFields)
+| extend PipeName = tostring(F.PipeName),
+          FileOp  = tostring(F.FileOperation)
+| where isnotempty(PipeName)
+| where FileOp =~ "File created"  // pipe creation
+| where tolower(PipeName) !has_any (BaselinePipeFragments)
+| project
+    TimeGenerated,
+    DeviceId,
+    DeviceName = tolower(DeviceName), // Normalize for join
+    AccountName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    PipeName;
+
+// --- Service Creation (PsExec, RemCom, Cobalt Strike implants) ---
+let ServiceCreation =
+SecurityEvent
+| where TimeGenerated >= ago(lookback)
+| where EventID == 7045
+| extend ServiceFileName = tostring(ServiceFileName)
+| where ServiceFileName has_any ("psexesvc.exe", "remcomsvc.exe", "csexecsvc.exe", "gruntsvc.exe", "sliver.exe")
+| project
+    TimeGenerated,
+    DeviceName = tolower(tostring(split(Computer, ".")[0])), // Normalize Computer Name to match DeviceName
+    ServiceFileName,
+    ServiceName,
+    ServiceCommand = ServiceFileName,
+    ServiceCreated = true;
+
+// --- Pipe frequency (for rarity scoring) ---
+let PipeFrequency =
+PipeEvents_raw
+| summarize OrgPipeCount = count(), HostCount = dcount(DeviceName) by PipeName;
+
+// --- Enrich, classify, score per event ---
+let PipeEvents =
+PipeEvents_raw
+| join kind=leftouter PipeFrequency on PipeName
+| extend OrgPipeCount = coalesce(OrgPipeCount, 0),
+         HostCount    = coalesce(HostCount, 0)
+| extend PipeCategory =
+    case(
+        PipeName has_any (HighRiskPipes),   "HighRiskFramework",
+        PipeName has_any (MediumRiskPipes), "MediumRiskFramework",
+        "Suspicious"
+    )
+| extend KillChainStage =
+    case(
+        PipeCategory == "HighRiskFramework",               "Command & Control / Post-Ex",
+        PipeName has_any (dynamic(["psexec","remcom"])), "Lateral Movement",
+        PipeName has_any (dynamic(["lsadump","cachedump","wceservicepipe"])), "Credential Access",
+        "Suspicious Named Pipe Activity"
+    )
+| extend BaseScore =
+    case(
+        PipeCategory == "HighRiskFramework",   70,
+        PipeCategory == "MediumRiskFramework", 50,
+        30
+    )
+| extend RarityScore =
+    case(
+        tolong(OrgPipeCount) == 0,  30, // Added tolong for casting
+        tolong(OrgPipeCount) <= 3,  20,
+        tolong(OrgPipeCount) <= 10, 10,
+        0
+    )
+| extend AccountBaselinePenalty = iif(AccountName in (BaselineAccounts), -10, 0)
+| extend EventScore = tolong(BaseScore) + tolong(RarityScore) + tolong(AccountBaselinePenalty);
+
+// --- Correlate pipes with suspicious service creation on same host ---
+let PipeWithServices =
+PipeEvents
+| join kind=leftouter (
+    ServiceCreation
+) on DeviceName
+| where isnull(ServiceCreated) or TimeGenerated between (TimeGenerated1 - 15m .. TimeGenerated1 + 15m)
+| extend HasServiceCreation = iff(isnotempty(ServiceCreated), true, false)
+| extend CorrelationBoost   = iif(HasServiceCreation, 20, 0)
+| extend FinalScore          = tolong(EventScore) + tolong(CorrelationBoost)
+| extend Severity =
+    case(
+        FinalScore >= 90, "CRITICAL",
+        FinalScore >= 70, "HIGH",
+        FinalScore >= 50, "MEDIUM",
+        "LOW"
+    )
+| extend HunterDirectives = pack_array(
+    strcat("Host=", DeviceName, " | Account=", AccountName, " | Pipe=", PipeName),
+    strcat("Score=", tostring(FinalScore), " (Base=", tostring(BaseScore),
+           ", Rarity=", tostring(RarityScore),
+           iif(HasServiceCreation, ", ServiceCorrelated=+20", ""),
+           ", BaselineAdj=", tostring(AccountBaselinePenalty), ")"),
+    strcat("Kill chain: ", KillChainStage, " | Severity: ", Severity),
+    iif(HasServiceCreation,
+        "Check if service creation and pipe belong to a legitimate admin tool (PsExec/RemCom) with approved change ticket.",
+        "Review process tree around InitiatingProcessFileName and parent for red-team / C2 tooling."),
+    "Pivot on PipeName across the estate to see reuse on other hosts/accounts.",
+    "If tooling is unauthorized and activity is recent, treat host as potentially compromised, isolate, and acquire full triage (memory + disk)."
+)
+| where FinalScore >= 50      // keep this as your main noise gate; tune per tenant
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    PipeName,
+    InitiatingProcessFileName,
+    InitiatingProcessParentFileName,
+    InitiatingProcessCommandLine,
+    PipeCategory,
+    KillChainStage,
+    HasServiceCreation,
+    OrgPipeCount,
+    FinalScore,
+    Severity,
+    HunterDirectives;
+    
+PipeWithServices
+| order by FinalScore desc, TimeGenerated desc
