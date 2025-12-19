@@ -1,0 +1,175 @@
+// ============================================================================
+// L3_IIS_W3WP_InMemory_CLR_Abuse_Chain — HUNT MODE (Companion to React2Shell)
+// Author: Ala Dabat
+// Version: 2025-12 (L3 Hunt)
+// Platform: Windows (IIS / ASP.NET)
+// Purpose:
+//   Detect w3wp.exe in-memory abuse via behavioral incongruity using EDR-visible artifacts:
+//     (1) Injection/Tampering telemetry (when present)
+//     (2) Suspicious/unsigned module loads from writable paths (when present)
+//     (3) External outbound connections from w3wp.exe (C2/exfil onset)
+//     (4) Persistence-like touches (high-risk surfaces)
+//
+// Truth in Telemetry:
+//   Truly fileless reflective Assembly.Load from request bodies may leave no module-load artifacts.
+//   This rule is a tripwire for the operational transition when w3wp.exe begins doing “non-IIS” actions.
+// ============================================================================
+
+let lookback = 7d;
+let ChainWindow = 15m;
+
+let EnableAllowlist = true;
+
+// IIS worker
+let IISProc = dynamic(["w3wp.exe"]);
+
+// Writable paths IIS should NOT load code from
+let WritablePaths = dynamic([
+  @"\users\",
+  @"\appdata\",
+  @"\programdata\",
+  @"\windows\temp\",
+  @"\temp\",
+  @"\inetpub\temp\"
+]);
+
+// Known benign IIS/.NET module locations
+let AllowedModulePaths = dynamic([
+  @"\windows\microsoft.net\",
+  @"\windows\system32\inetsrv\"
+]);
+
+// High-risk persistence surfaces (IIS should not write here)
+let PersistencePaths = dynamic([
+  @"\windows\system32\tasks\",
+  @"\windows\system32\drivers\",
+  @"\programdata\microsoft\windows\start menu\programs\startup\",
+  @"\users\public\",
+  @"\windows\temp\"
+]);
+
+// Tenant allowlist (edit per tenant)
+let AllowedAccounts = dynamic(["svc-iis","svc-web","iis apppool\\defaultapppool"]);
+let IsAllowlisted = EnableAllowlist and AccountName has_any (AllowedAccounts);
+
+// 1) Injection/Tamper signals involving w3wp.exe (best-effort)
+let InjectionSignals =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("CreateRemoteThread","WriteProcessMemory","QueueUserAPC","ProcessInjection","ProcessHollowing","ProcessTampering")
+| project InjectTs=Timestamp, DeviceId, DeviceName, AccountName,
+          TargetPid=ProcessId, InjectorPid=InitiatingProcessId, InjectionAction=ActionType;
+
+// 2) Ghost/unsigned module loads by w3wp.exe from writable paths (best-effort)
+let GhostLoads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName in~ (IISProc)
+| where FolderPath has_any (WritablePaths)
+| where not(FolderPath has_any (AllowedModulePaths))
+| extend SigStatus = tostring(FileSignatureStatus)
+| where isempty(SigStatus) or SigStatus != "Signed"
+| project LoadTs=Timestamp, DeviceId, DeviceName, AccountName,
+          W3wpPid=InitiatingProcessId, LoadedImage=FileName, LoadPath=FolderPath, SHA1, Signer;
+
+// 3) External outbound connections from w3wp.exe (C2/exfil onset)
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName in~ (IISProc)
+| where ActionType == "ConnectionSuccess"
+| extend IsExternal = iff(isnotempty(RemoteIP), not(ipv4_is_private(RemoteIP)), bool(null))
+| where IsExternal == true
+| project NetTs=Timestamp, DeviceId, DeviceName, AccountName,
+          W3wpPid=InitiatingProcessId, RemoteIP, RemotePort, RemoteUrl, Protocol;
+
+// 4) Persistence-like touches by w3wp.exe (high-risk)
+let Persist =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName in~ (IISProc)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| where FolderPath has_any (PersistencePaths)
+| project FileTs=Timestamp, DeviceId, DeviceName, AccountName,
+          W3wpPid=InitiatingProcessId, FolderPath, FileName;
+
+// Anchor on w3wp.exe PIDs observed in any of the datasets
+let Anchor =
+(
+  GhostLoads | project DeviceId, DeviceName, AccountName, W3wpPid
+  | union (Net | project DeviceId, DeviceName, AccountName, W3wpPid)
+  | union (Persist | project DeviceId, DeviceName, AccountName, W3wpPid)
+  | distinct DeviceId, DeviceName, AccountName, W3wpPid
+);
+
+Anchor
+| where not(IsAllowlisted)
+| join kind=leftouter (GhostLoads) on DeviceId, DeviceName, AccountName, W3wpPid
+| join kind=leftouter (Net) on DeviceId, DeviceName, AccountName, W3wpPid
+| join kind=leftouter (Persist) on DeviceId, DeviceName, AccountName, W3wpPid
+// Injection: best-effort correlate by target PID = w3wp PID
+| join kind=leftouter (
+    InjectionSignals
+    | project DeviceId, DeviceName, AccountName, W3wpPid=TargetPid, InjectTs, InjectorPid, InjectionAction
+  ) on DeviceId, DeviceName, AccountName, W3wpPid
+| extend HasInjection = iif(isnotempty(InjectTs), 1, 0)
+| extend HasGhostLoad = iif(isnotempty(LoadTs), 1, 0)
+| extend HasExternalNet = iif(isnotempty(NetTs), 1, 0)
+| extend HasPersistenceTouch = iif(isnotempty(FileTs), 1, 0)
+| extend RiskScore =
+    20
+  + iif(HasInjection==1, 40, 0)
+  + iif(HasGhostLoad==1, 25, 0)
+  + iif(HasExternalNet==1, 20, 0)
+  + iif(HasPersistenceTouch==1, 25, 0)
+| extend Severity = case(
+    RiskScore >= 90, "CRITICAL",
+    RiskScore >= 65, "HIGH",
+    RiskScore >= 45, "MEDIUM",
+    "LOW"
+)
+| where Severity in ("CRITICAL","HIGH","MEDIUM")
+| summarize
+    FirstSeen=min(coalesce(InjectTs, LoadTs, NetTs, FileTs)),
+    LastSeen=max(coalesce(InjectTs, LoadTs, NetTs, FileTs)),
+    MaxScore=max(RiskScore),
+    InjectActions=make_set(tostring(InjectionAction), 10),
+    LoadPaths=make_set(tostring(LoadPath), 10),
+    LoadedImages=make_set(tostring(LoadedImage), 10),
+    RemoteIPs=make_set(tostring(RemoteIP), 10),
+    RemoteUrls=make_set(tostring(RemoteUrl), 10),
+    RemotePorts=make_set(tostring(RemotePort), 10),
+    PersistFiles=make_set(strcat(tostring(FolderPath),"\\",tostring(FileName)), 10),
+    Signals=make_set(
+      strcat(
+        iif(HasInjection==1,"Injection;",""),
+        iif(HasGhostLoad==1,"GhostLoad;",""),
+        iif(HasExternalNet==1,"ExternalNet;",""),
+        iif(HasPersistenceTouch==1,"PersistenceTouch;","")
+      ), 10
+    )
+  by DeviceName, AccountName, W3wpPid
+| extend Severity = case(
+    MaxScore >= 90, "CRITICAL",
+    MaxScore >= 65, "HIGH",
+    "MEDIUM"
+)
+| extend HuntingDirectives = case(
+    Severity=="CRITICAL",
+      "CRITICAL: w3wp.exe shows strong in-memory abuse indicators (injection and/or ghost-load) with external comms/persistence. Isolate host, capture memory, assume fileless webshell.",
+    Severity=="HIGH",
+      "HIGH: w3wp.exe anomalous behavior. Validate loaded images/paths + outbound remotes + any persistence touches. Escalate if unknown unsigned modules or suspicious remotes confirmed.",
+    "MEDIUM: Weak but notable w3wp.exe anomaly. Corroborate with IIS logs, first-seen remotes, and follow-on persistence attempts."
+)
+| order by FirstSeen desc
+;
+
+// ============================================================================
+// INCIDENT RESPONSE FRAMEWORK — IIS In-Memory CLR Abuse
+// ============================================================================
+// 1) TRIAGE: confirm PID, validate signals, check allowlist context.
+// 2) SCOPE: pivot on W3wpPid, remotes, loaded modules, repeat occurrences.
+// 3) CONTAIN: isolate if CRITICAL/HIGH, disable app pool/site if necessary.
+// 4) ERADICATE: remove persistence, rotate machine keys/app secrets, patch.
+// 5) HARDEN: ViewState protection, WAF rules, least privilege app pools.
+// ============================================================================
