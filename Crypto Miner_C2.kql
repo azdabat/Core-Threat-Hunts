@@ -1,0 +1,74 @@
+// ============================================================================
+// Crypto Miner & Rare Outbound Connection Hunt (Enhanced)
+// Author: Ala Dabat (Optimized)
+// Focus: Detects rare executables connecting to public IPs on non-standard ports.
+//        Highlights potential Crypto Miners (Stratum ports) and C2 beacons.
+// ============================================================================
+
+let Lookback = 30d;
+
+// 1. Define Exclusions (Subnets & Browsers)
+let ExcludedSubnets = dynamic(['100.0.0.0/16', '200.200.200.0/24']); 
+let BrowserExecutables = dynamic([
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", 
+    "iexplore.exe", "vivaldi.exe", "safari.exe", "waterfox.exe"
+]);
+
+// 2. Define Miner Indicators (Stratum / Pool Ports)
+let MinerPorts = dynamic([3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 45700]);
+
+DeviceNetworkEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType == "Public"
+
+// 3. Port Filtering (The "Anomaly" Logic)
+// Exclude standard web ports (80, 443) and DNS (53) to focus on the "weird" stuff
+| where not(RemotePort in (80, 443, 53))
+
+// 4. Noise Reduction (The "Browser" Filter)
+// Filter out known browsers to find the "Weird EXEs"
+| where not(InitiatingProcessFileName in~ (BrowserExecutables))
+| where InitiatingProcessFileName endswith ".exe"
+
+// 5. Aggregation (Prevalence Calculation)
+| summarize 
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    DeviceCount = dcount(DeviceId),
+    RemoteIPs = make_set(RemoteIP, 10),
+    Ports = make_set(RemotePort, 10),
+    CommandLines = make_set(InitiatingProcessCommandLine, 5),
+    UserAgents = make_set(InitiatingProcessAccountName, 5)
+    by InitiatingProcessFileName, InitiatingProcessMD5
+
+// 6. Hunting Logic (The "Rarity" Check)
+| where DeviceCount <= 4 // Only show binaries seen on 4 or fewer devices
+
+// 7. Scoring & Enrichment
+| extend IsMinerPort = iif(array_length(array_intersect(Ports, MinerPorts)) > 0, 1, 0)
+| extend Severity = case(
+    IsMinerPort == 1, "High",
+    DeviceCount == 1, "Medium", 
+    "Low"
+)
+
+// 8. Hunter Directive
+| extend HunterDirective = strcat(
+    "SEVERITY: ", Severity, ". ",
+    "Rare Binary '", InitiatingProcessFileName, "' seen on ", tostring(DeviceCount), " device(s). ",
+    "Connecting to Non-Standard Ports: ", tostring(Ports), ". ",
+    iif(IsMinerPort == 1, "WARNING: Uses known Crypto Miner ports. ", ""),
+    "Review Command Line: ", tostring(CommandLines)
+)
+
+// 9. Output Formatting
+| project FirstSeen, LastSeen, Severity, InitiatingProcessFileName, DeviceCount, Ports, RemoteIPs, CommandLines, HunterDirective
+| order by Severity desc, DeviceCount asc
+  SampleProcess=any(InitiatingProcessCommandLine),
+  SampleRemoteIP=any(RemoteIP),
+  Ports=make_set(RemotePort) by InitiatingProcessFileName
+// To make it even more strict, decrease the number to narrow the results
+| where DeviceCount < 4
+| extend RemoteIP_country = tostring(parse_json(geo_info_from_ip_address(SampleRemoteIP)).country) 
+| sort by DeviceCount asc
