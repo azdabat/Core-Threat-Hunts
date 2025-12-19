@@ -1,24 +1,25 @@
 // ============================================================================
-// HUNT PACK 05/10 — Scheduled Task / Service Persistence (CORE)
-// Binaries: schtasks.exe, at.exe, sc.exe, reg.exe, wmic.exe, powershell.exe, cmd.exe
+// HUNT PACK 06/10 — Ransomware-Adjacent Defense Evasion (CORE)
+// Binaries: vssadmin.exe, wevtutil.exe, bcdedit.exe, bcedit.exe, wbadmin.exe, fsutil.exe, cipher.exe, netsh.exe
 // ============================================================================
 
 let lookback = 7d;
 
-let TargetProcs = dynamic(["schtasks.exe","at.exe","sc.exe","reg.exe","wmic.exe","powershell.exe","cmd.exe"]);
-let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let TargetProcs = dynamic(["vssadmin.exe","wevtutil.exe","bcdedit.exe","bcedit.exe","wbadmin.exe","fsutil.exe","cipher.exe","netsh.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe","mshta.exe"]);
 let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
 
 DeviceProcessEvents
 | where Timestamp > ago(lookback)
 | where FileName in~ (TargetProcs)
 | where ProcessCommandLine has_any (
-    "/create","/tn","/tr","/sc","/ru","/rp","/f",
-    "/interactive","/every",
-    "create","binpath=","start=","obj=",
-    "reg add","\\run","\\runonce","\\image file execution options","\\services",
-    "process call create","/node:","startup","service",
-    "scheduledtasks","new-scheduledtask","register-scheduledtask"
+    "delete shadows","delete shadowcopies","shadows /all","/quiet",
+    " wevtutil cl "," wevtutil.exe cl ","clear-log"," sl "," set-log ",
+    "bcdedit","bcedit","set","bootstatuspolicy","recoveryenabled","safeboot","nointegritychecks",
+    "wbadmin delete","catalog","systemstatebackup",
+    "fsutil","usn","deletejournal","setzerodata","behavior set",
+    "cipher /w",
+    "netsh advfirewall","firewall set","set allprofiles state off"
 )
 | extend
     HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
@@ -27,7 +28,7 @@ DeviceProcessEvents
     WeirdExport = bool(false),
     BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
     IsDownloader = bool(false),
-    IsPersistence = true
+    IsPersistence = (FileName in~ ("bcdedit.exe","bcedit.exe") and ProcessCommandLine has " set ")
 | extend RiskScore =
     0
     + iif(HasNet or IsDownloader, 60, 0)
@@ -36,12 +37,16 @@ DeviceProcessEvents
     + iif(WeirdExport, 20, 0)
     + iif(BadParent, 20, 0)
     + iif(IsPersistence, 40, 0)
+    + iif(FileName =~ "wevtutil.exe" and ProcessCommandLine has " cl ", 60, 0)
+    + iif(FileName =~ "vssadmin.exe" and ProcessCommandLine has "delete", 60, 0)
 | where RiskScore >= 50
 | extend Hunter_Directive = case(
-    IsPersistence, "HIGH: Task/Service/Registry persistence attempt via LOLBIN",
-    HasScript, "HIGH: Persistence attempt with encoded/script staging",
-    BadParent, "MEDIUM: Persistence initiated by suspicious parent",
-    "Suspicious persistence activity"
+    FileName =~ "vssadmin.exe", "CRITICAL: Shadow copy deletion (ransomware recovery inhibition)",
+    FileName =~ "wevtutil.exe" and ProcessCommandLine has " cl ", "CRITICAL: Event log cleared via wevtutil (anti-forensics)",
+    FileName in~ ("bcdedit.exe","bcedit.exe"), "HIGH: Boot/security configuration tamper",
+    FileName =~ "wbadmin.exe", "HIGH: Backup deletion / recovery inhibition",
+    FileName =~ "netsh.exe", "HIGH: Firewall/network tamper",
+    "HIGH: Defense evasion / recovery inhibition via LOLBIN"
 )
 | summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
     by DeviceName, FileName, Hunter_Directive
