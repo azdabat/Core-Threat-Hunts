@@ -1,0 +1,52 @@
+// ============================================================================
+// HUNT PACK 07/10 — AD & Domain Recon (Discovery) (EVASION-AWARE)
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["dsquery.exe","dsget.exe","nltest.exe","net.exe","net1.exe","whoami.exe","systeminfo.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","winword.exe","excel.exe","outlook.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig = isnotempty(OrigLower)
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "dsquery","dsget","user","group","computer","server","subnet","ou","site","-limit","-name","-samid",
+    "/dclist:","/domain_trusts","/trusted_domains","/dsgetdc:",
+    "user","group","localgroup","accounts","share","view","use","start","stop",
+    "/all","/priv","/groups","systeminfo"
+)
+| extend
+    IsMasqueraded = HasOrig and FileLower != OrigLower,
+    HasNet = bool(false),
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false),
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(IsMasqueraded, 50, 0)
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+    + 30
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    IsMasqueraded, "HIGH: Masqueraded recon LOLBIN (OriginalFileName mismatch)",
+    FileLower in~ ("dsquery.exe","dsget.exe","nltest.exe") or OrigLower in~ ("dsquery.exe","dsget.exe","nltest.exe"), "HIGH: AD / domain reconnaissance",
+    FileLower in~ ("net.exe","net1.exe") or OrigLower in~ ("net.exe","net1.exe"), "MEDIUM-HIGH: Net command recon / admin activity (baseline required)",
+    "MEDIUM: Host/domain discovery"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 50 and MaxRisk < 70)
