@@ -1,0 +1,57 @@
+// ============================================================================
+// HUNT PACK 02/10 — Script Proxy Execution (EVASION-AWARE)
+// ============================================================================
+
+let lookback = 7d;
+
+let TargetProcs = dynamic(["mshta.exe","regsvr32.exe","rundll32.exe","wscript.exe","cscript.exe","odbcconf.exe","control.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","winword.exe","excel.exe","outlook.exe","powerpnt.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig = isnotempty(OrigLower)
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "javascript","vbscript","scrobj","hta","mshta",
+    ".sct",".js",".jse",".vbs",".vbe",".wsf",
+    ".dll",".cpl",
+    "DllRegisterServer",
+    "-a","-f","regsvr",
+    ".cpl"
+)
+| extend
+    IsMasqueraded = HasOrig and FileLower != OrigLower,
+    IsRundll32 = (FileLower == "rundll32.exe" or OrigLower == "rundll32.exe"),
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("scrobj.dll","javascript:","vbscript:","wscript.shell",".sct",".wsf"),
+    BadDLLPath = (ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl") and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = IsRundll32 and ProcessCommandLine matches regex @"(?i),(#\d+|run|start|dllregisterserver|entry|main|shellexec_rundll)",
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = ((FileLower == "mshta.exe" or OrigLower == "mshta.exe" or FileLower == "regsvr32.exe" or OrigLower == "regsvr32.exe") and HasNet),
+    IsPersistence = bool(false)
+| extend RiskScore =
+    0
+    + iif(IsMasqueraded, 50, 0)
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    IsMasqueraded, "CRITICAL: Masqueraded script proxy LOLBIN (OriginalFileName mismatch)",
+    HasNet or IsDownloader, "CRITICAL: Remote script/proxy execution via LOLBIN",
+    HasScript, "HIGH: Script/scriptlet execution via LOLBIN",
+    BadDLLPath or WeirdExport, "MEDIUM-HIGH: DLL/CPL proxy execution from non-system path",
+    BadParent, "MEDIUM: LOLBIN spawned by suspicious parent",
+    "Suspicious LOLBIN activity"
+)
+| summarize Count=count(), MaxRisk=max(RiskScore), SampleCLI=any(ProcessCommandLine)
+    by DeviceName, FileName, Hunter_Directive
+| where not(Count > 20 and MaxRisk < 70)
