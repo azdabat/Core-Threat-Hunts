@@ -1,0 +1,90 @@
+// ==========================================================
+// Rule: Blockchain_RPC_C2_L3_V6
+// Path: /C2/Blockchain_RPC_C2_L3_V6.kql
+// Purpose: Detect Web3 / Blockchain RPC used as C2 (EtherRAT-style) with high fidelity.
+// MITRE: TA0011, T1102, T1568
+// Notes: Enhanced beaconing detection and process enrichment for L3.
+// Author:  Ala Dabat's V5
+// ==========================================================
+
+let Lookback = 7d; // Increased lookback window for better historical correlation
+let BeaconingThreshold = 80; // Minimum event count for likely beaconing in the window
+let TimeDifferenceThreshold = 30m; // Max time difference for clustered events
+
+let RpcProviders = dynamic([
+    "solana.com","alchemy.com","infura.io","etherscan.io","quicknode.com","moralis.io","chainstack.com",
+    "ankr.com", "getblock.io" // Added more common providers
+]);
+
+let DevHints = dynamic(["dev","blockchain","chain","web3","crypto","wallet","node","vault","metamask","brave"]); // Added browser/tool hints
+
+// 1. Initial Network Activity Filter & Aggregation
+DeviceNetworkEvents
+| where Timestamp >= ago(Lookback)
+| where RemoteUrl has_any (RpcProviders)
+| where ActionType == "ConnectionSuccess" // Focus on successful connections
+| extend RpcHost = split(RemoteUrl, '/')[2] // Extract only the domain for cleaner aggregation
+
+// 2. Identify Beaconing (L3 Enhancement: Tighter time clustering)
+| summarize 
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    EventCount = count(),
+    // Calculate time difference between first and last event for a more precise beaconing check
+    TimeSpan = datetime_diff('second', LastSeen, FirstSeen), 
+    SampleCmd = any(InitiatingProcessCommandLine),
+    // L3 Enrichment: Get details about the initiating process
+    ProcessList = make_set(InitiatingProcessFileName, 10), 
+    ParentList = make_set(InitiatingProcessParentFileName, 10)
+    by DeviceName, InitiatingProcessFileName, RpcHost
+
+// 3. Flag Beaconing and Dev Hosts
+| extend
+    // Tighter Beaconing Check: High volume AND small time window (e.g., 80 events in less than 30 mins)
+    IsBeaconLike = iif(EventCount >= BeaconingThreshold and TimeSpan < (TimeDifferenceThreshold / 1s), 1, 0),
+    IsDevHost = iif(DeviceName has_any (DevHints) or tostring(ParentList) has_any (DevHints), 1, 0),
+    // L3 Enrichment: Flag if the connection is from a highly suspicious binary (e.g., cmd/powershell connecting directly)
+    IsSuspiciousProcess = iif(InitiatingProcessFileName in ('powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe', 'regsvr32.exe'), 1, 0)
+    
+// 4. Calculate Risk Score
+| extend RiskScore =
+      0
+    + iif(IsDevHost == 0, 40, 0) // Increased weight: Non-dev host is a major factor
+    + iif(IsBeaconLike == 1, 40, 0) // Increased weight: Clear beaconing is a major factor
+    + iif(IsSuspiciousProcess == 1, 20, 0) // NEW: Added weight for suspicious parent process
+    
+| where RiskScore >= 50 // Raised the threshold to reduce P3 noise
+| extend Severity = case(
+        RiskScore >= 80, "P1 – Confirmed High-Frequency RPC C2 (Non-Dev Host)",
+        RiskScore >= 60, "P2 – RPC Connection from Suspicious Process",
+        "P3 – Anomalous RPC Use Requiring Validation"
+    ),
+    Hunter_Directive = case(
+        Severity startswith "P1",
+        " **CRITICAL RPC C2**: Correlate immediately with `Userland_UnsignedBinary` hunt. Isolate host and perform memory acquisition. Block C2 domain.",
+        Severity startswith "P2",
+        "Investigate `InitiatingProcessFileName` and `ParentList`. Validate if process is a legitimate Web3 tool or a common scripting interpreter. Check for persistence.",
+        "Validate if host belongs to blockchain/Web3 team or if process is a known development tool. If not, investigate further."
+    ),
+    MITRE_Tactics = "Command and Control",
+    MITRE_Techniques = "T1102; T1568 (Dynamic Resolution)"
+
+// 5. Final Projection and Ordering
+| project
+    Timestamp = LastSeen,
+    Severity,
+    RiskScore,
+    Hunter_Directive,
+    DeviceName,
+    RpcHost,
+    EventCount,
+    TimeSpan,
+    InitiatingProcessFileName,
+    ParentList, // L3 Enrichment
+    SampleCmd,
+    IsDevHost,
+    IsBeaconLike,
+    IsSuspiciousProcess, // NEW Flag
+    MITRE_Tactics,
+    MITRE_Techniques
+| order by RiskScore desc, LastSeen desc
