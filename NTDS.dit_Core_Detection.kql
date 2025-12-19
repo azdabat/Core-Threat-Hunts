@@ -1,79 +1,169 @@
 // ============================================================================
-// CORE HUNT — NTDS / Domain Credential Dumping (Behaviour-Only)
-// Author: Ala Dabat
-// Purpose: Identify behaviour consistent with NTDS.dit extraction attempts.
-// MITRE: T1003.003 (NTDS), T1105 (Staging), T1021.002 (SMB Admin Shares)
+// CORE HUNT — NTDS / Domain Credential Dumping (Behaviour-Only) — HARDENED
+// Author: Ala Dabat (hardened)
+// Purpose: Detect behaviour consistent with NTDS.dit extraction attempts.
+// MITRE: T1003.003 (NTDS), T1003.002 (SAM), T1105 (Staging), T1021.002 (SMB Admin Shares)
+// Data: DeviceProcessEvents, DeviceFileEvents (MDE Advanced Hunting / Sentinel)
+// Notes: Balances coverage vs false positives (backup tools, patching, AV).
 // ============================================================================
 
 let lookback = 7d;
-let ntds_keywords = dynamic(["ntdsutil", "create full", "ac i ntds", "shadowcopy"]);
-let ntds_paths = dynamic([
-    @"\ntds.dit",
-    @"\Windows\NTDS\",
-    @"\Temp\", @"\Users\Public\", @"\Downloads\", @"\Desktop\"
+let EnableAllowlist = true;
+
+// ---- Core binaries used in real NTDS dump chains
+let DumpTools = dynamic([
+  "ntdsutil.exe","esentutl.exe","dsamain.exe",
+  "vssadmin.exe","diskshadow.exe","wbadmin.exe",
+  "reg.exe","powershell.exe","pwsh.exe","cmd.exe",
+  "robocopy.exe","xcopy.exe"
 ]);
 
-// 1) Suspicious process behaviour (ntdsutil, python dumpers, PowerShell copy ops)
-let ProcActivity =
+// ---- Strong command indicators (keep tight; avoid “everything” keywords)
+let StrongCmdIndicators = dynamic([
+  "ac i ntds","ifm","create full","install from media",
+  "vssadmin create shadow","diskshadow","wbadmin start backup",
+  "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy",
+  "C:\\Windows\\NTDS\\ntds.dit","\\Windows\\NTDS\\",
+  "secretsdump","impacket"
+]);
+
+// ---- Registry hive exports commonly paired with NTDS extraction
+let HiveIndicators = dynamic([
+  "HKLM\\SAM","HKLM\\SYSTEM","HKLM\\SECURITY",
+  "reg save","reg.exe save","reg.exe export"
+]);
+
+// ---- Sensitive source locations
+let SensitiveSources = dynamic([
+  "\\Windows\\NTDS\\",
+  "\\System32\\config\\"
+]);
+
+// ---- Suspicious staging destinations
+let SuspiciousDestDirs = dynamic([
+  "\\Users\\Public\\","\\ProgramData\\","\\Windows\\Temp\\","\\Temp\\",
+  "\\Downloads\\","\\Desktop\\","\\AppData\\Local\\Temp\\","\\AppData\\Roaming\\"
+]);
+
+// ---- Allowlist (optional) — tune per tenant
+let AllowedProc = dynamic([
+  "VeeamAgent.exe","Veeam.Backup.exe","wbengine.exe","backupexec.exe",
+  "NetBackup.exe","AcronisAgent.exe","rubrik.exe"
+]);
+let AllowedAccounts = dynamic(["svc-backup","backupsvc","svc-veeam","svc-netbackup"]);
+
+let IsAllowlisted = EnableAllowlist and (
+  InitiatingProcessFileName in~ (AllowedProc) or AccountName in~ (AllowedAccounts)
+);
+
+// ---------------------------------------------------------------------------
+// 1) PROCESS SIGNALS — VSS/IFM/NTDS tooling + strong indicators
+// ---------------------------------------------------------------------------
+let ProcSignals =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in~ ("ntdsutil.exe","esentutl.exe","python.exe","powershell.exe")
-    or ProcessCommandLine has_any (ntds_keywords)
-    or InitiatingProcessCommandLine has_any (ntds_keywords)
-| extend Parent = InitiatingProcessFileName
-| project Timestamp, DeviceName, AccountName,
-          Process = FileName,
-          Cmd = ProcessCommandLine,
-          Parent;
+| where FileName in~ (DumpTools)
+| where not(IsAllowlisted)
+| extend Cmd = tostring(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName)
+| extend HasStrong = Cmd has_any (StrongCmdIndicators) or Cmd has_any (HiveIndicators)
+| extend HasVSS = Cmd has_any (dynamic(["vssadmin","diskshadow","HarddiskVolumeShadowCopy"]))
+| extend HasIFM = Cmd has_any (dynamic(["ntdsutil","ifm","ac i ntds","create full","install from media"]))
+| extend HasHive = Cmd has_any (HiveIndicators)
+| extend ProcScore =
+    10
+  + iif(FileName =~ "ntdsutil.exe" and HasIFM, 60, 0)
+  + iif(FileName in~ ("vssadmin.exe","diskshadow.exe","wbadmin.exe") and HasVSS, 45, 0)
+  + iif(FileName =~ "dsamain.exe" and Cmd has_any (dynamic(["/dbpath","/ldapport"])), 40, 0)
+  + iif(FileName =~ "reg.exe" and HasHive, 35, 0)
+  + iif(FileName has_any ("powershell.exe","pwsh.exe") and HasStrong, 25, 0)
+  + iif(Cmd has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy", 35, 0)
+| project
+    Ts=Timestamp, DeviceId, DeviceName, AccountName,
+    SignalType="PROC", Process=FileName, Parent, Cmd,
+    ProcScore;
 
-// 2) NTDS file access / staging attempts
-let FileActivity =
+// ---------------------------------------------------------------------------
+// 2) FILE SIGNALS — NTDS/registry files accessed or staged to suspicious locations
+//     IMPORTANT: Don’t match Temp/Downloads alone; require NTDS/SAM/SYSTEM/SECURITY context.
+// ---------------------------------------------------------------------------
+let FileSignals =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
-| where FileName has_cs "ntds.dit"
-    or FolderPath has_any (ntds_paths)
-| where InitiatingProcessFileName !in~ ("TiWorker.exe") // reduce noise
-| project Timestamp, DeviceName,
-          FileName, FolderPath,
-          Proc = InitiatingProcessFileName,
-          Cmd = InitiatingProcessCommandLine;
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileCopied")
+| extend Name=tostring(FileName), Path=tostring(FolderPath)
+| extend IsNTDS = Name =~ "ntds.dit" or Path has "\\Windows\\NTDS\\"
+| extend IsHive = Name matches regex @"(?i)^(sam|system|security)\.(save|bak|tmp|old)$" or Path has "\\System32\\config\\"
+| extend IsShadowCopyPath = Path has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy"
+| extend IsAdminShare = Path startswith @"\\" and Path has_any (dynamic(["ADMIN$","C$","D$","E$"]))
+| extend IsStagedToSuspiciousDest = Path has_any (SuspiciousDestDirs)
+| where (IsNTDS or IsHive or IsShadowCopyPath) or (IsAdminShare and Name has_any (dynamic(["ntds","dit","sam","system","security"])))
+| where InitiatingProcessFileName !in~ ("TiWorker.exe","MsMpEng.exe","Sense.exe","svchost.exe")
+| extend FileScore =
+    10
+  + iif(IsNTDS, 55, 0)
+  + iif(IsHive, 40, 0)
+  + iif(IsShadowCopyPath, 35, 0)
+  + iif(IsAdminShare, 30, 0)
+  + iif(IsStagedToSuspiciousDest and (IsNTDS or IsHive), 25, 0)
+| project
+    Ts=Timestamp, DeviceId, DeviceName, AccountName=tostring(InitiatingProcessAccountName),
+    SignalType="FILE", Process=tostring(InitiatingProcessFileName),
+    Parent=tostring(InitiatingProcessParentFileName),
+    Cmd=tostring(InitiatingProcessCommandLine),
+    FileName=Name, FolderPath=Path,
+    FileScore;
 
-// 3) PowerShell-based staging / copy attempts
-let PsStaging =
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| where FileName =~ "powershell.exe"
-| where ProcessCommandLine has_any (dynamic(["copy", "cp", "move", "robocopy", "Get-Item", "Get-ChildItem", "Get-Content"]))
-| where ProcessCommandLine has_any (dynamic(["ntds","shadow","vss","\\Windows\\NTDS"]))
-| project Timestamp, DeviceName, AccountName,
-          Process = "powershell.exe",
-          Cmd = ProcessCommandLine,
-          Parent = InitiatingProcessFileName;
-
-// 4) SMB Admin$ / C$ staging
-let AdminShares =
-DeviceFileEvents
-| where Timestamp >= ago(lookback)
-| where FolderPath startswith @"\\"
-| where FolderPath has_any (dynamic(["ADMIN$","C$"]))
-    and FileName has_any (dynamic(["ntds","dit"]))
-| project Timestamp, DeviceName, FolderPath, FileName,
-          Proc = InitiatingProcessFileName, Cmd = InitiatingProcessCommandLine;
-
-// --- Combine all signals ---
-union ProcActivity, FileActivity, PsStaging, AdminShares
-| order by Timestamp desc
-| extend HunterDirective =
-    case(
-        Process =~ "ntdsutil.exe",
-            "CRITICAL: NTDSUTIL execution detected. Confirm backup legitimacy immediately.",
-        Process =~ "python.exe" and Cmd has_any ("secretsdump","ntds"),
-            "HIGH: Python-based NTDS extraction (secretsdump-family). Check lateral paths + NTLM traffic.",
-        Process =~ "powershell.exe" and Cmd has_any ("copy","shadow","vss"),
-            "HIGH: PowerShell staging of NTDS/shadowcopy. Investigate file writes + network share usage.",
-        FileName has_cs "ntds.dit",
-            "HIGH: NTDS database file touched. Verify if backup or shadow copy operation is approved.",
-        FolderPath startswith @"\\",
-            "MEDIUM: NTDS-related file access over SMB. Validate admin share access.",
-        "Review activity for shadow copies, backup tools, or credential dumpers."
-    )
+// ---------------------------------------------------------------------------
+// 3) COMBINE + SCORE + DIRECTIVES
+// ---------------------------------------------------------------------------
+union isfuzzy=true
+(
+  ProcSignals
+  | extend Score = todouble(ProcScore)
+),
+(
+  FileSignals
+  | extend Score = todouble(FileScore)
+)
+| summarize
+    FirstSeen=min(Ts),
+    LastSeen=max(Ts),
+    TotalScore=sum(Score),
+    Signals=make_set(SignalType, 10),
+    Processes=make_set(Process, 15),
+    Parents=make_set(Parent, 15),
+    SampleCmd=any(Cmd),
+    Files=make_set(coalesce(FileName, ""), 10),
+    Paths=make_set(coalesce(FolderPath, ""), 10)
+  by DeviceId, DeviceName, AccountName
+| extend Severity = case(
+    TotalScore >= 120, "CRITICAL",
+    TotalScore >= 80,  "HIGH",
+    TotalScore >= 50,  "MEDIUM",
+    "LOW"
+)
+| extend HuntingDirective = case(
+    Severity == "CRITICAL",
+    "CRITICAL: Strong NTDS/registry dumping chain (VSS/IFM + sensitive file access/staging). Immediately validate legitimacy, isolate if unapproved, acquire memory, and rotate impacted credentials/service accounts.",
+    Severity == "HIGH",
+    "HIGH: Multiple NTDS dump indicators. Confirm whether backup/DR tooling is running; if not, pivot to process tree, shadow copy usage, admin shares, and follow-on exfil/persistence.",
+    Severity == "MEDIUM",
+    "MEDIUM: Partial NTDS/hive access signal. Baseline host role (DC/backup server/admin jumpbox). Promote if paired with VSS creation, hive exports, or admin share staging.",
+    "LOW: Weak signal; keep for baselining and watch for recurrence."
+)
+| project
+    Severity,
+    HuntingDirective,
+    FirstSeen,
+    LastSeen,
+    DeviceName,
+    AccountName,
+    TotalScore,
+    Signals,
+    Processes,
+    Parents,
+    Files,
+    Paths,
+    SampleCmd
+| order by TotalScore desc, LastSeen desc
