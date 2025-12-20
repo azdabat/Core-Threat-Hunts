@@ -12,7 +12,11 @@
 //     - Internal lateral movement
 // ============================================================================
 
-let Lookback=7d; let BaselineWindow=30d; let TenantHistory=90d; let RareThreshold=5; let ChainWindow=1h;
+let Lookback=7d; let BaselineWindow=30d; let TenantHistory=90d; let RareThreshold=5; let ScoreThreshold=90; let GlobalDestMaxDevices=3; let MinConnForBeacon=10;
+
+let TrustedSigners=dynamic(["Microsoft Corporation","Microsoft Windows","Google LLC","Apple Inc.","Mozilla Corporation"]);
+let KnownLOLBins=dynamic(["powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","regsvr32.exe","bitsadmin.exe","certutil.exe"]);
+let AllowedDomains=dynamic(["microsoft.com","windowsupdate.com","office.com","office365.com","live.com","azure.com","azureedge.net","trafficmanager.net","cloudfront.net","akamaiedge.net","akamai.net","edgekey.net","edgesuite.net","google.com","gstatic.com","googleapis.com","doubleclick.net","mozilla.org","digicert.com","letsencrypt.org","github.com","githubusercontent.com"]);
 
 let Ports=externaldata(dest_port:int,metadata_comment:string,metadata_confidence:string,metatada_category:string,metadata_detection_type:string,metadata_link:string,metadata_reference:string)
 ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
@@ -21,74 +25,141 @@ with(format="csv",ignoreFirstRecord=true)
 | where metatada_category in ("C2","RMM","Persistence","Exploitation")
 | project dest_port,metadata_comment,metadata_confidence,metatada_category;
 
-let TenantSeen=DeviceNetworkEvents
-| where Timestamp between (ago(TenantHistory)..ago(Lookback))
-| summarize Seen=true by RemotePort;
+let TenantSeenPorts=DeviceNetworkEvents | where Timestamp between (ago(TenantHistory)..ago(Lookback)) | summarize Seen=true by RemotePort;
+let HostBaseline=DeviceNetworkEvents | where Timestamp between (ago(BaselineWindow)..ago(Lookback)) | summarize BaselineCount=count() by DeviceName,RemotePort;
 
-let HostBaseline=DeviceNetworkEvents
-| where Timestamp between (ago(BaselineWindow)..ago(Lookback))
-| summarize BaselineCount=count() by DeviceName,RemotePort;
-
-let Beaconing=DeviceNetworkEvents
-| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
-| summarize Times=make_list(Timestamp),Cnt=count() by DeviceName,RemoteIP,RemotePort,InitiatingProcessFileName
-| where Cnt>=10
-| extend StdDev=stdev(array_diff(Times))
-| where StdDev<5m
-| project DeviceName,RemoteIP,RemotePort,BeaconConf=iff(StdDev<1m,"HIGH","MEDIUM");
-
-let DGA=DeviceNetworkEvents
-| where Timestamp>=ago(Lookback) and isnotempty(RemoteUrl)
-| extend Domain=extract(@"https?://([^/]+)",1,RemoteUrl)
-| where strlen(Domain)>15
-| extend Entropy=-sum(strlen(Domain)*log2(strlen(Domain)))
-| where Entropy>3.5
-| project DeviceName,Entropy;
-
-let Persist=DeviceProcessEvents
-| where Timestamp>=ago(Lookback)
-| where FileName in~("schtasks.exe","sc.exe","reg.exe","powershell.exe","cmd.exe")
-| where ProcessCommandLine has_any("create","add","autorun","startup","service","run")
-| project DeviceName,PersistCmd=ProcessCommandLine;
-
-let Cred=DeviceProcessEvents
-| where Timestamp>=ago(Lookback)
-| where ProcessCommandLine has_any("sekurlsa","mimikatz","dump","lsass")
-| project DeviceName,CredTs=Timestamp;
-
-let Lateral=DeviceNetworkEvents
-| where Timestamp>=ago(Lookback) and RemotePort in (445,135,5985,5986) and ipv4_is_private(RemoteIP)
-| summarize LateralCount=count() by DeviceName;
-
+// ---- Core network signals: suspicious ports + denoise gates + global prevalence gate
+let NetSignals=
 DeviceNetworkEvents
 | where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
 | join kind=inner Ports on RemotePort==dest_port
-| join kind=leftouter HostBaseline on DeviceName,RemotePort
-| join kind=leftouter TenantSeen on RemotePort
-| extend BaselineCount=coalesce(BaselineCount,0),RareHost=BaselineCount<=RareThreshold,FirstTenant=isnull(Seen),
-        Proc=InitiatingProcessFileName,Parent=InitiatingProcessParentFileName,Cmd=InitiatingProcessCommandLine,
-        LOLBIN=Proc in~("powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe")
-| join kind=leftouter Beaconing on DeviceName,RemotePort
+| extend Proc=InitiatingProcessFileName,Signer=InitiatingProcessSigner,Cmd=InitiatingProcessCommandLine,Parent=InitiatingProcessParentFileName
+| extend IsLOLBIN=Proc in~ (KnownLOLBins)
+| where not(Signer in~ (TrustedSigners) and IsLOLBIN==false)                           // known-good signer suppression
+| extend Domain=extract(@"https?://([^/]+)",1,RemoteUrl)
+| where isempty(Domain) or not(Domain has_any (AllowedDomains))                        // CDN/high-rep domain suppression (best-effort)
+| summarize FirstSeen=min(Timestamp),LastSeen=max(Timestamp),ConnCount=count(),
+          RemoteIPs=make_set(RemoteIP,10),RemoteUrls=make_set(RemoteUrl,10),
+          Procs=make_set(Proc,10),Parents=make_set(Parent,10),Cmds=make_set(Cmd,5),
+          AnySigner=any(Signer)
+  by DeviceName, RemoteIP, RemotePort, metatada_category, metadata_confidence, metadata_comment;
+
+// ---- Global prevalence gate: “rare destinations” across tenant
+let GlobalPrev=
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
+| summarize GlobalDeviceCount=dcount(DeviceName) by RemoteIP,RemotePort;
+
+let NetCore=
+NetSignals
+| join kind=leftouter GlobalPrev on RemoteIP,RemotePort
+| where coalesce(GlobalDeviceCount,0) <= GlobalDestMaxDevices;
+
+// ---- Beaconing: keep it lightweight (per Device/IP/Port). (If your workspace lacks array_diff(), drop this block.)
+let Beaconing=
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
+| summarize Times=make_list(Timestamp), Cnt=count() by DeviceName, RemoteIP, RemotePort, InitiatingProcessFileName
+| where Cnt>=MinConnForBeacon
+| extend StdDev=stdev(array_diff(Times))
+| where StdDev < 5m
+| summarize BeaconScore=max(iif(StdDev<1m,25,15)) by DeviceName, RemoteIP, RemotePort;
+
+// ---- DNS entropy/DGA (best-effort, denoised by AllowedDomains)
+let DGA=
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and isnotempty(RemoteUrl)
+| extend Domain=extract(@"https?://([^/]+)",1,RemoteUrl)
+| where isnotempty(Domain) and strlen(Domain)>15 and not(Domain has_any (AllowedDomains))
+| extend Entropy=-sum(strlen(Domain)*log2(strlen(Domain)))
+| where Entropy>3.5
+| summarize DgaScore=max(15), DgaDomains=make_set(Domain,10) by DeviceName;
+
+// ---- Persistence / cred access / injection-ish staging (cheap but effective)
+let Persist=
+DeviceProcessEvents
+| where Timestamp>=ago(Lookback)
+| where FileName in~ ("schtasks.exe","sc.exe","reg.exe","powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_any ("schtasks","sc create","reg add","runonce","startup","autorun","/create","New-Service","Set-ItemProperty")
+| summarize PersistScore=max(30), PersistSamples=make_set(ProcessCommandLine,5) by DeviceName;
+
+let CredAccess=
+DeviceProcessEvents
+| where Timestamp>=ago(Lookback)
+| where ProcessCommandLine has_any ("sekurlsa","mimikatz","comsvcs.dll","lsass","procdump","rundll32") 
+| summarize CredScore=max(30), CredSamples=make_set(ProcessCommandLine,5) by DeviceName;
+
+let Injection=
+DeviceProcessEvents
+| where Timestamp>=ago(Lookback)
+| where ProcessCommandLine has_any ("CreateRemoteThread","WriteProcessMemory","VirtualAlloc","QueueUserAPC","NtCreateThreadEx","RtlCreateUserThread") // heuristic
+| summarize InjectScore=max(20), InjectSamples=make_set(ProcessCommandLine,5) by DeviceName;
+
+// ---- Internal lateral movement ports
+let Lateral=
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and ipv4_is_private(RemoteIP)
+| where RemotePort in (445,135,5985,5986,3389)
+| summarize LateralCount=count(), LateralTargets=make_set(RemoteIP,10) by DeviceName
+| extend LateralScore=iif(LateralCount>=10,20,iif(LateralCount>=5,10,0));
+
+// ---- Port novelty features (host rare + tenant first-seen port)
+let Novelty=
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
+| summarize by DeviceName, RemotePort
+| join kind=leftouter HostBaseline on DeviceName, RemotePort
+| join kind=leftouter TenantSeenPorts on RemotePort
+| extend BaselineCount=coalesce(BaselineCount,0), RareHost=iif(BaselineCount<=RareThreshold,1,0), FirstTenant=iif(isnull(Seen),1,0)
+| summarize RareHost=max(RareHost), FirstTenant=max(FirstTenant) by DeviceName;
+
+// ---- Entity-centric incident record (one row per device)
+NetCore
+| summarize
+    FirstSeen=min(FirstSeen), LastSeen=max(LastSeen),
+    RemoteIPSet=make_set(RemoteIP,10), PortSet=make_set(tostring(RemotePort),10),
+    Categories=make_set(metatada_category,10),
+    Confidence=make_set(metadata_confidence,10),
+    Context=make_set(metadata_comment,10),
+    Procs=make_set(tostring(Procs),10),
+    Parents=make_set(tostring(Parents),10),
+    CmdSamples=make_set(tostring(Cmds),5),
+    GlobalMax=max(GlobalDeviceCount),
+    NetScore=max(iif(array_length(RemoteIPSet)>0,25,0))
+  by DeviceName
+| join kind=leftouter Novelty on DeviceName
+| join kind=leftouter Beaconing on DeviceName
 | join kind=leftouter DGA on DeviceName
 | join kind=leftouter Persist on DeviceName
-| join kind=leftouter Cred on DeviceName
+| join kind=leftouter CredAccess on DeviceName
+| join kind=leftouter Injection on DeviceName
 | join kind=leftouter Lateral on DeviceName
 | extend RiskScore=
-      (metadata_confidence=="high"?30:15)
-    + (RareHost?20:0)
-    + (FirstTenant?25:0)
-    + (LOLBIN?15:0)
-    + (isnotempty(BeaconConf)?20:0)
-    + (isnotempty(Entropy)?15:0)
-    + (isnotempty(PersistCmd)?25:0)
-    + (isnotempty(CredTs)?25:0)
-    + (LateralCount>=10?20:0)
-| extend Severity=case(RiskScore>=120,"CRITICAL",RiskScore>=90,"HIGH",RiskScore>=60,"MEDIUM","LOW"),
-        HunterDirective=case(
-            Severity=="CRITICAL","Isolate host, capture memory, enumerate persistence, block C2, start IR.",
-            Severity=="HIGH","Validate process, inspect persistence/creds, consider containment.",
-            Severity=="MEDIUM","Baseline host, monitor for follow-on.",
-            "Weak signal, retain for trend analysis.")
-| project Severity,RiskScore,HunterDirective,DeviceName,RemoteIP,RemotePort,metatada_category,metadata_comment,
-          Proc,Parent,Cmd,RareHost,FirstTenant,BeaconConf,Entropy,PersistCmd,LateralCount
+      0
+    + NetScore
+    + iif(RareHost==1,20,0)
+    + iif(FirstTenant==1,25,0)
+    + coalesce(BeaconScore,0)
+    + coalesce(DgaScore,0)
+    + coalesce(PersistScore,0)
+    + coalesce(CredScore,0)
+    + coalesce(InjectScore,0)
+    + coalesce(LateralScore,0)
+| where RiskScore >= ScoreThreshold
+| extend Severity=case(RiskScore>=130,"CRITICAL",RiskScore>=110,"HIGH","HIGH"),
+         HunterDirectives=pack_array(
+            "1) Validate process legitimacy (signed vendor suppressed; focus on LOLBins/odd tools).",
+            strcat("2) External dest rarity: max devices seen = ", tostring(GlobalMax), " (<= ", tostring(GlobalDestMaxDevices), ")."),
+            strcat("3) Destinations: ", tostring(RemoteIPSet), " | Ports: ", tostring(PortSet)),
+            strcat("4) Novelty: RareHost=", tostring(RareHost), " FirstTenant=", tostring(FirstTenant)),
+            strcat("5) Cmd samples: ", tostring(CmdSamples)),
+            iif(isnotempty(DgaDomains), strcat("6) DGA-like domains: ", tostring(DgaDomains)), "6) DGA: none"),
+            iif(isnotempty(PersistSamples), strcat("7) Persistence hits: ", tostring(PersistSamples)), "7) Persistence: none"),
+            iif(isnotempty(CredSamples), strcat("8) Cred access hits: ", tostring(CredSamples)), "8) Cred access: none"),
+            iif(isnotempty(InjectSamples), strcat("9) Injection-ish hits: ", tostring(InjectSamples)), "9) Injection: none"),
+            iif(coalesce(LateralCount,0)>0, strcat("10) Internal LM ports: ", tostring(LateralTargets), " (count=", tostring(LateralCount), ")"), "10) Lateral movement: none"),
+            "11) If CRITICAL/HIGH: isolate host, capture memory, enumerate persistence, rotate creds if cred access suspected."
+         )
+| project Severity,RiskScore,DeviceName,FirstSeen,LastSeen,RemoteIPSet,PortSet,Categories,Context,Procs,Parents,CmdSamples,
+          RareHost,FirstTenant,GlobalMax,BeaconScore,DgaScore,PersistScore,CredScore,InjectScore,LateralScore,HunterDirectives
 | order by RiskScore desc
