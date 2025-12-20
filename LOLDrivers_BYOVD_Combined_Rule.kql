@@ -1,0 +1,65 @@
+// ============================================================================
+// L2 CORE+ Hunt: BYOVD Driver Load Exposure
+// Author: Ala Dabat
+// see L3 rule for suspicious parent process
+// Audience: L2 / L2.5 Threat Hunters
+// Purpose:
+//   Identify known malicious or vulnerable kernel drivers loaded on endpoints.
+//   This hunt answers: "Do we have BYOVD exposure?" — not "Is this exploited?"
+// ============================================================================
+
+// ============================================================================
+// L2 CORE+ Hunt: BYOVD Driver Load Exposure (FIXED SYNTAX)
+// Fix: Removed 'or' from join; implemented 'union' matching logic.
+// ============================================================================
+
+let lookback = 7d;
+
+// 1. External LOLDrivers feed
+let VulnerableDriverData = externaldata (
+    Id:string, Category:string, Privileges:string, MitreID:string,
+    SHA256_Hashes:string, TagsInfo:string, PublisherInfo:string, CompanyInfo:string
+)["https://www.loldrivers.io/api/drivers.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+// 2. Normalize LOLDrivers for a broad match
+let LOLDrivers =
+VulnerableDriverData
+| extend Hashes = split(SHA256_Hashes, ", "), Tags = split(TagsInfo, ", ")
+| mv-expand Hashes, Tags
+| extend 
+    NormalizedSHA256 = tolower(trim(" ", tostring(Hashes))),
+    NormalizedFileName = trim_end(".sys", tolower(trim(" ", tostring(Tags))))
+| project Category, Privileges, MitreID, NormalizedSHA256, NormalizedFileName, PublisherInfo, CompanyInfo;
+
+// 3. Capture MDE Driver Loads
+let DeviceDriverLoads = 
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType has "DriverLoad"
+| extend 
+    DeviceSHA256 = tolower(SHA256),
+    DeviceFileName = trim_end(".sys", tolower(FileName));
+
+let HashMatches = 
+    DeviceDriverLoads
+    | join kind=inner LOLDrivers on $left.DeviceSHA256 == $right.NormalizedSHA256;
+
+let NameMatches = 
+    DeviceDriverLoads
+    | join kind=inner LOLDrivers on $left.DeviceFileName == $right.NormalizedFileName;
+
+union HashMatches, NameMatches
+| summarize arg_max(Timestamp, *) by DeviceName, DeviceSHA256
+| extend RiskLevel = case(
+    Category =~ "Malicious Driver", "HIGH",
+    Category =~ "Vulnerable Driver", "MEDIUM",
+    "LOW"
+)
+| extend HunterDirective = case(
+    RiskLevel == "HIGH", "HIGH: Known malicious kernel driver. Escalate for exploitation assessment.",
+    RiskLevel == "MEDIUM", "MEDIUM: Vulnerable driver loaded. Confirm business justification.",
+    "LOW: Driver present in LOLDrivers dataset. Monitor context."
+)
+| project Timestamp, DeviceName, FileName, Category, Privileges, MitreID, PublisherInfo, CompanyInfo, RiskLevel, HunterDirective
+| order by Timestamp desc
