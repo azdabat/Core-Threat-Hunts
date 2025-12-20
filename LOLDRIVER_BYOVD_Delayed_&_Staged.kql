@@ -1,0 +1,114 @@
+// ============================================================================
+// L2 CORE+ Hunt: BYOVD Driver Load Exposure (Modernized: Staging + Delayed Load)
+// Author: Ala Dabat
+// Purpose: Identify known malicious/vulnerable drivers loaded + detect staged/delayed loads.
+// Notes: Still "Exposure", but includes evasion context (drop now, load later).
+// ============================================================================
+
+let lookback = 7d;
+let stagingLookback = 30d;          // wider window to catch staged drops
+let DelayedLoadThreshold = 6h;      // "delayed" if loaded >= X after first seen on disk
+let SuspiciousDirs = dynamic([
+  "\\Users\\Public\\","\\ProgramData\\","\\Windows\\Temp\\","\\Temp\\",
+  "\\Downloads\\","\\Desktop\\","\\AppData\\Local\\Temp\\","\\AppData\\Roaming\\"
+]);
+
+// 1) LOLDrivers feed
+let VulnerableDriverData = externaldata (
+    Id:string, Category:string, Privileges:string, MitreID:string,
+    SHA256_Hashes:string, TagsInfo:string, PublisherInfo:string, CompanyInfo:string
+)["https://www.loldrivers.io/api/drivers.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+let LOLDrivers =
+VulnerableDriverData
+| extend Hashes = split(SHA256_Hashes, ", "), Tags = split(TagsInfo, ", ")
+| mv-expand Hashes, Tags
+| extend
+    NormalizedSHA256 = tolower(trim(" ", tostring(Hashes))),
+    NormalizedFileName = trim_end(".sys", tolower(trim(" ", tostring(Tags))))
+| project Category, Privileges, MitreID, NormalizedSHA256, NormalizedFileName, PublisherInfo, CompanyInfo;
+
+// 2) Driver loads (DeviceEvents "DriverLoad")
+let DriverLoads =
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType has "DriverLoad"
+| extend
+    DeviceSHA256 = tolower(tostring(SHA256)),
+    DeviceFileName = trim_end(".sys", tolower(tostring(FileName))),
+    DriverPath = tostring(FolderPath),
+    DriverName = tostring(FileName);
+
+// 3) Staged driver drops (file created/renamed to .sys in suspicious locations)
+//    (This is where delayed-load evasion shows up.)
+let StagedSys =
+DeviceFileEvents
+| where Timestamp >= ago(stagingLookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| where FileName endswith ".sys"
+| extend
+    StagedSHA256 = tolower(tostring(SHA256)),
+    StagedName = trim_end(".sys", tolower(tostring(FileName))),
+    StagedPath = tostring(FolderPath),
+    IsSuspiciousDir = StagedPath has_any (SuspiciousDirs)
+| where IsSuspiciousDir
+| summarize
+    FirstStaged=min(Timestamp),
+    StagedPaths=make_set(StagedPath, 10),
+    StagedNames=make_set(FileName, 10)
+  by DeviceName, StagedSHA256, StagedName;
+
+// 4) Match loads to LOLDrivers by hash and by name
+let HashMatches =
+DriverLoads
+| join kind=inner LOLDrivers on $left.DeviceSHA256 == $right.NormalizedSHA256;
+
+let NameMatches =
+DriverLoads
+| join kind=inner LOLDrivers on $left.DeviceFileName == $right.NormalizedFileName;
+
+// 5) Combine + enrich with staging & delayed-load context
+union isfuzzy=true HashMatches, NameMatches
+| summarize arg_max(Timestamp, *) by DeviceName, DeviceSHA256, DeviceFileName
+| join kind=leftouter (
+    StagedSys
+) on DeviceName
+    and ($left.DeviceSHA256 == $right.StagedSHA256 or $left.DeviceFileName == $right.StagedName)
+| extend
+    HasStaging = isnotempty(FirstStaged),
+    Delay = iff(HasStaging, Timestamp - FirstStaged, time(null)),
+    IsDelayedLoad = iff(HasStaging and Delay >= DelayedLoadThreshold, true, false),
+    PathRisk = iff(tostring(DriverPath) has_any (SuspiciousDirs), 1, 0)
+| extend RiskLevel = case(
+    Category =~ "Malicious Driver", "HIGH",
+    Category =~ "Vulnerable Driver", "MEDIUM",
+    "LOW"
+)
+| extend RiskScore =
+    0
+    + iif(RiskLevel == "HIGH", 70, iif(RiskLevel == "MEDIUM", 45, 25))
+    + iif(PathRisk == 1, 15, 0)
+    + iif(IsDelayedLoad, 20, 0)
+| extend HunterDirective = case(
+    RiskLevel == "HIGH" and IsDelayedLoad,
+      "CRITICAL: Known malicious driver loaded with delayed-load pattern. Hunt for staging event, loader service creation, EDR tamper/kill activity, and persistence. Consider isolate.",
+    RiskLevel == "HIGH",
+      "HIGH: Known malicious kernel driver loaded. Escalate for exploitation assessment + tamper actions (EDR kill, callback removal, handle abuse).",
+    RiskLevel == "MEDIUM" and IsDelayedLoad,
+      "HIGH: Vulnerable driver loaded with delayed-load staging. Validate business justification; pivot to staging path + preceding install mechanism.",
+    RiskLevel == "MEDIUM",
+      "MEDIUM: Vulnerable driver loaded. Confirm justification; verify vulnerable driver blocklist/WDAC policy coverage.",
+    "LOW: Driver present in LOLDrivers dataset. Baseline & monitor context."
+)
+| project
+    Timestamp,
+    DeviceName,
+    DriverName=FileName,
+    DriverPath,
+    Category, Privileges, MitreID, PublisherInfo, CompanyInfo,
+    RiskLevel, RiskScore,
+    HasStaging, FirstStaged, Delay, IsDelayedLoad,
+    StagedPaths, StagedNames,
+    HunterDirective
+| order by RiskScore desc, Timestamp desc
