@@ -1,0 +1,94 @@
+// ============================================================================
+// MASTER HUNT — External C2 / RMM Abuse with Behavioural Correlation
+// Author: Ala Dabat
+// Audience: L3 Threat Hunters / DFIR
+// Purpose:
+//   Detect true command-and-control or RMM abuse by correlating:
+//     - External port intelligence
+//     - Host & tenant novelty
+//     - Beaconing behaviour
+//     - DNS entropy (DGA-like)
+//     - Persistence / injection
+//     - Internal lateral movement
+// ============================================================================
+
+let Lookback=7d; let BaselineWindow=30d; let TenantHistory=90d; let RareThreshold=5; let ChainWindow=1h;
+
+let Ports=externaldata(dest_port:int,metadata_comment:string,metadata_confidence:string,metatada_category:string,metadata_detection_type:string,metadata_link:string,metadata_reference:string)
+["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
+with(format="csv",ignoreFirstRecord=true)
+| where metadata_confidence in ("high","medium")
+| where metatada_category in ("C2","RMM","Persistence","Exploitation")
+| project dest_port,metadata_comment,metadata_confidence,metatada_category;
+
+let TenantSeen=DeviceNetworkEvents
+| where Timestamp between (ago(TenantHistory)..ago(Lookback))
+| summarize Seen=true by RemotePort;
+
+let HostBaseline=DeviceNetworkEvents
+| where Timestamp between (ago(BaselineWindow)..ago(Lookback))
+| summarize BaselineCount=count() by DeviceName,RemotePort;
+
+let Beaconing=DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
+| summarize Times=make_list(Timestamp),Cnt=count() by DeviceName,RemoteIP,RemotePort,InitiatingProcessFileName
+| where Cnt>=10
+| extend StdDev=stdev(array_diff(Times))
+| where StdDev<5m
+| project DeviceName,RemoteIP,RemotePort,BeaconConf=iff(StdDev<1m,"HIGH","MEDIUM");
+
+let DGA=DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and isnotempty(RemoteUrl)
+| extend Domain=extract(@"https?://([^/]+)",1,RemoteUrl)
+| where strlen(Domain)>15
+| extend Entropy=-sum(strlen(Domain)*log2(strlen(Domain)))
+| where Entropy>3.5
+| project DeviceName,Entropy;
+
+let Persist=DeviceProcessEvents
+| where Timestamp>=ago(Lookback)
+| where FileName in~("schtasks.exe","sc.exe","reg.exe","powershell.exe","cmd.exe")
+| where ProcessCommandLine has_any("create","add","autorun","startup","service","run")
+| project DeviceName,PersistCmd=ProcessCommandLine;
+
+let Cred=DeviceProcessEvents
+| where Timestamp>=ago(Lookback)
+| where ProcessCommandLine has_any("sekurlsa","mimikatz","dump","lsass")
+| project DeviceName,CredTs=Timestamp;
+
+let Lateral=DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and RemotePort in (445,135,5985,5986) and ipv4_is_private(RemoteIP)
+| summarize LateralCount=count() by DeviceName;
+
+DeviceNetworkEvents
+| where Timestamp>=ago(Lookback) and not(ipv4_is_private(RemoteIP))
+| join kind=inner Ports on RemotePort==dest_port
+| join kind=leftouter HostBaseline on DeviceName,RemotePort
+| join kind=leftouter TenantSeen on RemotePort
+| extend BaselineCount=coalesce(BaselineCount,0),RareHost=BaselineCount<=RareThreshold,FirstTenant=isnull(Seen),
+        Proc=InitiatingProcessFileName,Parent=InitiatingProcessParentFileName,Cmd=InitiatingProcessCommandLine,
+        LOLBIN=Proc in~("powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe")
+| join kind=leftouter Beaconing on DeviceName,RemotePort
+| join kind=leftouter DGA on DeviceName
+| join kind=leftouter Persist on DeviceName
+| join kind=leftouter Cred on DeviceName
+| join kind=leftouter Lateral on DeviceName
+| extend RiskScore=
+      (metadata_confidence=="high"?30:15)
+    + (RareHost?20:0)
+    + (FirstTenant?25:0)
+    + (LOLBIN?15:0)
+    + (isnotempty(BeaconConf)?20:0)
+    + (isnotempty(Entropy)?15:0)
+    + (isnotempty(PersistCmd)?25:0)
+    + (isnotempty(CredTs)?25:0)
+    + (LateralCount>=10?20:0)
+| extend Severity=case(RiskScore>=120,"CRITICAL",RiskScore>=90,"HIGH",RiskScore>=60,"MEDIUM","LOW"),
+        HunterDirective=case(
+            Severity=="CRITICAL","Isolate host, capture memory, enumerate persistence, block C2, start IR.",
+            Severity=="HIGH","Validate process, inspect persistence/creds, consider containment.",
+            Severity=="MEDIUM","Baseline host, monitor for follow-on.",
+            "Weak signal, retain for trend analysis.")
+| project Severity,RiskScore,HunterDirective,DeviceName,RemoteIP,RemotePort,metatada_category,metadata_comment,
+          Proc,Parent,Cmd,RareHost,FirstTenant,BeaconConf,Entropy,PersistCmd,LateralCount
+| order by RiskScore desc
