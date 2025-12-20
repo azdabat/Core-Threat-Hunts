@@ -1,4 +1,5 @@
 //Author: Ala Dabat
+//Basic Hunt
 let VulnerableDriverData = externaldata (
     Id:string, Author:string, Created:string, Command:string, Description:string, Usecase:string, Category:string, Privileges:string, MitreID:string, OperatingSystem:string, Resources:string, DriverInfo:string, ContactPerson:string, HandleReference:string, DetectionMethod:string, MD5_Hashes:string, SHA1_Hashes:string, SHA256_Hashes:string, PublisherInfo:string, CompanyInfo:string, VulnerabilityDetails:string, MD5_Authentihash:string, SHA256_Authentihash:string, SHA1_Authentihash:string, VerificationStatus:string, TagsInfo:string
 ) ["https://www.loldrivers.io/api/drivers.csv"] with (format="csv", ignoreFirstRecord=true);
