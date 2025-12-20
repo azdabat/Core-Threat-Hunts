@@ -1,0 +1,151 @@
+// ============================================================================
+// DC_CORE_NTDS_DUMP_L3 — Domain Controller NTDS/IFM/VSS Dump (High Fidelity)
+// Author: Ala Dabat
+// Purpose: Detect NTDS/registry dumping behaviours on Domain Controllers.
+// Scope: Domain Controllers only (highest confidence).
+// Data: DeviceInfo, DeviceProcessEvents, DeviceFileEvents
+// MITRE: T1003.003 (NTDS), T1003.002 (SAM), T1070 (Defense Evasion), T1105 (Staging)
+// ============================================================================
+
+let lookback = 7d;
+let ChainWindow = 20m;
+let EnableAllowlist = true;
+
+// ---- Tooling commonly used for NTDS/IFM/VSS/hive export on DCs
+let DumpTools = dynamic([
+  "ntdsutil.exe","esentutl.exe","dsamain.exe",
+  "vssadmin.exe","diskshadow.exe","wbadmin.exe",
+  "reg.exe","powershell.exe","pwsh.exe","cmd.exe",
+  "robocopy.exe","xcopy.exe","copy.exe","move.exe"
+]);
+
+// ---- Strong indicators (tight; avoid “keyword soup”)
+let StrongIndicators = dynamic([
+  "ac i ntds","ifm","create full","install from media",
+  "vssadmin create shadow","diskshadow","wbadmin start backup",
+  "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy",
+  "C:\\Windows\\NTDS\\ntds.dit","\\Windows\\NTDS\\",
+  "HKLM\\SAM","HKLM\\SYSTEM","HKLM\\SECURITY","reg save","reg.exe save","reg.exe export"
+]);
+
+let SensitivePaths = dynamic([
+  "\\Windows\\NTDS\\",
+  "\\System32\\config\\"
+]);
+
+let SuspiciousDestDirs = dynamic([
+  "\\Users\\Public\\","\\ProgramData\\","\\Windows\\Temp\\","\\Temp\\",
+  "\\Downloads\\","\\Desktop\\","\\AppData\\Local\\Temp\\","\\AppData\\Roaming\\"
+]);
+
+// ---- Optional allowlist (backup/DR/service accounts)
+let AllowedProc = dynamic(["VeeamAgent.exe","Veeam.Backup.exe","wbengine.exe","backupexec.exe","NetBackup.exe","AcronisAgent.exe","rubrik.exe"]);
+let AllowedAccounts = dynamic(["svc-backup","backupsvc","svc-veeam","svc-netbackup","svc-rubrik"]);
+
+let DomainControllers =
+DeviceInfo
+| summarize arg_max(Timestamp, *) by DeviceId
+| extend DeviceTagsStr = tostring(DeviceTags)
+| extend IsServer = iff(DeviceType =~ "Server", true, false)
+| extend IsDC =
+    iff(
+        (DeviceTagsStr has "DomainController")
+        or (DeviceName matches regex @"(?i)\bDC\d{0,3}\b")
+        or (DeviceName startswith "DC" and IsServer),
+        true,
+        false
+    )
+| where IsDC == true
+| project DeviceId, DeviceName;
+
+let IsAllowlisted = (EnableAllowlist and (InitiatingProcessFileName in~ (AllowedProc) or AccountName in~ (AllowedAccounts)));
+
+let Proc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| join kind=inner (DomainControllers) on DeviceId
+| where FileName in~ (DumpTools)
+| where not(IsAllowlisted)
+| extend Cmd = tostring(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName)
+| extend HasStrong = Cmd has_any (StrongIndicators)
+| extend HasIFM = Cmd has_any (dynamic(["ntdsutil","ifm","ac i ntds","create full","install from media"]))
+| extend HasVSS = Cmd has_any (dynamic(["vssadmin","diskshadow","HarddiskVolumeShadowCopy","create shadow","shadowcopy"]))
+| extend HasHive = Cmd has_any (dynamic(["HKLM\\SAM","HKLM\\SYSTEM","HKLM\\SECURITY","reg save","reg.exe save","reg.exe export"]))
+| extend ProcScore =
+    10
+  + iif(FileName =~ "ntdsutil.exe" and HasIFM, 70, 0)
+  + iif(FileName in~ ("vssadmin.exe","diskshadow.exe","wbadmin.exe") and HasVSS, 55, 0)
+  + iif(FileName =~ "dsamain.exe" and (Cmd has "/dbpath" or Cmd has "/ldapport"), 45, 0)
+  + iif(FileName =~ "reg.exe" and HasHive, 45, 0)
+  + iif(FileName in~ ("powershell.exe","pwsh.exe") and HasStrong, 35, 0)
+  + iif(Cmd has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy", 45, 0)
+| project
+    ProcTs=Timestamp, DeviceId, DeviceName, AccountName,
+    Parent, Process=FileName, Cmd,
+    HasIFM, HasVSS, HasHive, ProcScore;
+
+let Files =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| join kind=inner (DomainControllers) on DeviceId
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileCopied")
+| extend Name=tostring(FileName), Path=tostring(FolderPath)
+| extend IsNTDS = (Name =~ "ntds.dit") or (Path has "\\Windows\\NTDS\\")
+| extend IsHive = Name matches regex @"(?i)^(sam|system|security)\.(save|bak|tmp|old)$" or Path has "\\System32\\config\\"
+| extend IsShadowCopyPath = Path has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy"
+| extend IsStagedToSuspiciousDest = Path has_any (SuspiciousDestDirs)
+| where IsNTDS or IsHive or IsShadowCopyPath
+| where InitiatingProcessFileName !in~ ("TiWorker.exe","MsMpEng.exe","Sense.exe","svchost.exe")
+| extend FileScore =
+    10
+  + iif(IsNTDS, 70, 0)
+  + iif(IsHive, 55, 0)
+  + iif(IsShadowCopyPath, 45, 0)
+  + iif(IsStagedToSuspiciousDest and (IsNTDS or IsHive), 35, 0)
+| project
+    FileTs=Timestamp, DeviceId, DeviceName,
+    Proc=tostring(InitiatingProcessFileName),
+    Parent=tostring(InitiatingProcessParentFileName),
+    Cmd=tostring(InitiatingProcessCommandLine),
+    FileName=Name, FolderPath=Path,
+    IsNTDS, IsHive, IsShadowCopyPath, IsStagedToSuspiciousDest,
+    FileScore;
+
+Proc
+| join kind=leftouter (Files) on DeviceId
+| where FileTs between (ProcTs - ChainWindow .. ProcTs + ChainWindow) or isempty(FileTs)
+| extend TotalScore = todouble(ProcScore) + todouble(coalesce(FileScore, 0))
+| summarize
+    FirstSeen=min(coalesce(ProcTs, FileTs)),
+    LastSeen=max(coalesce(ProcTs, FileTs)),
+    MaxScore=max(TotalScore),
+    ProcCount=count(),
+    Procs=make_set(Process, 15),
+    Parents=make_set(Parent, 15),
+    SampleCmd=any(Cmd),
+    FilesTouched=make_set(strcat(FolderPath,"\\",FileName), 15)
+  by DeviceId, DeviceName, AccountName
+| extend Severity = case(
+    MaxScore >= 130, "CRITICAL",
+    MaxScore >= 95,  "HIGH",
+    MaxScore >= 60,  "MEDIUM",
+    "LOW"
+)
+| extend HuntingDirective = case(
+    Severity == "CRITICAL",
+    "CRITICAL: DC shows NTDS/IFM/VSS + sensitive file activity. Validate backup legitimacy immediately. If unapproved: isolate DC, capture memory, identify operator host, rotate KRBTGT/service creds, enforce AES-only, review replication & admin activity.",
+    Severity == "HIGH",
+    "HIGH: Strong NTDS dump preparation/access on DC. Validate change window/backup tooling. Pivot: process tree, shadow copy usage, hive exports, admin share staging.",
+    Severity == "MEDIUM",
+    "MEDIUM: Partial signals on DC. Baseline expected admin tooling; watch for follow-on file staging or outbound transfer.",
+    "LOW: Weak signal. Keep for baselining; promote if repeated or correlated with staging/exfil."
+)
+| project
+    Severity, HuntingDirective,
+    FirstSeen, LastSeen,
+    DeviceName, AccountName,
+    MaxScore, ProcCount,
+    Procs, Parents, FilesTouched,
+    SampleCmd
+| order by MaxScore desc, LastSeen desc;
