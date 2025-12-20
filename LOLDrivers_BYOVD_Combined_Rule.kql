@@ -8,11 +8,6 @@
 //   This hunt answers: "Do we have BYOVD exposure?" — not "Is this exploited?"
 // ============================================================================
 
-// ============================================================================
-// L2 CORE+ Hunt: BYOVD Driver Load Exposure (FIXED SYNTAX)
-// Fix: Removed 'or' from join; implemented 'union' matching logic.
-// ============================================================================
-
 let lookback = 7d;
 
 // 1. External LOLDrivers feed
