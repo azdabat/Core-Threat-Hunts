@@ -1,0 +1,60 @@
+// ============================================================================
+// HUNT: PS_L3_Persistence_Script_and_Task_Abuse
+// Author: Ala Dabat
+//
+// PURPOSE
+//   Detects persistence mechanisms that ultimately invoke PowerShell,
+//   including indirect script-based techniques.
+//
+// DESIGN
+//   - Covers Run keys, modified scheduled tasks, WMI subscriptions
+//   - Accounts for script-based indirection (VBS/JS calling PowerShell)
+//
+// MITRE
+//   T1547.001 (Run Keys)
+//   T1053 (Scheduled Tasks)
+//   T1546 (WMI Event Subscriptions)
+// ============================================================================
+
+let lookback = 7d;
+
+union isfuzzy=true
+(
+  // Registry Run / RunOnce
+  DeviceRegistryEvents
+  | where Timestamp >= ago(lookback)
+  | extend RK = tolower(RegistryKey)
+  | extend RV = tolower(RegistryValueData)
+  | where RK has @"\currentversion\run"
+  | where RV has_any ("powershell","pwsh","-enc","iex")
+  | project Timestamp, DeviceName, DeviceId, InitiatingProcessAccountName, RegistryKey, RegistryValueData
+),
+(
+  // Scheduled task creation OR modification invoking PowerShell
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where FileName in~ ("schtasks.exe","cmd.exe","powershell.exe")
+  | extend Cmd = tolower(ProcessCommandLine)
+  | where Cmd has_any ("powershell","pwsh","-enc","iex")
+  | project Timestamp, DeviceName, DeviceId, AccountName, FileName, ProcessCommandLine
+),
+(
+  // WMI event subscription creation
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where FileName in~ ("powershell.exe","pwsh.exe")
+  | extend Cmd = tolower(ProcessCommandLine)
+  | where Cmd has_any ("__eventfilter","commandlineeventconsumer","root\\subscription")
+  | project Timestamp, DeviceName, DeviceId, AccountName, FileName, ProcessCommandLine
+)
+
+| extend
+    RiskScore = 70,
+    HuntName = "PS_L3_Persistence_Script_and_Task_Abuse",
+    HuntingDirectives = strcat(
+      "PowerShell persistence mechanism detected. ",
+      "1) Identify trigger type (logon, schedule, WMI). ",
+      "2) Remove persistence ONLY after full scoping. ",
+      "3) Hunt for original staging vector. ",
+      "4) Persistence confirms successful execution."
+    );
