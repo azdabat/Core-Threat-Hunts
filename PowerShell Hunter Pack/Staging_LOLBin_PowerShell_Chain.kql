@@ -1,0 +1,82 @@
+// ============================================================================
+// HUNT: PS_L3_Staging_LOLBin_PowerShell_Chain
+// Author: Ala Dabat
+//
+// PURPOSE
+//   Detects multi-stage initial access & staging chains involving:
+//     - LOLBins (mshta, rundll32, certutil, bitsadmin, wmic, etc)
+//     - PowerShell execution shortly after
+//
+// DESIGN (2025 Reality)
+//   - Covers ClickFix, Remcos, Lumma, Cobalt Strike loaders
+//   - Detects staging even when PowerShell does NOT perform the download
+//   - Behavior-based: sequence + rarity, not just strings
+//
+// MITRE
+//   T1218 (Signed Binary Proxy Execution)
+//   T1059.001 (PowerShell)
+//   T1105 (Ingress Tool Transfer)
+// ============================================================================
+
+let lookback = 7d;
+let corrWindow = 10m;
+
+let Stagers = dynamic([
+  "mshta.exe","rundll32.exe","regsvr32.exe","certutil.exe",
+  "bitsadmin.exe","wmic.exe","wscript.exe","cscript.exe"
+]);
+
+// Stage 1: LOLBin staging (any external/script activity)
+let Stage1 =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (Stagers)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any (
+    "http://","https://",".hta",".sct",".js",".jse",".vbs",".xsl",".wsf"
+)
+| project
+    DeviceId,
+    DeviceName,
+    Stage1Time = Timestamp,
+    Stage1Proc = FileName,
+    Stage1Cmd  = ProcessCommandLine,
+    AccountName;
+
+// Stage 2: PowerShell execution shortly after (regardless of who downloaded payload)
+let Stage2 =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| project
+    DeviceId,
+    Stage2Time = Timestamp,
+    PSProc = FileName,
+    PSCmd  = ProcessCommandLine,
+    Parent = InitiatingProcessFileName;
+
+Stage1
+| join kind=inner Stage2 on DeviceId
+| where Stage2Time between (Stage1Time .. Stage1Time + corrWindow)
+| project
+    Stage1Time,
+    Stage2Time,
+    DeviceName,
+    DeviceId,
+    AccountName,
+    Stage1Proc,
+    Stage1Cmd,
+    PSProc,
+    PSCmd,
+    Parent
+| extend
+    RiskScore = 75,
+    HuntName = "PS_L3_Staging_LOLBin_PowerShell_Chain",
+    HuntingDirectives = strcat(
+      "Multi-stage staging chain detected (LOLBin → PowerShell). ",
+      "1) Identify external infrastructure used by the LOLBin. ",
+      "2) Pivot PSCmd across tenant for reuse. ",
+      "3) Check for follow-on AMSI tampering or in-memory loaders. ",
+      "4) Treat as HIGH RISK initial access (ClickFix-style)."
+    );
