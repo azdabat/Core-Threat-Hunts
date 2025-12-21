@@ -7,6 +7,13 @@
 // MITRE: TA0002 (Execution), TA0005 (Defense Evasion), TA0011 (C2)
 //        T1059.001, T1059.003, T1059.005, T1027.003, T1620
 // ============================================================================
+// Detection Name: Stego Image Loader — Phase 2 (Reflective .NET)
+// Author:         Ala Dabat
+// Date:           2025-12-21
+// MITRE ATT&CK:   T1027.003 (Steganography), T1620 (Reflective Code Loading)
+// Validation:     Verified via Atomic Red Team (Bespoke YAML: T1027.003-Bespoke)
+// Status:         Production / Validated
+// ============================================================================
 
 let lookback = 7d;
 let UserFacingParents = dynamic([
