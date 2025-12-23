@@ -1,0 +1,407 @@
+// ============================================================================
+// HUNT: Unified_Powershell_Behavioural_KillChain_2025 (Unified / Patched)
+// Author: Ala Dabat
+//
+// GOAL
+//   One consolidated L3 hunt that models attacker behaviour end-to-end (2024–2025 tradecraft):
+//     - Staging (LOLBin / ClickFix / script host → PowerShell)
+//     - Telemetry evasion (ScriptBlock/Module logging disable, AMSI/ETW impairment)
+//     - In-memory execution (alloc/protect/write/threads + modern .NET loader patterns)
+//     - Persistence (Run keys + alternate reg paths + tasks + WMI + protocol handlers)
+//     - Post-access (cred access + lateral movement via non-WinRM methods)
+//     - PowerShell hosted in non-powershell processes (System.Management.Automation load)
+//
+// DESIGN RULES
+//   - Behavioural correlation + cumulative scoring (NOT segmented rules)
+//   - Schema-correct for MDE (DeviceEvents columns fixed)
+//   - Tight stager gating (Suspicious parent REQUIRED)
+//   - “Ghost alert” prevention (persistence/post-access must be near the intent event)
+//   - Prevalence suppression fixed (normalize before hashing; avoid unique junk in AdditionalFields)
+//
+// TARGET
+//   ≥90% fidelity after tuning allowlists + prevalence thresholds
+//
+// NOTES ON TELEMETRY
+//   - API-call ActionTypes vary by tenant; we keep a broad family and rely on correlation gates.
+//   - Memory allocation/protection signals are ONLY used when present as ActionType telemetry.
+// ============================================================================
+
+let lookback = 7d;
+let corrWindow = 30m;
+
+// -------------------------------
+// 0) Tenant Tunables / Allow Lists
+// -------------------------------
+let KnownGoodAccounts = dynamic(["svc_scom","svc_sccm","system"]);
+let KnownGoodParents  = dynamic(["monitoringhost.exe","sccmexec.exe","services.exe","taniumclient.exe","senseir.exe"]);
+
+// Suspicious “initial access” parents (context boost)
+// Include explorer.exe to cover ClickFix/ClearFake clipboard-driven execution.
+let SuspiciousParents = dynamic([
+  "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+  "mshta.exe","wscript.exe","cscript.exe","cmd.exe",
+  "rundll32.exe","regsvr32.exe","wmic.exe","explorer.exe"
+]);
+
+// “Stage 0/1” LOLBins + script hosts (used for context enrichment)
+let LOLBins = dynamic([
+  "mshta.exe","rundll32.exe","regsvr32.exe","certutil.exe",
+  "bitsadmin.exe","wmic.exe","wscript.exe","cscript.exe","curl.exe","powershell.exe","pwsh.exe"
+]);
+
+// -------------------------------
+// 1) Token Families (2025+ coverage)
+// -------------------------------
+
+// High-signal in-memory / injection intent tokens (string-level intent; not sufficient alone)
+let MemoryExecTokens = dynamic([
+  // Classic Win32 / common loader tokens
+  "virtualalloc","virtualallocex","writeprocessmemory","rtlmovememory","rtlcopymemory",
+  "createthread","createremotethread","queueuserapc","setthreadcontext","resumethread",
+  "virtualprotect","virtualprotectex","ntprotectvirtualmemory","ntallocatevirtualmemory",
+  "ntmapviewofsection","zwunmapviewofsection",
+  // .NET loader patterns
+  "system.reflection","reflection.assembly","assembly::load","assembly.load","appdomain",
+  "entrypoint.invoke","getdelegateforfunctionpointer","marshal]::copy","allochglobal","unsafe",
+  "dynamicmethod","system.reflection.emit","ilgenerator","opcodes"
+]);
+
+// Defense impairment / telemetry evasion intent tokens
+let DefImpairTokens = dynamic([
+  // AMSI / ETW common strings
+  "amsiutils","amsiinitfailed","amsiscanbuffer","etweventwrite","eventprovider",
+  // Hex-ish / patching breadcrumbs (coarse, low noise; correlation required)
+  "0x41,0x6d,0x73,0x69", // "Amsi" bytes seen in some patch snippets
+  "virtualprotect","page_execute_readwrite","0x40" // common memory protection change in patching
+]);
+
+// Stagers (strictly gated by Suspicious Parent — per SNR guidance)
+let StagerTokens = dynamic([
+  "iex","invoke-expression","downloadstring","new-object net.webclient","system.net.webclient",
+  "invoke-webrequest","iwr","invoke-restmethod","irm",
+  "-enc","-encodedcommand","frombase64string","gzipstream",
+  // ClickFix / ClearFake clipboard vector
+  "get-clipboard","set-clipboard","forms.clipboard","clipboard"
+]);
+
+// COM / DCOM / Runspace hosting / “PowerShell without powershell.exe”
+let HostingTokens = dynamic([
+  "createobject(\"powershell\")","createobject(\"wscript.shell\")",
+  "system.management.automation","runspacefactory","createpipeline","addscript",
+  "gettypefromprogid","mmc20.application","shellbrowserwindow"
+]);
+
+// Credential + lateral (beyond WinRM)
+// Includes SCM/service exec, remote schtasks, and hive dumping.
+let PostAccessTokens = dynamic([
+  // Cred access
+  "lsass","minidump","comsvcs.dll","dbghelp.dll","sekurlsa","logonpasswords",
+  "reg save hk\\lm\\sam","reg save hk\\lm\\security","reg save hk\\lm\\system",
+  "ntds.dit","vssadmin","wmic shadowcopy","diskshadow",
+  // Lateral / execution
+  "new-pssession","invoke-command","enter-pssession","winrm","get-wmiobject","invoke-wmimethod",
+  "schtasks /create /s","sc.exe \\\\","psexec","atexec","dcom","mmc20.application"
+]);
+
+// Registry / persistence paths (expanded beyond Run keys)
+let PersistenceRegIndicators = dynamic([
+  "\\currentversion\\run",
+  "\\currentversion\\runonce",
+  "\\currentversion\\explorer\\startupapproved\\run",
+  "\\windows nt\\currentversion\\winlogon\\userinit",
+  "\\software\\classes\\protocols\\handler",               // protocol handlers
+  "\\shell\\open\\command",                                // protocol / file handler hijack
+  "\\software\\classes\\clsid",                            // CLSID / COM hijack
+  "scriptleturl",                                          // COM scriptlet URL persistence
+  "\\system\\currentcontrolset\\control\\session manager\\environment", // env var persistence (machine)
+  "\\environment"                                          // env var persistence (user)
+]);
+
+// PowerShell logging policy keys (telemetry nullification)
+let LoggingDisableIndicators = dynamic([
+  "\\software\\policies\\microsoft\\windows\\powershell\\scriptblocklogging",
+  "\\software\\policies\\microsoft\\windows\\powershell\\modulelogging",
+  "\\software\\policies\\microsoft\\windows\\powershell\\transcription"
+]);
+
+// Noise anchors (tenant expand)
+let NoiseTokens = dynamic(["compattelrunner","autogenerated","scom","monitoringhost","sccm","healthservice"]);
+
+// -------------------------------
+// 2) Normalization Helpers (Prevalence fix)
+//    Goal: stop the hash from being “always unique” due to GUIDs/timestamps/pointers.
+// -------------------------------
+let Normalize = (s:string) {
+  let x0 = tolower(coalesce(s,""));
+  let x1 = replace_regex(x0, @"[0-9a-f]{8}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{12}", "<guid>");
+  let x2 = replace_regex(x1, @"0x[0-9a-f]{6,16}", "<hexptr>");
+  let x3 = replace_regex(x2, @"\b\d{4,}\b", "<num>");               // long numbers / timestamps / IDs
+  let x4 = replace_regex(x3, @"\s+", " ");
+  x4
+};
+
+// -------------------------------
+// 3) INTENT LAYER (DeviceEvents, schema-correct)
+// -------------------------------
+let ScriptLayerRaw =
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("PowerShellCommand","PowerShellScriptBlock","AmrScriptDetected")
+| extend
+    Proc = tolower(tostring(InitiatingProcessFileName)),
+    Parent = tolower(tostring(InitiatingProcessParentFileName)),
+    AccountName = tostring(InitiatingProcessAccountName),
+    PSCommand = tostring(InitiatingProcessCommandLine),
+    Url = tostring(RemoteUrl)
+| extend Raw = Normalize(strcat(PSCommand," ",Url," ",tostring(AdditionalFields)))
+| where not(Raw has_any (NoiseTokens))
+| extend
+    SuspParent = Parent has_any (SuspiciousParents),
+    HasStager = Raw has_any (StagerTokens),
+    HasMemoryExec = Raw has_any (MemoryExecTokens),
+    HasDefImpair = Raw has_any (DefImpairTokens),
+    HasHosting = Raw has_any (HostingTokens),
+    HasPostAccess = Raw has_any (PostAccessTokens)
+| extend
+    // SNR FIX: stager MUST have suspicious parent (no “http” alone)
+    StagerGated = HasStager and SuspParent
+| where HasDefImpair or HasMemoryExec or StagerGated or HasHosting or HasPostAccess
+| extend ScriptFingerprint = hash_sha256(Raw)
+| project
+    ScriptTime = Timestamp,
+    DeviceId, DeviceName,
+    AccountName,
+    Proc, Parent,
+    Url,
+    Raw,
+    ScriptFingerprint,
+    SuspParent, StagerGated,
+    HasDefImpair, HasMemoryExec, HasHosting, HasPostAccess;
+
+// Prevalence gate (fixed by normalization)
+// Suppress widely prevalent scripts unless they are in the “hard signals” families.
+let ScriptPrevalence =
+ScriptLayerRaw
+| summarize ScriptDevicePrevalence = dcount(DeviceId) by ScriptFingerprint;
+
+let ScriptLayer =
+ScriptLayerRaw
+| join kind=leftouter ScriptPrevalence on ScriptFingerprint
+| where (HasDefImpair or HasMemoryExec or HasHosting) or (ScriptDevicePrevalence <= 3);
+
+// -------------------------------
+// 4) ACTION LAYER (Memory allocation/protection/injection API telemetry)
+//    Use broad family; rely on correlation and scoring.
+// -------------------------------
+let ApiLayer =
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in (
+    // classic family (if present in tenant)
+    "CreateRemoteThreadApiCall","WriteProcessMemoryApiCall",
+    "NtAllocateVirtualMemoryApiCall","VirtualProtectApiCall",
+    // expanded coverage (tenant-dependent; harmless if absent)
+    "QueueUserApcApiCall","SetThreadContextApiCall","ResumeThreadApiCall",
+    "NtMapViewOfSectionApiCall","ZwUnmapViewOfSectionApiCall"
+  )
+| extend
+    AccountName = tostring(InitiatingProcessAccountName),
+    Proc = tolower(tostring(InitiatingProcessFileName))
+| where Proc in~ ("powershell.exe","pwsh.exe","powershell_ise.exe")
+| project
+    ApiTime = Timestamp,
+    DeviceId, DeviceName, AccountName,
+    ApiAction = ActionType,
+    ApiProc = Proc;
+
+// -------------------------------
+// 5) TELEMETRY EVASION LAYER (Logging policy disable via registry)
+// -------------------------------
+let TelemetryEvasionLayer =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| extend RK = tolower(tostring(RegistryKey)), RVN = tolower(tostring(RegistryValueName)), RVD = tolower(tostring(RegistryValueData))
+| where RK has_any (LoggingDisableIndicators)
+| where (RVN has "enablescriptblocklogging" or RVN has "enablemodulelogging" or RVN has "enabletranscripting")
+| where (RVD == "0" or RVD has "0x0" or RVD == "false")
+| project DeviceId, EvasionTime=Timestamp, EvasionType="PS_Logging_Disable", EvasionKey=RegistryKey, EvasionData=RegistryValueData;
+
+// -------------------------------
+// 6) PERSISTENCE LAYER (expanded + time-bound to prevent ghost alerts)
+// -------------------------------
+let PersistenceLayer =
+union isfuzzy=true
+(
+  // Run/RunOnce + alternate autoruns + protocol/handler + CLSID/ScriptletURL + env vars
+  DeviceRegistryEvents
+  | where Timestamp >= ago(lookback)
+  | extend RK = tolower(tostring(RegistryKey)), RVD = tolower(tostring(RegistryValueData))
+  | where RK has_any (PersistenceRegIndicators)
+  | where RVD has_any ("powershell","pwsh","-enc","-encodedcommand","iex","downloadstring","invoke-webrequest","invoke-restmethod")
+  | project DeviceId, PersistTime=Timestamp, PersistType="Registry", PersistEvidence=strcat(RegistryKey," :: ",RegistryValueData)
+),
+(
+  // Task scheduler CLI usage (schtasks)
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where tolower(FileName) in ("schtasks.exe")
+  | where tolower(ProcessCommandLine) has_any ("powershell","pwsh","-enc","-encodedcommand","iex")
+  | project DeviceId, PersistTime=Timestamp, PersistType="ScheduledTask", PersistEvidence=ProcessCommandLine
+),
+(
+  // Task scheduler COM / PowerShell task cmdlets (no schtasks.exe)
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where tolower(FileName) in ("powershell.exe","pwsh.exe")
+  | where tolower(ProcessCommandLine) has_any ("register-scheduledtask","new-scheduledtask","schedule.service")
+  | project DeviceId, PersistTime=Timestamp, PersistType="TaskCOM", PersistEvidence=ProcessCommandLine
+),
+(
+  // WMI permanent event subscriptions
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where tolower(ProcessCommandLine) has_any ("__eventfilter","commandlineeventconsumer","__filtertoconsumerbinding","root\\subscription")
+  | project DeviceId, PersistTime=Timestamp, PersistType="WMI", PersistEvidence=ProcessCommandLine
+);
+
+// -------------------------------
+// 7) POST-ACCESS LAYER (cred + lateral, broader than WinRM)
+// -------------------------------
+let PostAccessLayer =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where tolower(FileName) in ("powershell.exe","pwsh.exe","cmd.exe","wmic.exe","sc.exe","schtasks.exe","rundll32.exe")
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any (PostAccessTokens)
+| project DeviceId, PostTime=Timestamp, PostEvidence=ProcessCommandLine;
+
+// -------------------------------
+// 8) HOSTED POWERSHELL RUNTIME (non-powershell processes loading SMA)
+//    This is critical gap coverage: “PowerShell without powershell.exe”
+// -------------------------------
+let HostedPowerShellLayer =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| extend Proc = tolower(tostring(InitiatingProcessFileName)), Img = tolower(tostring(ImageLoaded))
+| where Img has "system.management.automation" or Img has "microsoft.powershell" or Img endswith "system.management.automation.dll"
+| where Proc !in~ ("powershell.exe","pwsh.exe","powershell_ise.exe")
+| project DeviceId, HostTime=Timestamp, HostProc=InitiatingProcessFileName, HostImg=ImageLoaded;
+
+// -------------------------------
+// 9) CORRELATION + “NEAREST EVENT” ENRICHMENT (avoid join explosions)
+// -------------------------------
+let WithApi =
+ScriptLayer
+| join kind=leftouter (ApiLayer) on DeviceId, AccountName
+| extend ApiDelta = abs(datetime_diff("minute", ApiTime, ScriptTime))
+| where isnull(ApiTime) or ApiTime between (ScriptTime - corrWindow .. ScriptTime + corrWindow)
+| summarize arg_min(ApiDelta, *) by DeviceId, AccountName, ScriptTime, ScriptFingerprint;
+
+let WithEvasion =
+WithApi
+| join kind=leftouter (TelemetryEvasionLayer) on DeviceId
+| extend EvasionDelta = abs(datetime_diff("minute", EvasionTime, ScriptTime))
+| where isnull(EvasionTime) or EvasionTime between (ScriptTime - 12h .. ScriptTime + 12h)
+| summarize arg_min(EvasionDelta, *) by DeviceId, AccountName, ScriptTime, ScriptFingerprint;
+
+let WithPersistence =
+WithEvasion
+| join kind=leftouter (PersistenceLayer) on DeviceId
+| extend PersistDelta = abs(datetime_diff("minute", PersistTime, ScriptTime))
+| where isnull(PersistTime) or PersistTime between (ScriptTime - 12h .. ScriptTime + 12h) // SNR FIX: prevent “ghost chains”
+| summarize arg_min(PersistDelta, *) by DeviceId, AccountName, ScriptTime, ScriptFingerprint;
+
+let WithPostAccess =
+WithPersistence
+| join kind=leftouter (PostAccessLayer) on DeviceId
+| extend PostDelta = abs(datetime_diff("minute", PostTime, ScriptTime))
+| where isnull(PostTime) or PostTime between (ScriptTime - 24h .. ScriptTime + 24h)
+| summarize arg_min(PostDelta, *) by DeviceId, AccountName, ScriptTime, ScriptFingerprint;
+
+let WithHosted =
+WithPostAccess
+| join kind=leftouter (HostedPowerShellLayer) on DeviceId
+| extend HostDelta = abs(datetime_diff("minute", HostTime, ScriptTime))
+| where isnull(HostTime) or HostTime between (ScriptTime - 24h .. ScriptTime + 24h)
+| summarize arg_min(HostDelta, *) by DeviceId, AccountName, ScriptTime, ScriptFingerprint;
+
+// -------------------------------
+// 10) Late Filters + Scoring (cumulative, kill-chain truth)
+// -------------------------------
+WithHosted
+| where not(AccountName has_any (KnownGoodAccounts))
+| where not(Parent has_any (KnownGoodParents))
+| extend
+    CorrelatedApi = iff(isnotempty(tostring(ApiAction)), true, false),
+    HasLogEvasion = iff(isnotempty(tostring(EvasionType)), true, false),
+    HasPersistence = iff(isnotempty(tostring(PersistType)), true, false),
+    HasPost = iff(isnotempty(tostring(PostEvidence)), true, false),
+    HasHostedSMA = iff(isnotempty(tostring(HostProc)), true, false)
+| extend
+    // Scoring rationale:
+    // - Defense impairment + logging disable is near-zero benign overlap.
+    // - In-memory loader intent + API telemetry is strongest “runtime loader” proof.
+    // - Hosted SMA in non-PS process is high value (PowerShell without powershell.exe).
+    // - Persistence/post-access only count when time-near to avoid ghost chains.
+    Score =
+        (25 * iff(StagerGated,1,0)) +
+        (55 * iff(HasMemoryExec,1,0)) +
+        (60 * iff(HasDefImpair,1,0)) +
+        (50 * iff(HasLogEvasion,1,0)) +
+        (45 * iff(CorrelatedApi,1,0)) +
+        (40 * iff(HasHostedSMA,1,0)) +
+        (25 * iff(HasPersistence,1,0)) +
+        (30 * iff(HasPost,1,0)) +
+        (15 * iff(HasHosting,1,0)) +
+        (10 * iff(HasPostAccess,1,0))
+| extend
+    Criticality = case(
+        // “hard truth” combos
+        (HasDefImpair and (CorrelatedApi or HasMemoryExec or HasLogEvasion)), "CRITICAL",
+        (HasLogEvasion and (CorrelatedApi or HasMemoryExec)), "CRITICAL",
+        (HasMemoryExec and CorrelatedApi), "CRITICAL",
+        (HasHostedSMA and (HasMemoryExec or CorrelatedApi or HasDefImpair)), "CRITICAL",
+        // high confidence
+        Score >= 110, "CRITICAL",
+        Score >= 80,  "HIGH",
+        Score >= 50,  "MEDIUM",
+        "LOW"
+    )
+| where Criticality != "LOW"
+
+// -------------------------------
+// 11) Output + IR Directives (SOC-ready)
+// -------------------------------
+| project
+    Timestamp = coalesce(ApiTime, ScriptTime),
+    DeviceName,
+    DeviceId,
+    AccountName,
+    Proc,
+    Parent,
+    Criticality,
+    RiskScore = Score,
+    CorrelatedApi,
+    ApiAction,
+    RemoteUrl = Url,
+    TelemetryEvasion = EvasionType,
+    Persistence = PersistType,
+    PostAccess = iff(isnotempty(PostEvidence), "true", "false"),
+    HostedPowerShell = iff(HasHostedSMA, strcat(HostProc," loaded ",HostImg), ""),
+    Evidence = Raw
+| extend
+    HuntName = "PS_L3_Behavioural_KillChain_Superior_2025",
+    HuntingDirectives = case(
+      Criticality == "CRITICAL",
+        strcat(
+          "// TRIAGE: Confirm which kill-chain stages fired (DefImpair/LogEvasion/MemoryExec/API/HostedSMA). ",
+          "// CONTAIN: Isolate host if approved (CRITICAL implies active runtime compromise). ",
+          "// SCOPE: Pivot DeviceId+AccountName ±7d; hunt child procs, injection targets, new services/tasks/WMI, and outbound connections post-event. ",
+          "// ERADICATE: Remove persistence (ONLY after scoping), reset creds/tokens where applicable, collect memory artefacts if feasible. ",
+          "// RECOVER: Validate ScriptBlock/Module logging, AMSI health, ASR/CLM posture; run retrospective hunt for same normalized fingerprints."
+        ),
+      Criticality == "HIGH",
+        "// TRIAGE: Validate correlation (API/HostedSMA/LogEvasion). // SCOPE: Identify staging origin and persistence. // Prepare containment if escalation occurs.",
+      "// TRIAGE: Treat as suspicious behaviour. // Validate prevalence + admin script legitimacy. // Enrich with parent chain & network telemetry."
+    )
+| sort by RiskScore desc;
