@@ -25,6 +25,49 @@
 //   - API-call ActionTypes vary by tenant; we keep a broad family and rely on correlation gates.
 //   - Memory allocation/protection signals are ONLY used when present as ActionType telemetry.
 // ============================================================================
+// ============================================================================
+// ⚠️ SOC EDUCATION — READ BEFORE MODIFYING ⚠️
+//
+// IMPORTANT: Memory execution tokens (VirtualAlloc, Assembly::Load, DynamicMethod,
+// etc.) are NOT expected to appear in ProcessCommandLine telemetry.
+//
+// WHY THEY EXIST:
+// - These tokens represent *attacker intent* captured during PowerShell parsing,
+//   ScriptBlock logging, or AMSI content inspection.
+// - They describe WHAT the attacker is attempting to do, not HOW Windows executed it.
+//
+// WHERE THEY APPEAR:
+// ✔ PowerShell ScriptBlock logs
+// ✔ AMSI content buffers (when not bypassed)
+// ✔ Pre-execution parsing / JIT compilation
+//
+// WHERE THEY DO NOT APPEAR:
+// ✖ DeviceProcessEvents.ProcessCommandLine
+// ✖ LOLBin command lines
+// ✖ Encoded PowerShell (-enc)
+//
+// HOW THIS RULE USES THEM:
+// - Tokens are NEVER standalone detections
+// - Tokens are WEIGHTED intent signals
+// - Final alerts require correlation with:
+//     • API behavior (WriteProcessMemory, CreateRemoteThread)
+//     • Defense impairment (AMSI / ETW tampering)
+//     • Suspicious parent processes
+//     • Non-standard PowerShell hosting
+//
+// WHY THIS MATTERS:
+// - Modern attackers intentionally remove these strings at runtime
+// - The *absence* of expected ScriptBlock telemetry is itself a signal
+// - Correlation > strings > signatures
+//
+// DO NOT:
+// ❌ Alert on these tokens alone
+// ❌ Expect them in command lines
+// ❌ Remove them because "they don't exist in malware strings"
+//
+// THIS IS AN L3 BEHAVIORAL HUNT, NOT A STRING MATCH RULE. NEWER ITERATIONS TO COME _ CORE+ DAY TO DAY HUNT.
+// ============================================================================
+
 
 let lookback = 7d;
 let corrWindow = 30m;
