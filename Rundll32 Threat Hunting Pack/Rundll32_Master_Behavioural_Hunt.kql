@@ -1,6 +1,8 @@
 // ============================================================================
 // Rundll32_SwissArmyProxyExec_2025 (Patched / High-Fidelity)
 // Patch Notes (Delta):
+// Author: Ala Dabat
+// Logic verfied (Atomic ReadTeam - DOCKER)
 //   - ADD: ChildShell reinforcement (rundll32 -> cmd/powershell) to close LNK/Explorer gap.
 //   - KEEP: Your categories, prevalence suppression, reinforcement, directives style.
 // ============================================================================
