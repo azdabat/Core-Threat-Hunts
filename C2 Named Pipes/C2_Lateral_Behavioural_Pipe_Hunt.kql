@@ -1,0 +1,255 @@
+// ============================================================================
+// HUNT: L3_NamedPipe_C2_Lateral_Behavioural_2025 (FINAL / Production-Hardened)
+// Author: Ala Dabat
+// TESTING PHASE
+// GOAL
+//   High-fidelity daily threat hunt for:
+//     - C2 frameworks using Named Pipes (CS / Sliver / BR / Mythic / Havoc / Covenant)
+//     - SMB-based lateral movement (PsExec / RemCom / PAExec / WMIExec / DCOMExec)
+//     - Browser masquerade via Mojo Named Pipes
+//     - Cobalt Strike Fork-n-Run dynamic hex pipes
+//     - epmapper typosquatting & RPC abuse
+//
+// DESIGN PRINCIPLES
+//   - Behavioural correlation > string matching
+//   - Rarity-aware scoring (OrgPipeCount + HostCount)
+//   - Infrastructure-agnostic (MDE-only OR Sentinel-enabled tenants)
+//   - Explicit noise suppression for scanners / admin tooling
+//   - <5% FP after minimal tenant tuning
+//
+// FIXES APPLIED (Gemini Audit)
+//   ✔ Fork-n-Run regex hardened (optional \\.\ prefix)
+//   ✔ Service creation correlation works via:
+//       - SecurityEvent 7045 (Sentinel)
+//       - DeviceEvents ActionType=ServiceInstalled (MDE-only)
+//
+// ============================================================================
+
+let lookback = 7d;
+let slowServiceLookback = 21d;
+let nearSmbWindow = 10m;
+let nearServiceWindow = 20m;
+
+// 0) Tenant Tunables (KEEP TIGHT)
+
+let BaselineAccounts = dynamic(["NT AUTHORITY\\SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"]);
+
+let BaselinePipeFragments = dynamic([
+  "eventlog","winsock","sql","postgres","mysql","oracle",
+  "vmware","vbox","hyperv","docker",
+  "chrome","msedge","brave","firefox","teams","onedrive","crashpad"
+]);
+
+let SuspiciousParents = dynamic([
+  "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+  "wscript.exe","cscript.exe","mshta.exe",
+  "powershell.exe","pwsh.exe","cmd.exe",
+  "rundll32.exe","regsvr32.exe","wmic.exe"
+]);
+
+// 1) Pipe Indicator Families
+
+let HighRiskPipes = dynamic([
+  // Cobalt Strike / default profiles
+  "msse-","status_","msagent_","postex_","beacon","pipetst",
+  "cobaltstrike","csession","cspipe","searchtextharvester",
+  // Mojo masquerade baseline
+  "mojo.",
+  // Sliver / Mythic / Havoc / BR
+  "sliver","operator","multiplayer","mythic","demon_pipe","nh_","badger","bruteratel",
+  // Covenant / Empire / PoshC2
+  "gruntsvc","covenant","empire","poshc2","jaccdpqnvbrrxlaf",
+  // Credential tooling
+  "lsadump","cachedump","wceservicepipe","samdump","credpipe"
+]);
+
+let MediumRiskPipes = dynamic([
+  "psexesvc","paexec","remcom","csexec",
+  "wmiexec","dcomexec","smbexec","atexec",
+  "svcctl","servicecontrol"
+]);
+
+let LegacyRpcPipes = dynamic([
+  "atsvc","spoolss","winreg","lsarpc",
+  "netlogon","samr","wkssvc","ntsvcs","epmapper"
+]);
+
+// 2) Named Pipe Telemetry (Created + Connected)
+let PipeEventsRaw =
+DeviceEvents
+| where TimeGenerated >= ago(lookback)
+| where ActionType in ("NamedPipeEvent","NamedPipeCreated","NamedPipeConnected")
+| extend F = parse_json(AdditionalFields)
+| extend PipeName = coalesce(tostring(F.PipeName), tostring(F.NamedPipe), tostring(F.Pipe))
+| where isnotempty(PipeName)
+| extend PipeLower = tolower(PipeName)
+| where PipeLower !has_any (BaselinePipeFragments)
+
+// FIX #1 — Fork-n-Run regex hardened for MDE variance
+| extend ForkNRunHex = PipeName matches regex @"^(\\\\.\\)?\\pipe\\[0-9a-f]{7,10}$"
+
+// Mojo masquerade detection
+| extend IsMojo = PipeLower has "mojo."
+| extend MojoLegitShape = PipeName matches regex @"^(\\\\.\\)?\\pipe\\mojo\.[0-9]{2,8}\.[0-9]{2,8}\."
+| extend MojoDeviation =
+    IsMojo and
+    ((MojoLegitShape == false) or
+     (tolower(InitiatingProcessFileName) !in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")))
+
+// epmapper typosquat
+| extend EpmTyposquat = (PipeLower has "epmap") and (PipeLower !has "epmapper")
+
+| extend
+    DeviceName = tolower(DeviceName),
+    AccountName = tostring(AccountName),
+    Proc = tostring(InitiatingProcessFileName),
+    Parent = tostring(InitiatingProcessParentFileName),
+    Cmd = tostring(InitiatingProcessCommandLine),
+    SuspParent = tolower(Parent) has_any (SuspiciousParents)
+| project
+    TimeGenerated, DeviceId, DeviceName, AccountName,
+    Proc, Parent, Cmd,
+    PipeName, PipeLower,
+    ForkNRunHex, MojoDeviation, EpmTyposquat, SuspParent;
+
+// 3) SMB Correlation (Named Pipe over SMB)
+let SmbPipeConnections =
+DeviceNetworkEvents
+| where TimeGenerated >= ago(lookback)
+| where ActionType has "Success"
+| where RemotePort in (445,139)
+| extend NamedPipe = tostring(parse_json(AdditionalFields).NamedPipe)
+| where isnotempty(NamedPipe)
+| project
+    SmbTime = TimeGenerated,
+    DeviceName = tolower(DeviceName),
+    RemoteIP,
+    RemotePort,
+    SmbPipeLower = tolower(NamedPipe);
+
+// 4) Service Creation (UNIVERSAL)
+//    - Sentinel: SecurityEvent 7045
+//    - MDE-only: DeviceEvents ServiceInstalled
+let ServiceCreation =
+union
+(
+    SecurityEvent
+    | where TimeGenerated >= ago(slowServiceLookback)
+    | where EventID == 7045
+    | project
+        SvcTime = TimeGenerated,
+        DeviceName = tolower(tostring(split(Computer,".")[0])),
+        ServiceName,
+        ServiceFileName,
+        ServiceAccount = Account
+),
+(
+    DeviceEvents
+    | where TimeGenerated >= ago(slowServiceLookback)
+    | where ActionType == "ServiceInstalled"
+    | extend F = parse_json(AdditionalFields)
+    | project
+        SvcTime = TimeGenerated,
+        DeviceName = tolower(DeviceName),
+        ServiceName = tostring(F.ServiceName),
+        ServiceFileName = tostring(F.ServiceFileName),
+        ServiceAccount = tostring(F.ServiceAccount)
+);
+
+// 5) Rarity Scoring
+let PipeFrequency =
+PipeEventsRaw
+| summarize OrgPipeCount = count(), HostCount = dcount(DeviceName) by PipeName;
+
+// 6) Correlation + Classification
+PipeEventsRaw
+| join kind=leftouter PipeFrequency on PipeName
+| join kind=leftouter (SmbPipeConnections) on DeviceName
+| join kind=leftouter (ServiceCreation) on DeviceName
+| extend
+    PipeCategory = case(
+        PipeLower has_any (HighRiskPipes), "HighRisk",
+        PipeLower has_any (MediumRiskPipes), "MediumRisk",
+        PipeLower has_any (LegacyRpcPipes), "LegacyRPC",
+        "Suspicious"
+    ),
+    SmbNear = isnotempty(RemoteIP) and abs(datetime_diff("minute", TimeGenerated, SmbTime)) <= 10,
+    PipeNameMatchesSmb = PipeLower == SmbPipeLower,
+    ServiceNear = isnotempty(ServiceName) and abs(datetime_diff("minute", TimeGenerated, SvcTime)) <= 20,
+    ServiceSlow = isnotempty(ServiceName) and abs(datetime_diff("day", TimeGenerated, SvcTime)) <= 7
+
+// 7) Scoring Model
+| extend
+    BaseScore = case(
+        ForkNRunHex, 85,
+        MojoDeviation, 75,
+        EpmTyposquat, 70,
+        PipeCategory == "HighRisk", 75,
+        PipeCategory == "MediumRisk", 55,
+        PipeCategory == "LegacyRPC", 35,
+        25
+    ),
+    RarityScore = case(
+        OrgPipeCount <= 1, 25,
+        OrgPipeCount <= 3, 15,
+        0
+    ),
+    SpreadPenalty = case(
+        HostCount >= 10, -20,
+        HostCount >= 5, -10,
+        0
+    ),
+    ContextScore =
+        (15 * iff(SuspParent, 1, 0)) +
+        (20 * iff(SmbNear and PipeNameMatchesSmb, 1, 0)) +
+        (10 * iff(ServiceNear, 1, 0)),
+    BaselinePenalty = iff(AccountName in (BaselineAccounts), -10, 0)
+| extend FinalScore = BaseScore + RarityScore + SpreadPenalty + ContextScore + BaselinePenalty
+| extend Severity = case(
+    FinalScore >= 90, "CRITICAL",
+    FinalScore >= 70, "HIGH",
+    FinalScore >= 50, "MEDIUM",
+    "LOW"
+)
+
+// 8) Noise Gate (Behavioural Truth)
+| where
+    (ForkNRunHex or MojoDeviation or EpmTyposquat or PipeCategory == "HighRisk")
+    or (PipeCategory == "MediumRisk" and (SmbNear or ServiceNear or ServiceSlow))
+    or (PipeCategory == "LegacyRPC" and (SmbNear or SuspParent) and OrgPipeCount <= 3)
+| where Severity != "LOW"
+
+// 9) SOC-Ready Output
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Host=", DeviceName, " | Account=", AccountName, " | Pipe=", PipeName),
+    strcat("[SCORE] ", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | Rarity=", tostring(RarityScore),
+           " | SpreadPenalty=", tostring(SpreadPenalty),
+           " | Context=", tostring(ContextScore)),
+    strcat("[PROCESS] Proc=", Proc, " | Parent=", Parent),
+    iif(ForkNRunHex, "[SIGNAL] Fork-n-Run dynamic hex pipe (Cobalt Strike class).", ""),
+    iif(MojoDeviation, "[SIGNAL] Mojo pipe masquerade (browser process mismatch).", ""),
+    iif(EpmTyposquat, "[SIGNAL] epmapper typosquat (RPC deception).", ""),
+    iif(SmbNear, strcat("[SMB] Named pipe over SMB to ", tostring(RemoteIP), ":", tostring(RemotePort)), "[SMB] No near SMB activity."),
+    iif(ServiceNear or ServiceSlow, strcat("[SERVICE] Service creation observed: ", ServiceName, " | ", ServiceFileName), "[SERVICE] No service correlation."),
+    "[NEXT] Pivot PipeName across estate; inspect process tree; verify admin authorization for PsExec/RemCom; hunt follow-on C2.",
+    "[CONTAIN] If unauthorized: isolate host, acquire memory, enumerate services/tasks/WMI, rotate credentials."
+)
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    PipeName,
+    PipeCategory,
+    Proc,
+    Parent,
+    RemoteIP,
+    RemotePort,
+    ServiceName,
+    OrgPipeCount,
+    HostCount,
+    FinalScore,
+    Severity,
+    HuntingDirectives
+| order by FinalScore desc, TimeGenerated desc
