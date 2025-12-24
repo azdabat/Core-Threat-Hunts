@@ -1,0 +1,233 @@
+// ============================================================================
+// CORE+ HUNT — Rundll32 Behavioural Proxy Execution (Unified / Patched) — 2025
+// Author: Ala Dabat
+//
+// GOAL (L2 / CORE+)
+//   Daily behavioural detection of rundll32.exe misuse with SOC-safe fidelity:
+//     - Script/protocol handler abuse (javascript:, vbscript:, mshtml RunHTMLApplication, scrobj.dll)
+//     - Remote DLL loading (UNC/WebDAV/HTTP staging)
+//     - LSASS dump via comsvcs.dll minidump (very high signal)
+//     - Suspicious directory context (Temp/Public/ProgramData/Downloads) ONLY when reinforced
+//     - Close LNK/Explorer gap via child-shell / network / file-drop reinforcement
+//
+// DESIGN (SNR FIRST)
+//   - Explicit allowlist of common legitimate rundll32 use
+//   - Rarity suppression (CmdHash prevalence)
+//   - Reinforcement joins: NetworkNear, DllDropNear, ChildShellNear
+//   - Noise gate:
+//       * Always allow top categories (Script/Comsvcs)
+//       * Remote load requires (rarity OR network) to reduce benign WebDAV/corp shares
+//       * Suspicious directory requires reinforcement (child shell OR network OR dll drop)
+// ============================================================================
+
+let Lookback = 7d;
+
+let LegitCommandAllowlist = dynamic([
+  "rundll32.exe shell32.dll,control_rundll",
+  "rundll32.exe shell32.dll,control_rundll desk.cpl",
+  "rundll32.exe shell32.dll,control_rundll main.cpl",
+  "rundll32.exe printui.dll,printuientry",
+  "rundll32.exe user32.dll,lockworkstation"
+]);
+
+let LegitParents = dynamic(["explorer.exe","svchost.exe","services.exe","winlogon.exe","userinit.exe","dwm.exe"]);
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","powerpnt.exe","outlook.exe","powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe","wmic.exe"]);
+
+let SuspiciousDirs = dynamic(["\\windows\\temp\\","\\users\\public\\","\\appdata\\local\\temp\\","\\programdata\\","\\downloads\\"]);
+
+// -------------------------------
+// 1) rundll32 executions (base set)
+// -------------------------------
+let RundllExec =
+DeviceProcessEvents
+| where TimeGenerated >= ago(Lookback)
+| where FileName =~ "rundll32.exe"
+| extend Cmd = tostring(ProcessCommandLine)
+| extend CmdLower = tolower(Cmd)
+| where not(CmdLower has_any (LegitCommandAllowlist))
+| extend
+    Parent = tostring(InitiatingProcessFileName),
+    ParentLower = tolower(tostring(InitiatingProcessFileName)),
+    ParentCmd = tostring(InitiatingProcessCommandLine),
+    // Primary behavioural flags
+    Flag_ScriptProtocol = CmdLower has_any ("javascript:","vbscript:","mshtml,runhtmlapplication","mshtml.dll","scrobj.dll"),
+    Flag_RemoteLoad = CmdLower startswith "\\\\" or CmdLower has_any ("http://","https://","ftp://"),
+    Flag_ComsvcsDump = CmdLower has_all ("comsvcs", "minidump") or (CmdLower has "lsass" and CmdLower has "minidump"),
+    Flag_SuspiciousDir = CmdLower has_any (SuspiciousDirs),
+    Flag_SuspiciousParent = ParentLower in~ (SuspiciousParents),
+    Flag_LegitParent = ParentLower in~ (LegitParents)
+| extend Category = case(
+    Flag_ComsvcsDump, "LSASS_Dump_via_comsvcs",
+    Flag_ScriptProtocol, "Script_Protocol_Handler_Abuse",
+    Flag_RemoteLoad, "Remote_UNC_HTTP_Load",
+    Flag_SuspiciousDir, "Suspicious_Directory_Context",
+    "Other"
+)
+| where Category != "Other"
+//
+// Prevalence normalization: stabilize CmdHash across hosts by stripping GUIDs/hex/numbers.
+// This prevents “port/id churn” from breaking rarity scoring.
+//
+| extend CmdNorm =
+    replace_regex(
+      replace_regex(
+        replace_regex(
+          CmdLower,
+          @"[0-9a-f]{8}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{12}", "<guid>"),
+        @"0x[0-9a-f]{6,16}", "<hex>"),
+      @"\b\d{2,}\b", "<num>")
+| extend CmdHash = hash_sha256(CmdNorm)
+| project TimeGenerated, DeviceId, DeviceName, AccountName, Parent, ParentCmd, Cmd, Category,
+          Flag_ScriptProtocol, Flag_RemoteLoad, Flag_ComsvcsDump, Flag_SuspiciousDir,
+          Flag_SuspiciousParent, Flag_LegitParent, CmdHash;
+
+// -------------------------------
+// 2) Rarity (CmdHash prevalence across estate)
+// -------------------------------
+let CmdPrevalence =
+RundllExec
+| summarize CmdHostCount = dcount(DeviceId) by CmdHash;
+
+let ExecWithPrev =
+RundllExec
+| join kind=leftouter CmdPrevalence on CmdHash
+| extend CmdHostCount = coalesce(CmdHostCount, 1);
+
+// -------------------------------
+// 3) Reinforcement contexts (light joins)
+// -------------------------------
+let NetworkContext =
+DeviceNetworkEvents
+| where TimeGenerated >= ago(Lookback)
+| where InitiatingProcessFileName =~ "rundll32.exe"
+| where RemoteIP !startswith "127." and RemoteIP != "::1"
+| project DeviceId, NetTime=TimeGenerated, RemoteIP, RemotePort, Protocol;
+
+let DllDropContext =
+DeviceFileEvents
+| where TimeGenerated >= ago(Lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| where FileName endswith ".dll"
+| where tolower(FolderPath) has_any (SuspiciousDirs)
+| project DeviceId, FileTime=TimeGenerated, DroppedDll=strcat(FolderPath,"\\",FileName);
+
+let ChildShellContext =
+DeviceProcessEvents
+| where TimeGenerated >= ago(Lookback)
+| where InitiatingProcessFileName =~ "rundll32.exe"
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe")
+| project DeviceId, ChildTime=TimeGenerated, ChildProc=FileName, ChildCmd=ProcessCommandLine;
+
+// -------------------------------
+// 4) Enrich + Score
+// -------------------------------
+ExecWithPrev
+| join kind=leftouter NetworkContext on DeviceId
+| extend NetNear = isnotempty(RemoteIP) and abs(datetime_diff("minute", TimeGenerated, NetTime)) <= 5
+| join kind=leftouter DllDropContext on DeviceId
+| extend DllNear = isnotempty(DroppedDll) and abs(datetime_diff("minute", TimeGenerated, FileTime)) <= 10
+| join kind=leftouter ChildShellContext on DeviceId
+| extend ChildShellNear = isnotempty(ChildProc) and abs(datetime_diff("minute", TimeGenerated, ChildTime)) <= 5
+
+| extend
+    BaseScore = case(
+      Category == "LSASS_Dump_via_comsvcs", 85,
+      Category == "Script_Protocol_Handler_Abuse", 80,
+      Category == "Remote_UNC_HTTP_Load", 60,
+      Category == "Suspicious_Directory_Context", 35,
+      25
+    ),
+    ContextScore =
+        (20 * iff(Flag_SuspiciousParent, 1, 0))
+      + (15 * iff(NetNear, 1, 0))
+      + (15 * iff(DllNear, 1, 0))
+      + (30 * iff(ChildShellNear, 1, 0))   // closes Explorer/LNK gap
+      + (10 * iff(Flag_SuspiciousDir, 1, 0)),
+    RarityScore = case(
+      CmdHostCount <= 1, 20,
+      CmdHostCount <= 3, 12,
+      CmdHostCount <= 10, 6,
+      -10
+    )
+| extend FinalScore = tolong(BaseScore + ContextScore + RarityScore)
+| extend Severity = case(
+    FinalScore >= 95, "CRITICAL",
+    FinalScore >= 75, "HIGH",
+    FinalScore >= 55, "MEDIUM",
+    "LOW"
+)
+
+// -------------------------------
+// 5) Noise Gate (CORE+ fidelity)
+//   - Script + comsvcs: can stand alone
+//   - Remote load: require rarity OR network OR suspicious parent (reduces benign share usage)
+//   - Suspicious directory: require reinforcement (child shell OR network OR dll drop) and rarity not widespread
+//   - If parent is "legit" (Explorer/etc.), require reinforcement for non-top categories (LNK hardening)
+// -------------------------------
+| where Severity != "LOW"
+| where
+    Category in ("LSASS_Dump_via_comsvcs","Script_Protocol_Handler_Abuse")
+    or (Category == "Remote_UNC_HTTP_Load" and (NetNear or Flag_SuspiciousParent or CmdHostCount <= 3))
+    or (Category == "Suspicious_Directory_Context"
+        and (NetNear or DllNear or ChildShellNear)
+        and CmdHostCount <= 3)
+| where
+    // LNK/Explorer gap closure: if parent is "legit", require reinforcement unless top category
+    (Category in ("LSASS_Dump_via_comsvcs","Script_Protocol_Handler_Abuse"))
+    or (Flag_LegitParent == false)
+    or (NetNear or DllNear or ChildShellNear)
+
+// -------------------------------
+// 6) Output + directives that explain scoring + kill-chain meaning
+// -------------------------------
+| extend KillChainStage = case(
+    Category == "LSASS_Dump_via_comsvcs", "Credential Access (Dumping)",
+    Category == "Script_Protocol_Handler_Abuse", "Execution / Defense Evasion (Proxy Execution)",
+    Category == "Remote_UNC_HTTP_Load", "Staging / Execution (Remote Load)",
+    "Execution (Suspicious Context)"
+)
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Host=", tostring(DeviceName), " | Account=", tostring(AccountName), " | Category=", Category, " | KillChain=", KillChainStage),
+    strcat("[SCORE] ", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | Context=", tostring(ContextScore), " (ParentSusp=", tostring(Flag_SuspiciousParent),
+           ", NetNear=", tostring(NetNear), ", DllNear=", tostring(DllNear), ", ChildShellNear=", tostring(ChildShellNear), ")",
+           " | Rarity=", tostring(RarityScore), " (CmdHostCount=", tostring(CmdHostCount), ")"),
+    strcat("[PROCESS] Parent=", tostring(Parent), iif(Flag_LegitParent, " (LegitParent)", " (NonLegitParent)"),
+           " | ParentCmd=", substring(tostring(ParentCmd),0,180)),
+    strcat("[CMD] ", substring(tostring(Cmd),0,240)),
+    iif(ChildShellNear,
+        strcat("[CASCADE] rundll32 spawned ", tostring(ChildProc), " near execution: ", substring(tostring(ChildCmd),0,180)),
+        "[CASCADE] No suspicious child shell observed."),
+    iif(NetNear,
+        strcat("[NET] rundll32 network near execution: ", tostring(RemoteIP), ":", tostring(RemotePort), " | ", tostring(Protocol)),
+        "[NET] No near network activity observed."),
+    iif(DllNear,
+        strcat("[FILE] Suspicious DLL activity near execution: ", tostring(DroppedDll)),
+        "[FILE] No suspicious DLL drop observed near execution."),
+    case(
+      Severity == "CRITICAL",
+        "[ACTION] CRITICAL: Strong proxy-exec/credential-access behaviour. Validate immediately; isolate if unapproved; capture memory for LSASS/script cases; scope for persistence + lateral movement.",
+      Severity == "HIGH",
+        "[ACTION] HIGH: Likely malicious proxy execution. Pivot CmdHash across estate; verify DLL source/path/signature; review process tree + user initiation (LNK/email/web).",
+      "[ACTION] MEDIUM: Behavioural signal with reinforcement. Baseline host/user; promote if repeated CmdHash, additional network beacons, or follow-on scripting appears."
+    ),
+    "[NEXT] Pivot queries: (1) DeviceProcessEvents where CmdHash matches, (2) DeviceNetworkEvents InitiatingProcess=rundll32.exe, (3) DeviceFileEvents for dropped DLLs in Temp/Public/ProgramData, (4) check email/web download origin if parent is explorer/Office."
+)
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    Category,
+    KillChainStage,
+    Parent,
+    ParentCmd,
+    Cmd,
+    NetNear, RemoteIP, RemotePort, Protocol,
+    DllNear, DroppedDll,
+    ChildShellNear, ChildProc,
+    CmdHostCount,
+    FinalScore,
+    Severity,
+    HuntingDirectives
+| order by FinalScore desc, TimeGenerated desc
