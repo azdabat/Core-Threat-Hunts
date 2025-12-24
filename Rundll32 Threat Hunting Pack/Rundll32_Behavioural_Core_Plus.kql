@@ -1,7 +1,7 @@
 // ============================================================================
 // CORE+ HUNT — Rundll32 Behavioural Proxy Execution (Unified / Patched) — 2025
 // Author: Ala Dabat
-//
+// Logic Verfieid - Atomic ReadTeam - DOCKER
 // GOAL (L2 / CORE+)
 //   Daily behavioural detection of rundll32.exe misuse with SOC-safe fidelity:
 //     - Script/protocol handler abuse (javascript:, vbscript:, mshtml RunHTMLApplication, scrobj.dll)
