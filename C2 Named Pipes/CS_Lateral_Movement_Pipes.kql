@@ -1,5 +1,6 @@
 // Named Pipe C2 & Lateral Movement Hunt (High-Fidelity)
 // Author: Ala Dabat
+// PROTOTYPE-HUNT
 // v1.0
 // Focus: C2 frameworks, PsExec/RemCom-style lateral movement, privilege escalation & persistence via named pipes
 
