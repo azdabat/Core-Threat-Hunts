@@ -1,0 +1,170 @@
+// ============================================================================
+// WMI_CHAINED_HUNT_UNIFIED_Sentinel_MDE_2026 (Logic Hardened)
+// Author: Ala Dabat
+// Audience: L2.5 / L3 Threat Hunters
+// Platform: Microsoft Sentinel (MDE Advanced Hunting tables in workspace)
+// Data Sources: DeviceProcessEvents, DeviceNetworkEvents
+// Version: 2026-01-04
+//
+// DESIGN GOAL
+//   Keep distinct attack chains while staying quiet on single noisy WMIC events.
+//   We score “Attacker behavior” and “Victim effects” independently per host.
+//   This avoids the lateral split-score problem (Host A vs Host B).
+//
+//   FIXES APPLIED
+//   1) Math Risk: Recon(10)+RemoteExec(60)=70 < 80  => FIX: RemoteExec=75
+//   2) Lateral Join Risk: Source host != Target host => FIX: make RemoteExec
+//      high-signal enough to alert per host without cross-host joins.
+//
+// THRESHOLD
+//   threshold=80 triggers on:
+//     - Persistence Create/Exec (90)
+//     - RemoteExec Source (75) + any chain enhancer (Recon 10, DefEvasion 40)
+//     - RemoteExec TargetEffect (75) + any chain enhancer
+//
+// OUTPUT
+//   - Per DeviceId+Account per 4h bucket
+//   - Score breakdown, evidence, RPC hints, SOC directives
+// ============================================================================
+
+let lookback  = 7d;
+let window    = 4h;
+let threshold = 80;
+
+// ---- Weights (Hardened) ----
+let W_Recon             = 10;
+let W_DefEvasion        = 40;
+let W_RemoteExec_Source = 75;
+let W_RemoteExec_Target = 75;
+let W_Persist_Create    = 90;
+let W_Persist_Exec      = 90;
+
+// ---- Tokens ----
+let ReconClasses = dynamic(["qfe","quickfixengineering","process","useraccount","group","startup","product","service","os","computersystem","logicaldisk","share","networkadapter","bios"]);
+let RemoteExecTokens = dynamic(["/node:","/node=","process call create","win32_process","invoke-wmimethod"]);
+let PersistTokens = dynamic(["root\\subscription","root/subscription","__eventfilter","__eventconsumer","__filtertoconsumerbinding","commandlineeventconsumer","activescripteventconsumer","register-wmievent","set-wmiinstance","new-ciminstance","invoke-cimmethod","mofcomp.exe"]);
+let DefEvasionTokens = dynamic(["win32_service","call stopservice","call deleteservice","win32_shadowcopy","shadowcopy","delete","securitycenter2","antivirusproduct"]);
+
+// ---- Base (MDE process telemetry) ----
+let Proc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend ProcName = tolower(FileName)
+| extend Parent   = tolower(InitiatingProcessFileName)
+| extend Cmd      = tolower(ProcessCommandLine)
+| extend Account  = coalesce(AccountName, InitiatingProcessAccountName)
+| project Timestamp, DeviceId, DeviceName, Account, ProcName, Parent, Cmd, SHA256, ReportId;
+
+// ---- Attacker-side stages (setup/actions on the source host) ----
+let AttackerStages =
+Proc
+| extend
+    Stage_Recon =
+      iff(ProcName == "wmic.exe" and Cmd has " get " and Cmd has_any(ReconClasses), 1, 0),
+    Stage_RemoteExec_Source =
+      iff(ProcName == "wmic.exe" and Cmd has_any(RemoteExecTokens), 1, 0),
+    Stage_Persist_Create =
+      iff((ProcName in~ ("powershell.exe","pwsh.exe","wmic.exe","mofcomp.exe") and Cmd has_any(PersistTokens))
+          and Cmd has_any("__eventfilter","__eventconsumer","__filtertoconsumerbinding","root\\subscription","mofcomp.exe"), 1, 0),
+    Stage_DefEvasion =
+      iff(ProcName == "wmic.exe" and Cmd has_any(DefEvasionTokens), 1, 0)
+| extend StageScore =
+    case(Stage_Persist_Create == 1, W_Persist_Create,
+         Stage_RemoteExec_Source == 1, W_RemoteExec_Source,
+         Stage_DefEvasion == 1, W_DefEvasion,
+         Stage_Recon == 1, W_Recon,
+         0)
+| where StageScore > 0
+| extend TimeBucket = bin(Timestamp, window)
+| extend EntityKey  = strcat(DeviceId, " | ", Account)
+| summarize
+    BaseScore               = sum(StageScore),
+    ReconScore              = sumif(StageScore, Stage_Recon == 1),
+    RemoteExecSourceScore   = sumif(StageScore, Stage_RemoteExec_Source == 1),
+    PersistCreateScore      = sumif(StageScore, Stage_Persist_Create == 1),
+    DefEvasionScore         = sumif(StageScore, Stage_DefEvasion == 1),
+    EvidenceCmds            = make_set(Cmd, 20),
+    EvidenceParents         = make_set(Parent, 10),
+    FirstSeen               = min(Timestamp),
+    LastSeen                = max(Timestamp),
+    Stages                  = make_set(
+                               case(Stage_Persist_Create == 1, "Persistence_Create",
+                                    Stage_RemoteExec_Source == 1, "RemoteExec_Source",
+                                    Stage_DefEvasion == 1, "DefenseEvasion",
+                                    Stage_Recon == 1, "Recon",
+                                    "Other"), 10)
+  by TimeBucket, DeviceId, DeviceName, Account, EntityKey;
+
+// ---- Victim-side effects (execution/persistence effects on the target host) ----
+let VictimEffects =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend ChildProc = tolower(FileName)
+| extend ParentProc = tolower(InitiatingProcessFileName)
+| extend ChildCmd = tolower(ProcessCommandLine)
+| extend Account = coalesce(AccountName, InitiatingProcessAccountName)
+| where ParentProc in~ ("wmiprvse.exe","scrcons.exe")
+| where ChildProc in~ ("cmd.exe","powershell.exe","pwsh.exe","mshta.exe","rundll32.exe","wscript.exe","cscript.exe","regsvr32.exe")
+      or ChildCmd has_any ("-enc","frombase64string","iex","downloadstring","http","https","\\\\")
+| extend
+    Stage_RemoteExec_Target = iff(ParentProc == "wmiprvse.exe", 1, 0),
+    Stage_Persist_Exec      = iff(ParentProc == "scrcons.exe", 1, 0)
+| extend StageScore =
+    case(Stage_Persist_Exec == 1, W_Persist_Exec,
+         Stage_RemoteExec_Target == 1, W_RemoteExec_Target,
+         0)
+| where StageScore > 0
+| extend TimeBucket = bin(Timestamp, window)
+| extend EntityKey = strcat(DeviceId, " | ", Account)
+| extend EffectEvidence = strcat(ParentProc, " -> ", ChildProc, " :: ", ChildCmd)
+| summarize
+    EffectScore           = sum(StageScore),
+    RemoteExecTargetScore = sumif(StageScore, Stage_RemoteExec_Target == 1),
+    PersistExecScore      = sumif(StageScore, Stage_Persist_Exec == 1),
+    EffectEvidences       = make_set(EffectEvidence, 10)
+  by TimeBucket, DeviceId, DeviceName, Account, EntityKey;
+
+// ---- RPC hints (optional context only) ----
+let RpcHints =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| extend NProc = tolower(InitiatingProcessFileName)
+| where NProc in~ ("wmic.exe","powershell.exe","pwsh.exe")
+| where RemotePort == 135 or RemotePort between (49152 .. 65535)
+| summarize RpcDestIPs = make_set(RemoteIP, 25), RpcPorts = make_set(RemotePort, 25)
+  by DeviceId;
+
+// ---- Final correlation (same-host only; lateral split is intentional) ----
+AttackerStages
+| join kind=leftouter VictimEffects on TimeBucket, DeviceId, DeviceName, Account, EntityKey
+| extend EffectScore           = coalesce(EffectScore, 0),
+         RemoteExecTargetScore = coalesce(RemoteExecTargetScore, 0),
+         PersistExecScore      = coalesce(PersistExecScore, 0),
+         FinalScore            = BaseScore + EffectScore
+| where FinalScore >= threshold
+| join kind=leftouter RpcHints on DeviceId
+| extend Severity =
+    case(PersistCreateScore > 0 or PersistExecScore > 0, "Critical",
+         RemoteExecTargetScore > 0, "High",             // victim confirmed
+         RemoteExecSourceScore > 0, "High",             // attacker action (now high-signal)
+         DefEvasionScore > 0, "High",
+         "Medium")
+| extend ChainSummary = strcat(
+    "Recon:", tostring(ReconScore), " | ",
+    "Exec(Source):", tostring(RemoteExecSourceScore), " | ",
+    "Exec(Target):", tostring(RemoteExecTargetScore), " | ",
+    "Persist(Create):", tostring(PersistCreateScore), " | ",
+    "Persist(Exec):", tostring(PersistExecScore), " | ",
+    "Defense:", tostring(DefEvasionScore)
+)
+| extend HuntingDirectives = strcat(
+    "1) If Exec(Source)>0: extract /node target(s) from EvidenceCmds; validate whether Account is authorised.\n",
+    "2) If Exec(Target)>0: treat this host as COMPROMISED (wmiprvse spawned payload). Identify child process + payload in EffectEvidences.\n",
+    "3) If Persist(Create/Exec)>0: treat as fileless persistence. Investigate WMI subscription artefacts (root\\\\subscription) and remove filter/consumer/binding.\n",
+    "4) If Defense>0: treat as ransomware staging; check service health + backup/shadow copy impact.\n",
+    "5) Use RpcDestIPs/RpcPorts as supporting context only (do not rely on it for detection)."
+)
+| project TimeBucket, Severity, FinalScore, DeviceName, DeviceId, Account,
+          ChainSummary, Stages, EvidenceCmds, EffectEvidences,
+          RpcDestIPs, RpcPorts, FirstSeen, LastSeen, HuntingDirectives
+| order by FinalScore desc, LastSeen desc;
