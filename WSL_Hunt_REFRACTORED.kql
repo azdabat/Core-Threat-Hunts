@@ -1,0 +1,321 @@
+// ============================================================================
+// HUNT: WSL_WindowsObservable_PrivEsc_Persistence_Abuse (REFRACTORED)
+// Author: Ala Dabat
+// Audience: L2.5 / L3 Threat Hunters, DFIR
+// Platform: Microsoft Defender XDR (MDE Advanced Hunting)
+// Version: 2026-01 (Windows-observable refactor)
+//
+// WHY THIS REFACTOR (CHANGE LOG / GEMINI AUDIT)
+// - Removed Linux-path file telemetry assumptions (/etc/shadow, /etc/sudoers) from DeviceFileEvents.
+//   Reason: WSL2 Linux filesystem lives inside ext4.vhdx (utility VM). Windows MDE generally cannot
+//   see internal Linux file modifications, so /etc/* signals are a telemetry wall.
+// - Replaced with Windows-observable invariants:
+//     1) Suspicious WSL entry vectors (LOLBIN/high-risk parents spawning wsl.exe / bash.exe)
+//     2) Risky WSL flags (root/debug-shell/system/mount/interop)
+//     3) Host-visible WSL virtual disk activity (ext4.vhdx / *.vhdx under WSL paths)
+//     4) Network egress correlated to WSL processes (wsl.exe / wslhost.exe / vmmemWSL / bash.exe)
+// - Hardened command-line detection: no fragile "-e <tool>" regex; instead score shell invocation
+//   + high-risk flags + presence of net/staging verbs anywhere in commandline.
+// - Keeps this as a THREAT HUNT (not a scheduled analytic). Outputs high-fidelity leads.
+//
+// LIMITATIONS (HONEST)
+// - Does NOT confirm what happened inside the Linux filesystem (needs MDE for Linux inside WSL VM
+//   or separate Linux telemetry). This hunt detects entry + host-side effects.
+// ============================================================================
+
+let lookback = 7d;
+
+// -------------------- Tunables / Toggles --------------------
+// Set to true to reduce dev noise in WSL-heavy environments (allowlist common dev parents).
+let EnableAllowlist = true;
+
+// If your org is dev-heavy, increase these thresholds or expand allowlists.
+let MinScore = 60;
+
+// -------------------- Canonical WSL Binaries --------------------
+let WslBins = dynamic(["wsl.exe","wslhost.exe","bash.exe","ubuntu.exe","kali.exe","debian.exe","vmmemwsl.exe"]);
+
+// High-risk parents (initial access / LOLBin chaining) — tight by design.
+let HighRiskParents = dynamic([
+  "mshta.exe","wscript.exe","cscript.exe","regsvr32.exe","rundll32.exe","installutil.exe",
+  "cmd.exe","powershell.exe","pwsh.exe"
+]);
+
+// Optional dev/admin allowlist parents to suppress noise (toggleable).
+let KnownGoodParents = dynamic([
+  "windowsterminal.exe","wt.exe","code.exe","devenv.exe","msbuild.exe","teams.exe","explorer.exe",
+  "sublime_text.exe","idea64.exe","pycharm64.exe","git-bash.exe"
+]);
+
+// Risky WSL / interop flags and contexts (Windows-observable invariants)
+let RiskFlags = dynamic([
+  "--system","--debug-shell","--mount","--unmount","--import","--export","--install","--update",
+  "-u root","--user root","--cd","--exec","-e","--distribution","-d","--set-default","--set-version",
+  "--shutdown","--terminate","--list","--status"
+]);
+
+// High-signal "entry to shell" tokens: attackers almost always drop to a shell in WSL.
+let ShellTokens = dynamic([" bash"," sh"," zsh"," dash"," fish"," -c "," -lc "," -i "]);
+
+// Execution / staging verbs (do not require adjacency to -e; detect anywhere in cmdline).
+let NetStageTokens = dynamic([
+  "curl ","wget ","nc ","ncat ","socat ","python ","python3 ","perl ","ruby ",
+  "chmod ","chown ","sudo ","su ","ssh ","scp ","sftp ",
+  "base64 ","xxd ","dd ","mkfifo ","nohup ","&>/dev/null",
+  "invoke-webrequest","iwr ","irm ","powershell ","pwsh ",
+  "git clone","apt-get","apt ","yum ","dnf ","pacman "
+]);
+
+// Host paths where WSL VHDX commonly lives (Windows-side).
+let WslVhdxPathHints = dynamic([
+  @"\AppData\Local\Packages\",
+  @"\AppData\Local\lxss\",
+  @"\AppData\Local\Microsoft\WindowsApps\",
+  @"\AppData\Local\Temp\",
+  @"\ProgramData\Microsoft\Windows\WSL\",
+  @"\ProgramData\"
+]);
+
+// Exclude common legitimate system actors touching VHDX.
+let KnownGoodVhdxActors = dynamic(["wsl.exe","wslhost.exe","vmmemwsl.exe","system","svchost.exe"]);
+
+// -------------------- 1) WSL Process Entry Vector (Process Lineage) --------------------
+let WslProc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (WslBins)
+| extend
+    t = Timestamp,
+    DeviceId, DeviceName,
+    Proc = tolower(FileName),
+    Cmd = tostring(ProcessCommandLine),
+    CmdL = tolower(tostring(ProcessCommandLine)),
+    Parent = tolower(tostring(InitiatingProcessFileName)),
+    ParentCmd = tostring(InitiatingProcessCommandLine),
+    Account = coalesce(InitiatingProcessAccountName, AccountName, "")
+| extend
+    ParentHighRisk = iif(Parent in~ (HighRiskParents), 1, 0),
+    ParentKnownGood = iif(Parent in~ (KnownGoodParents), 1, 0),
+    HasRiskFlags = iif(CmdL has_any (RiskFlags), 1, 0),
+    DropsToShell = iif(CmdL has_any (ShellTokens), 1, 0),
+    HasNetStage = iif(CmdL has_any (NetStageTokens), 1, 0),
+    RootIntent = iif(CmdL has_any ("-u root","--user root","sudo ","su "), 1, 0),
+    MountIntent = iif(CmdL has_any ("--mount","--unmount") or CmdL matches regex @"(?i)\s(/mnt/[a-z]/|\\\\wsl\\$\\)", 1, 0),
+    SystemIntent = iif(CmdL has "--system" or CmdL has "--debug-shell", 1, 0),
+    ImportExport = iif(CmdL has_any ("--import","--export"), 1, 0),
+    DistroOps = iif(CmdL has_any ("--install","--update","--set-version","--set-default","--distribution","-d "), 1, 0)
+| extend
+    // Scoring focuses on invariants: suspicious parentage + shell drop + risky flags + staging verbs.
+    Score =
+        (25 * ParentHighRisk) +
+        (20 * DropsToShell) +
+        (20 * HasRiskFlags) +
+        (20 * HasNetStage) +
+        (15 * RootIntent) +
+        (15 * MountIntent) +
+        (20 * SystemIntent) +
+        (10 * ImportExport) -
+        (20 * iif(EnableAllowlist and ParentKnownGood==1 and ParentHighRisk==0 and SystemIntent==0, 1, 0))
+| extend
+    Severity = case(Score >= 90, "High", Score >= 70, "Medium", Score >= MinScore, "Low", "Info"),
+    KillChain = case(
+        SystemIntent==1, "Privilege Escalation / Host Escape Attempt",
+        RootIntent==1, "Privilege Escalation",
+        MountIntent==1, "Discovery / Host File System Access",
+        HasNetStage==1, "Execution / Staging / C2",
+        ImportExport==1, "Defense Evasion / Data Staging",
+        "Suspicious WSL Activity"
+    )
+| project
+    WslTime=t, DeviceId, DeviceName, Account,
+    Proc, Parent, ParentCmd,
+    Cmd,
+    ParentHighRisk, DropsToShell, HasRiskFlags, HasNetStage, RootIntent, MountIntent, SystemIntent, ImportExport,
+    Score, Severity, KillChain;
+
+// -------------------- 2) Windows-Visible WSL Virtual Disk Touch (ext4.vhdx) --------------------
+// Note: this detects host-side modification/access patterns for WSL virtual disks, not internal Linux paths.
+let VhdxEvents =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".vhdx"
+| extend FP = tolower(tostring(FolderPath))
+| where FP has_any (WslVhdxPathHints) or FP has "wsl"
+| extend
+    t = Timestamp,
+    DeviceId, DeviceName,
+    FileName = tostring(FileName),
+    FolderPath = tostring(FolderPath),
+    ActionType = tostring(ActionType),
+    Actor = tolower(tostring(InitiatingProcessFileName)),
+    ActorCmd = tostring(InitiatingProcessCommandLine),
+    Account = tostring(InitiatingProcessAccountName)
+| extend
+    ActorKnownGood = iif(Actor in~ (KnownGoodVhdxActors), 1, 0),
+    SuspiciousActor = iif(ActorKnownGood==0, 1, 0),
+    SuspiciousAction = iif(ActionType in~ ("FileCreated","FileModified","FileRenamed","FileDeleted"), 1, 0)
+| extend
+    Score =
+        (35 * SuspiciousActor) +
+        (20 * SuspiciousAction) +
+        (10 * iif(FolderPath has_any (@"\Temp\",@"\Downloads\",@"\Users\Public\"), 1, 0)) -
+        (15 * iif(EnableAllowlist and ActorKnownGood==1, 1, 0))
+| extend
+    Severity = case(Score >= 80, "High", Score >= 60, "Medium", Score >= 40, "Low", "Info"),
+    KillChain = case(
+        SuspiciousActor==1 and SuspiciousAction==1, "Defense Evasion / Tampering",
+        SuspiciousActor==1, "Suspicious Host Interaction",
+        "WSL Disk Activity"
+    )
+| project
+    VhdxTime=t, DeviceId, DeviceName, Account,
+    VhdxFile=FileName, VhdxPath=FolderPath, VhdxAction=ActionType,
+    ActorProc=Actor, ActorCmd,
+    SuspiciousActor, SuspiciousAction,
+    Score, Severity, KillChain;
+
+// -------------------- 3) Network Egress by WSL Process Family --------------------
+// This catches "WSL as a tunnel" and early beaconing observable from the Windows host.
+let WslNet =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "ConnectionSuccess"
+| extend
+    t = Timestamp,
+    DeviceId, DeviceName,
+    Proc = tolower(tostring(InitiatingProcessFileName)),
+    Cmd = tostring(InitiatingProcessCommandLine),
+    Account = tostring(InitiatingProcessAccountName),
+    RemoteIP, RemotePort, RemoteUrl
+| where Proc in~ (WslBins) or Proc in~ ("wslservice.exe","vmmemwsl.exe")
+| extend
+    IsRarePort = iif(RemotePort !in (53,80,443,123,25,587,993,995,3389) and RemotePort != 0, 1, 0),
+    HasUrl = iif(isnotempty(RemoteUrl), 1, 0)
+| extend
+    Score =
+        (25 * IsRarePort) +
+        (10 * HasUrl)
+| extend
+    Severity = case(Score >= 40, "Medium", Score >= 25, "Low", "Info"),
+    KillChain = case(IsRarePort==1, "Command & Control / Execution", "Network Activity")
+| project
+    NetTime=t, DeviceId, DeviceName, Account,
+    Proc, Cmd,
+    RemoteIP, RemotePort, RemoteUrl,
+    IsRarePort,
+    Score, Severity, KillChain;
+
+// -------------------- 4) Correlation: Entry Vector + Net + VHDX (High Fidelity Leads) --------------------
+// Correlate within reasonable windows to reduce fan-out and preserve hunt usability.
+let Correlated =
+WslProc
+| where Severity in ("High","Medium","Low")
+| join kind=leftouter (
+    WslNet
+) on DeviceId, DeviceName
+| where isnull(NetTime) or NetTime between (WslTime .. WslTime + 20m)
+| join kind=leftouter (
+    VhdxEvents
+) on DeviceId, DeviceName
+| where isnull(VhdxTime) or VhdxTime between (WslTime - 30m .. WslTime + 30m)
+| extend
+    NetNear = iif(isnotempty(NetTime), 1, 0),
+    VhdxNear = iif(isnotempty(VhdxTime), 1, 0),
+    FinalScore = Score + (15 * NetNear) + (20 * VhdxNear),
+    FinalSeverity = case(FinalScore >= 110, "High", FinalScore >= 85, "Medium", FinalScore >= MinScore, "Low", "Info"),
+    FinalKillChain = case(
+        SystemIntent==1, "Privilege Escalation / Host Escape Attempt",
+        RootIntent==1, "Privilege Escalation",
+        MountIntent==1 and NetNear==1, "Discovery + Execution (WSL Interop)",
+        HasNetStage==1 and NetNear==1, "Execution + C2 (WSL Tunnel)",
+        VhdxNear==1 and ParentHighRisk==1, "Defense Evasion / Tampering (WSL Disk)",
+        KillChain
+    )
+| extend
+    Reason = case(
+        ParentHighRisk==1 and (SystemIntent==1 or RootIntent==1),
+            "High-risk parent spawned WSL with root/system intent flags.",
+        ParentHighRisk==1 and HasNetStage==1,
+            "High-risk parent spawned WSL and commandline includes staging/network tooling.",
+        VhdxNear==1 and SuspiciousActor==1,
+            "WSL virtual disk accessed/modified by a non-standard process.",
+        NetNear==1 and IsRarePort==1,
+            "WSL process initiated network connection on a rare port (possible tunnel/beacon).",
+        ParentHighRisk==1 and DropsToShell==1,
+            "High-risk parent spawned WSL and dropped into a shell (entry vector for execution).",
+        "Suspicious WSL activity with host-observable corroboration."
+    )
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Host=", DeviceName, " | Account=", Account, " | FinalSeverity=", FinalSeverity, " | FinalScore=", tostring(FinalScore)),
+    strcat("[ENTRY] Parent=", Parent, " | WSLProc=", Proc, " | ParentHighRisk=", tostring(ParentHighRisk), " | Shell=", tostring(DropsToShell), " | RiskFlags=", tostring(HasRiskFlags)),
+    strcat("[CMD] ", Cmd),
+    iif(NetNear==1, strcat("[NET] ", Proc, " -> ", tostring(RemoteIP), ":", tostring(RemotePort), " | URL=", tostring(RemoteUrl), " | RarePort=", tostring(IsRarePort)), "[NET] No near network egress observed."),
+    iif(VhdxNear==1, strcat("[VHDX] ", VhdxAction, " ", VhdxPath, VhdxFile, " | Actor=", ActorProc, " | SuspiciousActor=", tostring(SuspiciousActor)), "[VHDX] No near VHDX activity observed."),
+    "[NEXT] Validate authorization: is this developer/admin WSL use? If not expected, treat as intrusion entry vector and pivot.",
+    "[PIVOT] Pivot on: DeviceId, Account, Parent process tree, Cmd line tokens (root/debug-shell/mount), RemoteIP/RemoteUrl, VHDX ActorProc.",
+    "[NOTE] This hunt cannot see internal Linux /etc/* changes in WSL2 without Linux-side telemetry; it detects Windows-observable entry + effects."
+)
+| project
+    Timestamp=WslTime,
+    DeviceName,
+    Account,
+    FinalSeverity,
+    FinalScore,
+    FinalKillChain,
+    Reason,
+    Parent,
+    Proc,
+    Cmd,
+    NetTime, RemoteIP, RemotePort, RemoteUrl, IsRarePort,
+    VhdxTime, VhdxAction, VhdxPath, VhdxFile, ActorProc, SuspiciousActor,
+    HuntingDirectives
+| where FinalSeverity != "Info"
+| order by FinalScore desc, Timestamp desc;
+
+Correlated
+
+// ============================================================================
+// INCIDENT RESPONSE FRAMEWORK (IR DIRECTIVES) — for hunters/DFIR
+// (Annotations via // only; no extra narrative outside KQL)
+// ============================================================================
+//
+// Phase 1 — Triage & Validation
+// - Validate process lineage (Smoking Gun):
+//   - Malicious-leaning: mshta/wscript/cscript/regsvr32/rundll32/installutil/powershell -> wsl.exe -> bash -c ...
+//   - Benign-leaning: windowsterminal/code/devenv -> wsl.exe (no root/debug-shell/mount), common dev usage.
+// - Check commandline for invariants:
+//   - --debug-shell / --system / -u root / --user root / --mount / --import / --export
+//   - shell drop + net/staging verbs anywhere (curl/wget/nc/python/perl/base64/chmod).
+// - Confirm whether WSL is expected on the host (developer workstation vs server).
+//
+// Phase 2 — Containment
+// - If FinalSeverity=High AND (NetNear=1 OR SystemIntent/RootIntent=1):
+//   - Isolate device (MDE) to stop potential tunneling/beaconing.
+//   - Block RemoteIP/RemoteUrl if suspicious and observed in Net telemetry.
+// - If VHDX suspicious actor observed:
+//   - Immediately preserve evidence: copy VHDX metadata (path, timestamps) and collect Actor process tree.
+//
+// Phase 3 — Investigation (Forensic Pivot)
+// - Process pivots:
+//   - Pivot on Parent (high-risk parent) across estate for WSL spawning.
+//   - Pivot on Cmd tokens: "--debug-shell", "--system", "--mount", "-u root", "bash -c".
+// - Network pivots:
+//   - Pivot RemoteIP/RemoteUrl across tenant for additional WSL egress or related processes.
+//   - Look for repeated periodic egress from wsl.exe / wslhost.exe / vmmemWSL.
+// - Disk pivots:
+//   - Pivot on VhdxPath for other devices/users with similar ext4.vhdx access by non-standard actors.
+// - If you require inside-WSL evidence:
+//   - Acquire Linux-side telemetry (Defender for Linux inside WSL VM, if feasible) or perform offline analysis.
+//   - Consider targeted memory acquisition prior to isolation if active staging suspected.
+//
+// Phase 4 — Eradication & Recovery
+// - Remove unauthorized WSL distributions if policy forbids them; validate enterprise policy.
+// - Reset credentials if suspicious WSL activity correlated with outbound egress or credential tooling tokens.
+// - Review persistence mechanisms on Windows side (Scheduled Tasks, Run keys, WMI) that may re-launch WSL.
+// - If VHDX tampering suspected, treat as potential defense evasion; consider reimage based on impact.
+//
+// Phase 5 — Lessons Learned / Hardening
+// - Enforce policy: restrict WSL installation/use on non-dev endpoints.
+// - Add allowlist entries (KnownGoodParents / KnownGoodVhdxActors) per environment with expiry & audit.
+// - Consider EDR visibility gap: onboard Linux telemetry for WSL if your threat model requires /etc/* coverage.
+// ============================================================================
