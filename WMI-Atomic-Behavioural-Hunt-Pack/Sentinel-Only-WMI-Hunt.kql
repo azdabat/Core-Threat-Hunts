@@ -1,0 +1,84 @@
+// ============================================================================
+// WMI_CHAINED_HUNT_SENTINEL_ONLY_2026 (Logic Hardened)
+// Author: Ala Dabat
+// Platform: Microsoft Sentinel
+// Data Source: SecurityEvent (EventID 4688 - Process Creation with CommandLine enabled)
+// Version: 2026-01-04
+//
+//   FIX APPLIED
+//   RemoteExec weight bumped to 75 so Recon(10)+Exec(75)=85 > threshold(80).
+//
+// NOTES
+//   - Parent/child effects (wmiprvse/scrcons) require those parent fields to be present.
+//   - If ParentProcessName is missing in your ingestion, you still catch attacker-side RemoteExec.
+// ============================================================================
+
+let lookback  = 7d;
+let window    = 4h;
+let threshold = 80;
+
+let W_Recon             = 10;
+let W_DefEvasion        = 40;
+let W_RemoteExec_Source = 75;
+let W_RemoteExec_Target = 75;
+let W_Persist_Create    = 90;
+let W_Persist_Exec      = 90;
+
+let ReconClasses = dynamic(["qfe","quickfixengineering","process","useraccount","group","startup","product","service","os","computersystem","logicaldisk","share","networkadapter","bios"]);
+
+SecurityEvent
+| where TimeGenerated >= ago(lookback)
+| where EventID == 4688
+| extend Cmd    = tolower(tostring(CommandLine))
+| extend Parent = tolower(tostring(ParentProcessName))
+| extend Proc   = tolower(tostring(NewProcessName))
+| extend ProcName = tostring(split(Proc, "\\")[-1])
+| extend ParentName = tostring(split(Parent, "\\")[-1])
+| extend Account = strcat(tolower(tostring(SubjectDomainName)), "\\", tolower(tostring(SubjectUserName)))
+| extend Computer = tolower(tostring(Computer))
+| extend
+    Stage_Recon = iff(ProcName == "wmic.exe" and Cmd has " get " and Cmd has_any(ReconClasses), 1, 0),
+    Stage_RemoteExec_Source = iff(ProcName == "wmic.exe" and (Cmd has "/node:" or Cmd has "/node=") and Cmd has "process call create", 1, 0),
+    Stage_Persist_Create = iff(Cmd has_any ("root\\subscription","root/subscription","__eventfilter","__eventconsumer","__filtertoconsumerbinding","commandlineeventconsumer","activescripteventconsumer","register-wmievent","set-wmiinstance","new-ciminstance","invoke-cimmethod","mofcomp.exe"), 1, 0),
+    Stage_DefEvasion = iff(Cmd has_any ("win32_shadowcopy","shadowcopy") and Cmd has "delete", 1, 0),
+    Stage_RemoteExec_Target = iff(ParentName == "wmiprvse.exe" and ProcName in~ ("cmd.exe","powershell.exe","pwsh.exe","mshta.exe","rundll32.exe","wscript.exe","cscript.exe","regsvr32.exe"), 1, 0),
+    Stage_Persist_Exec = iff(ParentName == "scrcons.exe" and ProcName in~ ("cmd.exe","powershell.exe","pwsh.exe","mshta.exe","rundll32.exe","wscript.exe","cscript.exe"), 1, 0)
+| extend StageScore =
+    case(Stage_Persist_Exec == 1, W_Persist_Exec,
+         Stage_Persist_Create == 1, W_Persist_Create,
+         Stage_RemoteExec_Source == 1, W_RemoteExec_Source,
+         Stage_RemoteExec_Target == 1, W_RemoteExec_Target,
+         Stage_DefEvasion == 1, W_DefEvasion,
+         Stage_Recon == 1, W_Recon,
+         0)
+| where StageScore > 0
+| extend TimeBucket = bin(TimeGenerated, window)
+| summarize
+    FinalScore = sum(StageScore),
+    ReconScore = sumif(StageScore, Stage_Recon == 1),
+    ExecSource = sumif(StageScore, Stage_RemoteExec_Source == 1),
+    ExecTarget = sumif(StageScore, Stage_RemoteExec_Target == 1),
+    Persist    = sumif(StageScore, Stage_Persist_Create == 1 or Stage_Persist_Exec == 1),
+    DefEvasion = sumif(StageScore, Stage_DefEvasion == 1),
+    Evidence   = make_set(Cmd, 20),
+    Parents    = make_set(Parent, 10),
+    FirstSeen  = min(TimeGenerated),
+    LastSeen   = max(TimeGenerated)
+  by TimeBucket, Computer, Account
+| where FinalScore >= threshold
+| extend Severity =
+    case(Persist > 0, "Critical",
+         ExecTarget > 0, "High",
+         ExecSource > 0, "High",
+         DefEvasion > 0, "High",
+         "Medium")
+| extend HuntingDirectives = strcat(
+    "1) If ExecSource>0: extract /node target(s) from Evidence; validate if Account is authorised.\n",
+    "2) If ExecTarget>0: treat host as COMPROMISED (wmiprvse parent). Investigate child process & payload.\n",
+    "3) If Persist>0: investigate WMI subscription persistence (root\\\\subscription) and remove artefacts.\n",
+    "4) If DefEvasion>0: treat as ransomware staging; validate backup/shadow copies + security service health.\n"
+)
+| project TimeBucket, Severity, FinalScore, Computer, Account,
+          ReconScore, ExecSource, ExecTarget, Persist, DefEvasion,
+          Evidence, Parents, FirstSeen, LastSeen, HuntingDirectives
+| order by FinalScore desc, LastSeen desc;
