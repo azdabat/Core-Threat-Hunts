@@ -1,5 +1,6 @@
 // ============================================================================
 // ClickFix / ErrTraffic Threat Hunts (L2.5 CORE+ + L3) — MDE Advanced Hunting
+// Source: https://www.bleepingcomputer.com/news/security/new-errtraffic-service-enables-clickfix-attacks-via-fake-browser-glitches/
 // Author: Ala Dabat (refactor + hardening applied) - WORK IN PROGRESS (not tested fully)
 // Source context: ErrTraffic automates ClickFix by setting a shell payload into clipboard via browser UI,
 // then socially engineering the user to paste/run it (fake browser glitch / update / font error lure).
