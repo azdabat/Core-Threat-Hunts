@@ -1,0 +1,131 @@
+// ============================================================================
+//  WMI_CHAINED_HUNT_MDE_ONLY_2026 (Logic Hardened)
+// Author: Ala Dabat
+// Platform: Microsoft Defender XDR Advanced Hunting
+// Tables: DeviceProcessEvents (required), DeviceNetworkEvents (optional hints)
+// Version: 2026-01-04
+//
+//   FIXES APPLIED
+//   - RemoteExec weight bumped to 75 so Recon+Exec crosses threshold.
+//   - No cross-host join attempt; victim vs attacker surfaces independently.
+// ============================================================================
+
+let lookback  = 7d;
+let window    = 4h;
+let threshold = 80;
+
+let W_Recon             = 10;
+let W_DefEvasion        = 40;
+let W_RemoteExec_Source = 75;
+let W_RemoteExec_Target = 75;
+let W_Persist_Create    = 90;
+let W_Persist_Exec      = 90;
+
+let ReconClasses = dynamic(["qfe","quickfixengineering","process","useraccount","group","startup","product","service","os","computersystem","logicaldisk","share","networkadapter","bios"]);
+let RemoteExecTokens = dynamic(["/node:","/node=","process call create","win32_process","invoke-wmimethod"]);
+let PersistTokens = dynamic(["root\\subscription","root/subscription","__eventfilter","__eventconsumer","__filtertoconsumerbinding","commandlineeventconsumer","activescripteventconsumer","register-wmievent","set-wmiinstance","new-ciminstance","invoke-cimmethod","mofcomp.exe"]);
+let DefEvasionTokens = dynamic(["win32_service","call stopservice","call deleteservice","win32_shadowcopy","shadowcopy","delete","securitycenter2","antivirusproduct"]);
+
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Proc   = tolower(FileName)
+| extend Parent = tolower(InitiatingProcessFileName)
+| extend Cmd    = tolower(ProcessCommandLine)
+| extend Account = coalesce(AccountName, InitiatingProcessAccountName)
+| extend TimeBucket = bin(Timestamp, window)
+| project Timestamp, TimeBucket, DeviceId, DeviceName, Account, Proc, Parent, Cmd;
+
+// Attacker stages
+let Attacker =
+Base
+| extend
+    IsRecon = iff(Proc == "wmic.exe" and Cmd has " get " and Cmd has_any(ReconClasses), 1, 0),
+    IsRemoteSource = iff(Proc == "wmic.exe" and Cmd has_any(RemoteExecTokens), 1, 0),
+    IsPersistCreate = iff((Proc in~ ("powershell.exe","pwsh.exe","wmic.exe","mofcomp.exe") and Cmd has_any(PersistTokens))
+                          and Cmd has_any("__eventfilter","__eventconsumer","__filtertoconsumerbinding","root\\subscription","mofcomp.exe"), 1, 0),
+    IsDefEvasion = iff(Proc == "wmic.exe" and Cmd has_any(DefEvasionTokens), 1, 0)
+| extend Score =
+    case(IsPersistCreate == 1, W_Persist_Create,
+         IsRemoteSource == 1, W_RemoteExec_Source,
+         IsDefEvasion == 1, W_DefEvasion,
+         IsRecon == 1, W_Recon,
+         0)
+| where Score > 0
+| summarize
+    BaseScore = sum(Score),
+    ReconScore = sumif(Score, IsRecon == 1),
+    ExecSourceScore = sumif(Score, IsRemoteSource == 1),
+    PersistCreateScore = sumif(Score, IsPersistCreate == 1),
+    DefEvasionScore = sumif(Score, IsDefEvasion == 1),
+    EvidenceCmds = make_set(Cmd, 20),
+    Parents = make_set(Parent, 10),
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp)
+  by TimeBucket, DeviceId, DeviceName, Account;
+
+// Victim effects
+let Effects =
+Base
+| where Parent in~ ("wmiprvse.exe","scrcons.exe")
+| extend
+    IsRemoteTarget = iff(Parent == "wmiprvse.exe", 1, 0),
+    IsPersistExec  = iff(Parent == "scrcons.exe", 1, 0)
+| where Proc in~ ("cmd.exe","powershell.exe","pwsh.exe","mshta.exe","rundll32.exe","wscript.exe","cscript.exe","regsvr32.exe")
+      or Cmd has_any ("-enc","frombase64string","iex","downloadstring","http","https","\\\\")
+| extend Score =
+    case(IsPersistExec == 1, W_Persist_Exec,
+         IsRemoteTarget == 1, W_RemoteExec_Target,
+         0)
+| where Score > 0
+| extend EffectEvidence = strcat(Parent, " -> ", Proc, " :: ", Cmd)
+| summarize
+    EffectScore = sum(Score),
+    ExecTargetScore = sumif(Score, IsRemoteTarget == 1),
+    PersistExecScore = sumif(Score, IsPersistExec == 1),
+    EffectEvidences = make_set(EffectEvidence, 10)
+  by TimeBucket, DeviceId, DeviceName, Account;
+
+// RPC hints (optional)
+let RpcHints =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| extend NProc = tolower(InitiatingProcessFileName)
+| where NProc in~ ("wmic.exe","powershell.exe","pwsh.exe")
+| where RemotePort == 135 or RemotePort between (49152 .. 65535)
+| summarize RpcDestIPs = make_set(RemoteIP, 25), RpcPorts = make_set(RemotePort, 25)
+  by DeviceId;
+
+Attacker
+| join kind=leftouter Effects on TimeBucket, DeviceId, DeviceName, Account
+| extend EffectScore = coalesce(EffectScore, 0),
+         ExecTargetScore = coalesce(ExecTargetScore, 0),
+         PersistExecScore = coalesce(PersistExecScore, 0),
+         FinalScore = BaseScore + EffectScore
+| where FinalScore >= threshold
+| join kind=leftouter RpcHints on DeviceId
+| extend Severity =
+    case(PersistCreateScore > 0 or PersistExecScore > 0, "Critical",
+         ExecTargetScore > 0, "High",
+         ExecSourceScore > 0, "High",
+         DefEvasionScore > 0, "High",
+         "Medium")
+| extend ChainSummary = strcat(
+    "Recon:", tostring(ReconScore), " | ",
+    "Exec(Source):", tostring(ExecSourceScore), " | ",
+    "Exec(Target):", tostring(ExecTargetScore), " | ",
+    "Persist(Create):", tostring(PersistCreateScore), " | ",
+    "Persist(Exec):", tostring(PersistExecScore), " | ",
+    "Defense:", tostring(DefEvasionScore)
+)
+| extend HuntingDirectives = strcat(
+    "1) If Exec(Source)>0: extract /node targets from EvidenceCmds; validate admin legitimacy.\n",
+    "2) If Exec(Target)>0: host is COMPROMISED (wmiprvse spawned payload) — investigate EffectEvidences.\n",
+    "3) If Persist(Create/Exec)>0: investigate WMI subscription persistence and remove artefacts.\n",
+    "4) If Defense>0: treat as ransomware staging; validate backup/shadow copies + service health.\n",
+    "5) Use RpcDestIPs/RpcPorts as supporting context only."
+)
+| project TimeBucket, Severity, FinalScore, DeviceName, DeviceId, Account,
+          ChainSummary, EvidenceCmds, Parents, EffectEvidences,
+          RpcDestIPs, RpcPorts, FirstSeen, LastSeen, HuntingDirectives
+| order by FinalScore desc, LastSeen desc;
