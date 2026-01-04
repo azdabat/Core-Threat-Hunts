@@ -1,0 +1,351 @@
+// ============================================================================
+// ClickFix / ErrTraffic Threat Hunts (L2.5 CORE+ + L3) — MDE Advanced Hunting
+// Author: Ala Dabat (refactor + hardening applied) - WORK IN PROGRESS (not tested fully)
+// Source context: ErrTraffic automates ClickFix by setting a shell payload into clipboard via browser UI,
+// then socially engineering the user to paste/run it (fake browser glitch / update / font error lure).
+//
+// HARDENING APPLIED (per audit)
+//   ✔ Network lineage: correlate outbound from the shell PID OR its near-time child processes (curl/certutil/bits/etc.)
+//   ✔ "vmmem attribution gap": allow net confirmation by time-window on same device even if Proc attribution shifts
+//   ✔ Schema consistency: uses MDE tables/fields (Timestamp, ActionType, ProcessId/InitiatingProcessId, etc.)
+//   ✔ No FileProfile dependency; org-prevalence via dcount(DeviceId)
+//
+// Tables used:
+//   - DeviceEvents          (SetClipboardData)
+//   - DeviceProcessEvents   (shell exec + lineage + child spawn)
+//   - DeviceNetworkEvents   (fast outbound confirmation)
+//   - DeviceFileEvents      (optional payload drop + org prevalence)
+//
+// IMPORTANT
+// - These are THREAT HUNTS (not scheduled analytics). Tune allowlists before promotion.
+// - Clipboard text visibility depends on tenant settings/telemetry availability.
+// ============================================================================
+
+
+
+// ============================================================================
+// HUNT 1/2 — L2.5 CORE+ : Clipboard → Suspicious Shell Execution (behavioural breadth)
+// ============================================================================
+
+let Lookback = 45m;
+let CorrelationWindow = 10m;
+
+let BrowserBins = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe"]);
+let ShellBins   = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe"]);
+let SuspShellTokens = dynamic([
+  "-enc","-encodedcommand","frombase64string","iex","invoke-expression",
+  "downloadstring","downloadfile","system.net.webclient","invoke-webrequest","iwr","irm",
+  "start-bitstransfer","bitsadmin","certutil","curl ","wget ","http://","https://",
+  "-w hidden","-windowstyle hidden","-nop","-noprofile","-ep bypass","bypass"
+]);
+
+// 1) Browser sets clipboard (ClickFix "Copy" or overlay/CTRL+C lures still land here)
+let ClipboardSet =
+DeviceEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType == "SetClipboardData"
+| where InitiatingProcessFileName in~ (BrowserBins)
+| extend AF = parse_json(AdditionalFields)
+| extend ClipboardText = tostring(coalesce(AF.ClipboardText, AF.ClipboardData, AF.Text, AF.Data))
+| extend ClipboardLen = strlen(ClipboardText)
+| extend ClipboardLooksLikeCommand =
+    iif(
+      ClipboardLen between (25 .. 5000)
+      and tolower(ClipboardText) has_any ("powershell","pwsh","cmd","mshta","rundll32","regsvr32","wscript","cscript","http://","https://","-enc","iex","downloadstring"),
+      1, 0
+    )
+| project
+    ClipboardTime = Timestamp,
+    DeviceId, DeviceName,
+    Browser = InitiatingProcessFileName,
+    BrowserCmd = InitiatingProcessCommandLine,
+    BrowserPid = InitiatingProcessId,
+    Account = coalesce(InitiatingProcessAccountName, AccountName),
+    ClipboardText,
+    ClipboardLen,
+    ClipboardLooksLikeCommand;
+
+// 2) Suspicious shell exec (paste payload traits)
+let SuspShellExec =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType == "ProcessCreated"
+| where FileName in~ (ShellBins)
+| extend Cmd = tostring(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName)
+| extend HasSuspTokens = iif(tolower(Cmd) has_any (SuspShellTokens), 1, 0)
+| extend EncodedLike = iif(Cmd has_any (" -enc"," -e ","-EncodedCommand") or Cmd matches regex @"[A-Za-z0-9\+/]{80,}={0,2}", 1, 0)
+| extend WebFetchLike = iif(tolower(Cmd) has_any ("downloadstring","downloadfile","invoke-webrequest","iwr","irm","start-bitstransfer","certutil","bitsadmin","curl ","wget ","http://","https://"), 1, 0)
+| where HasSuspTokens == 1 or EncodedLike == 1 or WebFetchLike == 1
+| project
+    ShellTime = Timestamp,
+    DeviceId, DeviceName,
+    ShellProc = FileName,
+    ShellCmd  = Cmd,
+    ShellPid  = ProcessId,
+    Account   = coalesce(AccountName, InitiatingProcessAccountName),
+    ParentProc = Parent,
+    ParentCmd  = InitiatingProcessCommandLine,
+    EncodedLike, WebFetchLike;
+
+// 3) Correlate: browser clipboard-set -> shell within window
+ClipboardSet
+| join kind=inner (SuspShellExec) on DeviceId
+| where ShellTime between (ClipboardTime .. ClipboardTime + CorrelationWindow)
+| extend SameAccount = iif(isnotempty(Account) and Account == Account1, 1, 0)
+| extend DeltaSec = datetime_diff("second", ShellTime, ClipboardTime)
+| extend Score =
+      (35 * ClipboardLooksLikeCommand)
+    + (25 * EncodedLike)
+    + (25 * WebFetchLike)
+    + (10 * SameAccount)
+    + (5  * iif(ParentProc in~ (BrowserBins) or ParentProc =~ "explorer.exe", 1, 0))
+| extend Severity = case(Score >= 75, "HIGH", Score >= 55, "MEDIUM", "LOW")
+| where Severity != "LOW"
+| project
+    Timestamp = ShellTime,
+    Severity,
+    Score,
+    DeviceName,
+    Account = coalesce(Account1, Account),
+    Browser, BrowserCmd,
+    ClipboardTime, ClipboardLen, ClipboardText,
+    ShellProc, ShellCmd, ParentProc, ParentCmd,
+    DeltaSec
+| order by Score desc, Timestamp desc;
+
+
+
+// ============================================================================
+// HUNT 2/2 — L3 : Confirmed Chain (Clipboard → Shell → Lineage Network and/or Rare Drop)
+// Adds PID/lineage correlation, optional prevalence filter, and dev/vmmem tolerance.
+// ============================================================================
+
+let LookbackL3 = 2h;
+let ClipToShell = 10m;
+let ShellToNet  = 3m;
+let ShellToDrop = 7m;
+
+// Allowlist toggles (OFF by default; tune per tenant)
+let EnableAllowlist = false;
+let Allow_Accounts = dynamic(["CONTOSO\\RedTeam","CONTOSO\\ITDeploySvc"]);
+let Allow_Parents  = dynamic(["ccmexec.exe","intune.exe","sccmexec.exe"]);
+
+let BrowserBinsL3 = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe"]);
+let ShellBinsL3   = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe"]);
+let LineageNetBins = dynamic(["curl.exe","wget.exe","bitsadmin.exe","certutil.exe","powershell.exe","pwsh.exe","cmd.exe","mshta.exe","rundll32.exe","regsvr32.exe"]);
+let SuspShellTokensL3 = dynamic([
+  "-enc","-encodedcommand","frombase64string","iex","invoke-expression",
+  "downloadstring","downloadfile","system.net.webclient","invoke-webrequest","iwr","irm",
+  "start-bitstransfer","bitsadmin","certutil","curl ","wget ","http://","https://",
+  "-w hidden","-windowstyle hidden","-nop","-noprofile","-ep bypass","bypass"
+]);
+
+// Org prevalence for dropped payloads (estate-only)
+let PrevWindow = 30d;
+let PrevThresholdDevices = 50;
+let OrgPrevalence =
+DeviceFileEvents
+| where Timestamp >= ago(PrevWindow)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| where isnotempty(SHA256)
+| summarize OrgDeviceCount = dcount(DeviceId) by SHA256;
+
+// 1) Clipboard events
+let Clip =
+DeviceEvents
+| where Timestamp >= ago(LookbackL3)
+| where ActionType == "SetClipboardData"
+| where InitiatingProcessFileName in~ (BrowserBinsL3)
+| extend AF = parse_json(AdditionalFields)
+| extend ClipText = tostring(coalesce(AF.ClipboardText, AF.ClipboardData, AF.Text, AF.Data))
+| extend ClipTextLower = tolower(ClipText)
+| where strlen(ClipText) between (25 .. 6000)
+| extend ClipLooksLikePS =
+    iif(ClipTextLower has_any ("powershell","pwsh","-enc","downloadstring","invoke-webrequest"," iwr"," irm","frombase64string","iex"), 1, 0)
+| extend ClipHasUrl = iif(ClipTextLower has "http://" or ClipTextLower has "https://", 1, 0)
+| project
+    ClipTime = Timestamp,
+    DeviceId, DeviceName,
+    ClipAccount = coalesce(InitiatingProcessAccountName, AccountName),
+    BrowserProc = InitiatingProcessFileName,
+    BrowserCmd  = InitiatingProcessCommandLine,
+    ClipText,
+    ClipLooksLikePS,
+    ClipHasUrl;
+
+// 2) Shell exec (capture PID)
+let Shell =
+DeviceProcessEvents
+| where Timestamp >= ago(LookbackL3)
+| where ActionType == "ProcessCreated"
+| where FileName in~ (ShellBinsL3)
+| extend ShellCmd = tostring(ProcessCommandLine)
+| extend ShellCmdLower = tolower(ShellCmd)
+| extend ParentProc = tostring(InitiatingProcessFileName)
+| extend HasSusp = iif(ShellCmdLower has_any (SuspShellTokensL3), 1, 0)
+| extend EncodedLike = iif(ShellCmd has_any (" -enc"," -e ","-EncodedCommand") or ShellCmd matches regex @"[A-Za-z0-9\+/]{80,}={0,2}", 1, 0)
+| extend WebFetchLike = iif(ShellCmdLower has_any ("downloadstring","downloadfile","invoke-webrequest","iwr","irm","start-bitstransfer","certutil","bitsadmin","curl ","wget ","http://","https://"), 1, 0)
+| where HasSusp == 1 or EncodedLike == 1 or WebFetchLike == 1
+| project
+    ShellTime = Timestamp,
+    DeviceId, DeviceName,
+    ShellProc = FileName,
+    ShellCmd,
+    ShellCmdLower,
+    ShellPid = ProcessId,
+    ShellAccount = coalesce(AccountName, InitiatingProcessAccountName),
+    ParentProc,
+    ParentCmd = InitiatingProcessCommandLine,
+    EncodedLike, WebFetchLike;
+
+// 3) Build lineage set: shell PID + near-time child PIDs (curl/certutil/bits/etc.)
+let ChildLineage =
+DeviceProcessEvents
+| where Timestamp >= ago(LookbackL3)
+| where ActionType == "ProcessCreated"
+| where FileName in~ (LineageNetBins)
+| project
+    ChildTime = Timestamp,
+    DeviceId, DeviceName,
+    ChildProc = FileName,
+    ChildCmd  = ProcessCommandLine,
+    ChildPid  = ProcessId,
+    ParentPid = InitiatingProcessId;
+
+// 4) Network events (keep both explicit process attribution and a device/time fallback for vmmem cases)
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(LookbackL3)
+| where ActionType == "ConnectionSuccess"
+| project
+    NetTime = Timestamp,
+    DeviceId, DeviceName,
+    NetPid = ProcessId,
+    NetProc = InitiatingProcessFileName,
+    NetCmd  = InitiatingProcessCommandLine,
+    RemoteUrl, RemoteIP, RemotePort;
+
+// 5) Optional payload drops (supporting)
+let Drops =
+DeviceFileEvents
+| where Timestamp >= ago(LookbackL3)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| where tolower(FileName) endswith ".exe" or tolower(FileName) endswith ".dll" or tolower(FileName) endswith ".js" or tolower(FileName) endswith ".vbs" or tolower(FileName) endswith ".ps1"
+| project
+    DropTime = Timestamp,
+    DeviceId, DeviceName,
+    DroppedFile = FileName,
+    DroppedPath = FolderPath,
+    DroppedSHA256 = SHA256,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine,
+    DropperPid  = InitiatingProcessId;
+
+// 6) Correlate: clipboard -> shell
+let Chain =
+Clip
+| join kind=inner (Shell) on DeviceId
+| where ShellTime between (ClipTime .. ClipTime + ClipToShell)
+| extend SameAcct = iif(isnotempty(ClipAccount) and isnotempty(ShellAccount) and ClipAccount == ShellAccount, 1, 0)
+| extend ClipToShellSec = datetime_diff("second", ShellTime, ClipTime);
+
+// 7) Attach child lineage within shell->net window
+let ChainWithChildren =
+Chain
+| join kind=leftouter (
+    ChildLineage
+) on DeviceId
+| where isnull(ChildTime) or (ChildTime between (ShellTime .. ShellTime + ShellToNet))
+| extend IsShellChild = iif(ParentPid == ShellPid, 1, 0)
+| summarize
+    arg_max(ShellTime, *) ,
+    ChildPids = make_set_if(ChildPid, IsShellChild == 1, 50),
+    ChildProcs = make_set_if(ChildProc, IsShellChild == 1, 50),
+    ChildCmds = make_set_if(ChildCmd, IsShellChild == 1, 20)
+  by DeviceId, DeviceName, ShellPid, ClipTime;
+
+// 8) Network confirmation:
+//    - strict: NetPid == ShellPid OR NetPid in ChildPids
+//    - fallback: same device + near-time + suspicious port/url even if attribution shifts (vmmem/dev boxes)
+ChainWithChildren
+| join kind=leftouter (Net) on DeviceId
+| extend InLineage =
+    iif(NetPid == ShellPid or (array_length(ChildPids) > 0 and NetPid in (ChildPids)), 1, 0)
+| extend NetNear = iif(isnotempty(NetTime) and NetTime between (ShellTime .. ShellTime + ShellToNet), 1, 0)
+| extend SuspNetPort = iif(RemotePort !in (80,443,53) and RemotePort != 0, 1, 0)
+| extend HasUrlInShell = iif(ShellCmdLower has "http://" or ShellCmdLower has "https://", 1, 0)
+| extend NetFallback = iif(NetNear == 1 and (SuspNetPort == 1 or isnotempty(RemoteUrl)), 1, 0)
+| extend NetConfirmed = iif(InLineage == 1 and NetNear == 1, 1, 0)
+| extend NetConfirmedOrFallback = iif(NetConfirmed == 1 or NetFallback == 1, 1, 0);
+
+// 9) Attach drops + prevalence
+| join kind=leftouter (
+    Drops
+    | join kind=leftouter OrgPrevalence on $left.DroppedSHA256 == $right.SHA256
+) on DeviceId
+| extend DropNear = iif(isnotempty(DropTime) and DropTime between (ShellTime .. ShellTime + ShellToDrop), 1, 0)
+| extend RareDrop = iif(isnotempty(DroppedSHA256) and coalesce(OrgDeviceCount, 0) <= PrevThresholdDevices, 1, 0);
+
+// 10) Allowlist gates (toggleable)
+| extend AllowHit =
+    iif(
+      EnableAllowlist == true and (
+        (ClipAccount in~ (Allow_Accounts)) or
+        (ShellAccount in~ (Allow_Accounts)) or
+        (ParentProc in~ (Allow_Parents))
+      ),
+      1, 0
+    )
+| where AllowHit == 0;
+
+// 11) L3 scoring (tight scope, confirmation weighted)
+| extend L3Score =
+      (35 * ClipLooksLikePS)
+    + (20 * ClipHasUrl)
+    + (25 * EncodedLike)
+    + (20 * WebFetchLike)
+    + (10 * SameAcct)
+    + (30 * NetConfirmed)               // strongest confirmation
+    + (15 * iif(NetConfirmed==0 and NetFallback==1, 1, 0))  // vmmem/dev fallback (lower weight)
+    + (10 * HasUrlInShell)
+    + (10 * SuspNetPort)
+    + (15 * DropNear)
+    + (15 * RareDrop)
+    + (10 * iif(ParentProc in~ (BrowserBinsL3) or ParentProc =~ "explorer.exe", 1, 0))
+| extend L3Severity = case(L3Score >= 110, "CRITICAL", L3Score >= 85, "HIGH", L3Score >= 60, "MEDIUM", "LOW")
+| where L3Severity != "LOW";
+
+// 12) Output + directives
+| extend MITRE = dynamic(["TA0001","TA0002","TA0011","T1059","T1105","T1027","T1204"])
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] ClickFix/ErrTraffic chain suspected on ", DeviceName, " | Account=", coalesce(ShellAccount, ClipAccount)),
+    strcat("[CHAIN] ClipboardSet(", tostring(ClipTime), ") -> ShellExec(", tostring(ShellTime), ") delta=", tostring(ClipToShellSec), "s"),
+    strcat("[SHELL] ", ShellProc, " (PID ", tostring(ShellPid), ") | Parent=", ParentProc),
+    iif(array_length(ChildProcs) > 0, strcat("[LINEAGE] Child procs near-time: ", strcat_array(ChildProcs, ", ")), "[LINEAGE] No child procs observed in window (could be inline net)."),
+    iif(EncodedLike==1, "[SIGNAL] Encoded/obfuscated execution present (-enc/Base64-like).", ""),
+    iif(WebFetchLike==1, "[SIGNAL] Web fetch / stager semantics present (iwr/irm/webclient/downloadstring/certutil/bits/curl/wget).", ""),
+    iif(NetConfirmed==1, strcat("[NET] CONFIRMED via lineage: ", tostring(NetTime), " -> ", coalesce(RemoteUrl, RemoteIP), ":", tostring(RemotePort)),
+       iif(NetFallback==1, strcat("[NET] FALLBACK (attrib gap/dev/vmmem): ", tostring(NetTime), " -> ", coalesce(RemoteUrl, RemoteIP), ":", tostring(RemotePort)),
+          "[NET] No fast outbound confirmation (could be blocked/offline).")),
+    iif(DropNear==1, strcat("[DROP] Near-time drop: ", DroppedPath, "\\", DroppedFile, " | OrgDeviceCount=", tostring(coalesce(OrgDeviceCount,0))), "[DROP] No near-time payload drop (possible fileless)."),
+    "[NEXT] Pivot ClipboardText + ShellCmd across estate; validate user interaction (fake glitch/update prompt) and browser session.",
+    "[NEXT] If lineage-confirmed net: pivot RemoteIP/RemoteUrl across DeviceNetworkEvents; identify additional impacted hosts.",
+    "[NEXT] If RareDrop: pivot DroppedSHA256/path; acquire file + detonate; hunt persistence and follow-on C2.",
+    "[CONTAIN] If unauthorized: isolate device; prioritize forensic/memory collection before isolation where policy allows."
+)
+| project
+    Timestamp = ShellTime,
+    L3Severity,
+    Score = L3Score,
+    DeviceName,
+    Account = coalesce(ShellAccount, ClipAccount),
+    BrowserProc, BrowserCmd,
+    ClipTime, ClipText,
+    ShellProc, ShellCmd, ShellPid, ParentProc, ParentCmd,
+    NetConfirmed, NetFallback, NetTime, NetProc, NetPid, RemoteUrl, RemoteIP, RemotePort,
+    ChildPids, ChildProcs, ChildCmds,
+    DropNear, DropTime, DroppedFile, DroppedPath, DroppedSHA256, OrgDeviceCount, RareDrop,
+    MITRE,
+    HuntingDirectives
+| order by Score desc, Timestamp desc;
