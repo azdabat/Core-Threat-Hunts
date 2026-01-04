@@ -5,7 +5,7 @@
 // Platform: Microsoft Defender XDR (MDE Advanced Hunting)
 // Version: 2026-01 (Windows-observable refactor)
 //
-// WHY THIS REFACTOR (CHANGE LOG / GEMINI AUDIT)
+// WHY THIS REFACTOR (There is no shame in AI assisted rule evolution! ;) 
 // - Removed Linux-path file telemetry assumptions (/etc/shadow, /etc/sudoers) from DeviceFileEvents.
 //   Reason: WSL2 Linux filesystem lives inside ext4.vhdx (utility VM). Windows MDE generally cannot
 //   see internal Linux file modifications, so /etc/* signals are a telemetry wall.
