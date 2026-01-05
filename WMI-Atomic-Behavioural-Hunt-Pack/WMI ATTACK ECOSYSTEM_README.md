@@ -44,6 +44,7 @@ Threat actors use WMI to:
 ## 3. The WMI Attack Ecosystem (High-Level)
 
 Recon → Remote Execution → Victim Execution → Persistence → Defense Evasion
+
 ↘ Process-less Execution (Blind Spot)
 
 
