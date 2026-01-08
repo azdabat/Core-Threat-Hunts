@@ -1,0 +1,13 @@
+// ============================================================================
+// L3_DLL_Sideload_BYOVD_CHAIN_UNIFIED (Sentinel + MDE)
+// Author: Ala Dabat
+// Platform: Sentinel with MDE tables (Microsoft Defender connector)
+// Data: DeviceFileEvents, DeviceImageLoadEvents, DeviceRegistryEvents, DeviceNetworkEvents
+// MITRE: T1574.001, T1105, T1547.001, T1543.003
+// Version: 2026-01-08
+// ============================================================================
+//
+// NOTE: This is intentionally identical to the MDE-only logic for performance.
+// Sentinel-specific enrichment (e.g., SecurityEvent 7045 service creation) can be bolted on
+// as a follow-up join if your tenant needs it.
+//
