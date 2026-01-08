@@ -1,0 +1,66 @@
+// ============================================================================
+// L3_DLL_SIDELOAD_CHAIN_SENTINEL_ONLY (Sysmon-Preferred)
+// Author: Ala Dabat
+// Platform: Microsoft Sentinel
+// Data (Preferred): Event (Sysmon EID 11/7/13), SecurityEvent (4688)
+// MITRE: T1574.001, T1105, T1547.001, T1543.003
+// Version: 2026-01-08
+// ============================================================================
+
+let lookback = 14d;
+let window = 5m;
+
+let WritableRx = @"(?i)^[a-z]:\\(users\\|programdata\\|windows\\temp\\|temp\\|windows\\tasks\\)";
+
+let SysmonFileCreate =
+Event
+| where TimeGenerated >= ago(lookback)
+| where EventLog == "Microsoft-Windows-Sysmon/Operational"
+| where EventID == 11
+| extend TargetFilename = tostring(EventData.TargetFilename)
+| where TargetFilename matches regex WritableRx
+| where TargetFilename endswith ".dll" or TargetFilename endswith ".sys"
+| project DropTime=TimeGenerated, Computer, TargetFilename, Hashes=tostring(EventData.Hashes), ProcessGuid=tostring(EventData.ProcessGuid);
+
+let SysmonImageLoad =
+Event
+| where TimeGenerated >= ago(lookback)
+| where EventLog == "Microsoft-Windows-Sysmon/Operational"
+| where EventID == 7
+| extend ImageLoaded = tostring(EventData.ImageLoaded), Image=tostring(EventData.Image)
+| where ImageLoaded matches regex WritableRx
+| where ImageLoaded endswith ".dll"
+| project LoadTime=TimeGenerated, Computer, Image, ImageLoaded, ProcessGuid=tostring(EventData.ProcessGuid);
+
+let SysmonRegSet =
+Event
+| where TimeGenerated >= ago(lookback)
+| where EventLog == "Microsoft-Windows-Sysmon/Operational"
+| where EventID == 13
+| extend TargetObject=tostring(EventData.TargetObject), Details=tostring(EventData.Details), Image=tostring(EventData.Image)
+| where tolower(TargetObject) has_any ("\\currentversion\\run","\\runonce","\\winlogon\\shell","\\winlogon\\userinit","\\services\\")
+| project RegTime=TimeGenerated, Computer, Image, TargetObject, Details, ProcessGuid=tostring(EventData.ProcessGuid);
+
+SysmonFileCreate
+| join kind=leftouter (SysmonImageLoad) on Computer
+| where isnull(LoadTime) or LoadTime between (DropTime .. DropTime + window)
+| extend HasLoad = toint(isnotempty(LoadTime))
+| join kind=leftouter (SysmonRegSet) on Computer
+| where isnull(RegTime) or RegTime between (DropTime .. DropTime + window)
+| extend HasPersist = toint(isnotempty(TargetObject))
+| extend Score =
+    0
+    + iif(HasLoad==1, 60, 0)
+    + iif(HasPersist==1, 30, 0)
+    + 10 // drop in writable path
+| where Score >= 70
+| extend Severity = case(Score >= 90, "CRITICAL", "HIGH")
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] DLL chain (Sentinel/Sysmon) | Host=", Computer, " | Score=", tostring(Score), " | Severity=", Severity),
+    strcat("[DROP] ", TargetFilename),
+    iif(HasLoad==1, strcat("[LOAD] ", Image, " loaded ", ImageLoaded), "[LOAD] Not observed."),
+    iif(HasPersist==1, strcat("[PERSIST] ", TargetObject, " -> ", Details), "[PERSIST] Not observed."),
+    "[NEXT] Validate loader binary + expected DLL locations; collect binary + hashes; pivot in Sysmon for follow-on execution/injection."
+)
+| project DropTime, LoadTime, RegTime, Severity, Score, Computer, TargetFilename, Image, ImageLoaded, TargetObject, Details, HuntingDirectives
+| order by Score desc, DropTime desc
