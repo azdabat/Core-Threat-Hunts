@@ -1,0 +1,124 @@
+// ============================================================================
+// L3_DLL_Sideload_BYOVD_CHAIN_MDE_ONLY (Production-Hardened)
+// Author: Ala Dabat
+// Goal: File drop -> suspicious module load -> persistence (optional) -> network (optional but important)
+// Data: DeviceFileEvents, DeviceImageLoadEvents, DeviceRegistryEvents, DeviceNetworkEvents
+// MITRE: T1574.001 (DLL Search Order Hijacking / Sideload), T1105 (Ingress Tool Transfer),
+//        T1547.001 (Run Keys), T1543.003 (Service), T1068/T1562.* (if BYOVD follow-on)
+// Version: 2026-01-08
+// ============================================================================
+
+let lookback = 14d;
+let window = 5m;
+let DormantDays = 7d;
+
+let WritableUserPaths = dynamic([
+  "c:\\programdata\\","c:\\users\\","c:\\temp\\","c:\\windows\\temp\\","c:\\windows\\tasks\\"
+]);
+
+let BenignLoaders = dynamic(["code.exe","msiexec.exe","setup.exe","trustedinstaller.exe"]);
+let PersistenceKeyFragments = dynamic([
+  "\\currentversion\\run",
+  "\\currentversion\\runonce",
+  "\\winlogon\\shell",
+  "\\winlogon\\userinit",
+  "\\currentversion\\windows\\load",
+  "\\system\\currentcontrolset\\services\\"
+]);
+
+let Drops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".dll" or FileName endswith ".sys"
+| where tolower(FolderPath) has_any (WritableUserPaths)
+| extend DropperProc = tolower(InitiatingProcessFileName),
+         DropperCL   = tolower(InitiatingProcessCommandLine),
+         DropperSHA256 = InitiatingProcessSHA256,
+         DropperPid  = InitiatingProcessId,
+         DroppedSHA256 = SHA256
+| project DropTime=Timestamp, DeviceId, DeviceName, FileName, FolderPath, DroppedSHA256,
+          IsDriver = toint(FileName endswith ".sys"),
+          DropperProc, DropperCL, DropperSHA256, DropperPid, AccountName=InitiatingProcessAccountName;
+
+let Loads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".dll"
+| extend LoaderProc = tolower(InitiatingProcessFileName),
+         LoaderCL   = tolower(InitiatingProcessCommandLine),
+         LoaderSigned = tostring(InitiatingProcessSignatureStatus),
+         LoaderSHA256 = InitiatingProcessSHA256,
+         LoaderPid  = InitiatingProcessId
+| where LoaderProc !in~ (BenignLoaders)
+| project LoadTime=Timestamp, DeviceId, LoadedDllSHA256=SHA256, LoadedDllName=tolower(FileName), LoadedDllPath=tolower(FolderPath),
+          LoaderProc, LoaderCL, LoaderSigned, LoaderSHA256, LoaderPid;
+
+let Persist =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "RegistryValueSet"
+| extend KeyLower = tolower(RegistryKey)
+| where KeyLower has_any (PersistenceKeyFragments)
+| extend PersistProc = tolower(InitiatingProcessFileName),
+         PersistCL   = tolower(InitiatingProcessCommandLine),
+         PersistSHA256 = InitiatingProcessSHA256,
+         PersistPid  = InitiatingProcessId
+| project RegTime=Timestamp, DeviceId, RegistryKey, RegistryValueName, RegistryValueData,
+          PersistProc, PersistCL, PersistSHA256, PersistPid;
+
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where ActionType has "Connection" or ActionType has "Connect"
+| extend NetProc = tolower(InitiatingProcessFileName),
+         NetCL   = tolower(InitiatingProcessCommandLine),
+         NetSHA256 = InitiatingProcessSHA256,
+         NetPid  = InitiatingProcessId
+| extend UrlLower = tolower(coalesce(RemoteUrl,""))
+| extend HasPayloadExt = toint(UrlLower has_any (".dll",".sys",".exe"))
+| extend IsPublicIP = toint(not(RemoteIP startswith "10." or RemoteIP startswith "192.168." or RemoteIP startswith "172.16." or RemoteIP startswith "172.17." or RemoteIP startswith "172.18." or RemoteIP startswith "172.19." or RemoteIP startswith "172.2"))
+| project NetTime=Timestamp, DeviceId, RemoteIP, RemotePort, RemoteUrl, HasPayloadExt, IsPublicIP,
+          NetProc, NetCL, NetSHA256, NetPid;
+
+Drops
+| join kind=leftouter (Loads) on DeviceId and $left.DroppedSHA256 == $right.LoadedDllSHA256
+| where isnull(LoadTime) or LoadTime between (DropTime .. DropTime + window)
+| extend HasSideload = toint(isnotempty(LoadTime))
+
+| join kind=leftouter (Persist) on DeviceId and $left.DropperSHA256 == $right.PersistSHA256
+| where isnull(RegTime) or RegTime between (DropTime .. DropTime + window)
+| extend HasPersistence = toint(isnotempty(RegistryKey))
+
+| join kind=leftouter (Net) on DeviceId and $left.DropperSHA256 == $right.NetSHA256
+| where isnull(NetTime) or NetTime between (DropTime .. DropTime + window)
+| extend HasNetwork = toint(isnotempty(RemoteIP))
+
+| extend Score =
+    0
+    + iif(HasSideload==1, 60, 0)
+    + iif(HasPersistence==1, 25, 0)
+    + iif(HasNetwork==1 and IsPublicIP==1, 25, 0)
+    + iif(HasNetwork==1 and HasPayloadExt==1, 10, 0)
+    + iif(IsDriver==1, 10, 0)
+    + iif(IsDriver==1 and DropTime <= ago(DormantDays) and HasPersistence==1 and HasSideload==0, 30, 0) // dormant driver + persistence
+
+| extend Severity = case(Score >= 90, "CRITICAL", Score >= 70, "HIGH", "MEDIUM")
+| where Score >= 70
+
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] DLL/BYOVD chain | Host=", DeviceName, " | User=", AccountName, " | Score=", tostring(Score), " | Severity=", Severity),
+    strcat("[DROP] ", FileName, " @ ", FolderPath, " | SHA256=", tostring(DroppedSHA256)),
+    iif(HasSideload==1, strcat("[LOAD] ", LoaderProc, " (Signed=", LoaderSigned, ") loaded DLL=", LoadedDllName, " from ", LoadedDllPath), "[LOAD] Not observed (possible delayed load)."),
+    iif(HasPersistence==1, strcat("[PERSIST] ", RegistryKey, " -> ", tostring(RegistryValueData)), "[PERSIST] Not observed."),
+    iif(HasNetwork==1, strcat("[NET] ", NetProc, " -> ", tostring(RemoteIP), ":", tostring(RemotePort), " | ", tostring(RemoteUrl)), "[NET] Not observed in window."),
+    "[NEXT] Validate loader legitimacy + expected DLL search order. Pivot on DroppedSHA256 and LoaderSHA256 across estate.",
+    "[IR] If CRITICAL/HIGH: isolate host, collect triage, remove persistence, block hashes/domains/IPs, and review for follow-on injection/credential theft."
+)
+| project DropTime, LoadTime, RegTime, NetTime, Severity, Score,
+          DeviceName, AccountName,
+          FileName, FolderPath, DroppedSHA256,
+          LoaderProc, LoaderSigned, LoaderCL,
+          RegistryKey, RegistryValueName, RegistryValueData,
+          RemoteIP, RemotePort, RemoteUrl,
+          HuntingDirectives
+| order by Score desc, DropTime desc
