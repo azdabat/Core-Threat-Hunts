@@ -1,0 +1,64 @@
+// ============================================================================
+// CORE_KERBEROASTING_CLIENT_HEURISTIC_MDE_ONLY
+// Author: Ala Dabat
+// Audience: L2.5 / L3 Threat Hunters
+// Platform: Microsoft Defender XDR (Advanced Hunting) - MDE-only telemetry
+// Data: DeviceProcessEvents, DeviceNetworkEvents
+// MITRE: T1558.003 (Kerberoasting), TA0006 (Credential Access)
+// Version: 2026-01-08
+// ============================================================================
+
+let lookback = 24h;
+let window = 30m;
+let threshold = 70;
+
+// Tooling / tradecraft tokens (tight, high-signal)
+let KerbToolNames = dynamic(["rubeus.exe","kekeo.exe","mimikatz.exe","sharpview.exe","seatbelt.exe"]);
+let KerbCmdTokens = dynamic(["kerberoast","asreproast","tgtdeleg","/rc4","/nowrap","/format:hashcat","getuserspns","spn","ticket"]);
+let SuspParents = dynamic(["powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe"]);
+
+let Proc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Proc = tolower(FileName), Cmd = tolower(ProcessCommandLine), Parent = tolower(InitiatingProcessFileName)
+| extend IsKerbTool = toint(Proc has_any (KerbToolNames) or Cmd has_any (KerbCmdTokens))
+| extend IsSuspParent = toint(Parent in~ (SuspParents))
+| where IsKerbTool == 1
+| project Timestamp, DeviceId, DeviceName, AccountName, Proc, Cmd, Parent;
+
+let KerbNet =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 88
+| summarize KerbConnections=count(), KerbTargets=dcount(RemoteIP), KerbTargetIPs=make_set(RemoteIP, 10)
+  by DeviceId, DeviceName, AccountName, bin(Timestamp, window);
+
+Proc
+| extend TimeBucket = bin(Timestamp, window)
+| summarize
+    ToolHits = count(),
+    Tools = make_set(Proc, 10),
+    CmdSamples = make_set(Cmd, 10),
+    AnySuspParent = max(IsSuspParent),
+    FirstSeen=min(Timestamp),
+    LastSeen=max(Timestamp)
+  by DeviceId, DeviceName, AccountName, TimeBucket
+| join kind=leftouter (KerbNet) on DeviceId, DeviceName, AccountName, TimeBucket
+| extend KerbConnections = coalesce(KerbConnections, 0), KerbTargets = coalesce(KerbTargets, 0)
+| extend Score =
+    0
+    + iif(ToolHits >= 1, 50, 0)
+    + iif(AnySuspParent == 1, 10, 0)
+    + iif(KerbConnections >= 50, 20, 0)
+    + iif(KerbTargets >= 5, 10, 0)
+| where Score >= threshold
+| extend Severity = case(Score >= 90, "HIGH", "MEDIUM")
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Possible Kerberoast client behavior | Host=", DeviceName, " | User=", AccountName),
+    strcat("[SCORE] ", tostring(Score), " | ToolHits=", tostring(ToolHits), " | Kerberos(88)Connections=", tostring(KerbConnections), " | Targets=", tostring(KerbTargets)),
+    "[NEXT] Confirm tooling execution (process tree, parent). If PowerShell: pull script block logs if available.",
+    "[NEXT] Pivot: search for outbound SMB/WMI/WinRM shortly after (lateral movement), and credential dumping indicators.",
+    "[IR] If confirmed: isolate host, reset exposed creds, review SPN accounts and enforce AES-only + strong passwords."
+)
+| project TimeBucket, Severity, Score, DeviceName, AccountName, Tools, CmdSamples, KerbConnections, KerbTargets, KerbTargetIPs, HuntingDirectives
+| order by Score desc, TimeBucket desc
