@@ -1,0 +1,92 @@
+// ============================================================================
+// CORE_KERBEROASTING_TGS_ANOMALY_SENTINEL_ONLY (Hardened)
+// Author: Ala Dabat
+// Audience: L2.5 / L3 Threat Hunters
+// Platform: Microsoft Sentinel
+// Data: SecurityEvent (EventID 4769)
+// MITRE: T1558.003 (Kerberoasting), TA0006 (Credential Access)
+// Version: 2026-01-08
+// ============================================================================
+
+let Lookback = 24h;
+let BaselineLookback = 7d;
+let SpikeRatioThreshold = 3.0;
+let MinRequests = 20;
+let MinRC4 = 5;
+
+// --- 1) Baseline daily avg per ServiceAccount ---
+let BaselineTGS =
+SecurityEvent
+| where TimeGenerated between (ago(BaselineLookback)..ago(Lookback))
+| where EventID == 4769
+| extend ServiceAccount = tostring(EventData.ServiceName)
+| summarize BaselineRequests = count() by ServiceAccount
+| extend BaselineDailyAvg = todouble(BaselineRequests) / 7.0;
+
+// --- 2) Recent TGS ---
+let RecentTGS =
+SecurityEvent
+| where TimeGenerated >= ago(Lookback)
+| where EventID == 4769
+| extend
+    TicketEncType = tostring(EventData.TicketEncryptionType),
+    ServiceAccount = tostring(EventData.ServiceName),
+    RequestingUser = tostring(EventData.TargetUserName),
+    ClientIP = tostring(EventData.IpAddress),
+    DC = tostring(Computer);
+
+// --- 3) Aggregate ---
+RecentTGS
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen  = max(TimeGenerated),
+    RequestCount = count(),
+    DistinctRequesters = dcount(RequestingUser),
+    DistinctSourceIPs  = dcount(ClientIP),
+    RequestingUsers = make_set(RequestingUser, 15),
+    SourceIPs = make_set(ClientIP, 15),
+    RC4Count = countif(TicketEncType == "0x17"),
+    DCs = make_set(DC, 10)
+  by ServiceAccount
+| join kind=leftouter (BaselineTGS) on ServiceAccount
+| extend BaselineDailyAvg = coalesce(BaselineDailyAvg, 1.0)
+| extend SpikeRatio = todouble(RequestCount) / BaselineDailyAvg
+
+// --- 4) Service-account recon heuristics (safe, naming-based) ---
+| extend LooksLikeSvc =
+    iif(tolower(ServiceAccount) has_any ("svc","service","sql","backup","iis","web","app","db"), 1, 0)
+
+// --- 5) Detection gates ---
+| where
+    RC4Count >= MinRC4
+    or (RequestCount >= MinRequests and SpikeRatio >= SpikeRatioThreshold)
+
+// --- 6) Severity + directives ---
+| extend Severity = case(
+    RC4Count >= 10 and SpikeRatio >= 5.0, "HIGH",
+    RC4Count >= MinRC4 and SpikeRatio >= SpikeRatioThreshold, "HIGH",
+    RC4Count >= MinRC4 or (RequestCount >= MinRequests and SpikeRatio >= SpikeRatioThreshold), "MEDIUM",
+    "LOW"
+)
+| extend HuntingDirectives = pack_array(
+    strcat("[WHY] 4769 anomaly for ServiceAccount=", ServiceAccount,
+           " | Requests=", RequestCount,
+           " | BaselineDailyAvg=", round(BaselineDailyAvg, 2),
+           " | SpikeRatio=", round(SpikeRatio, 2),
+           " | RC4Count=", RC4Count),
+    strcat("[SCOPE] DistinctRequesters=", DistinctRequesters, " | DistinctSourceIPs=", DistinctSourceIPs),
+    "[NEXT] Pivot: Identify requester host(s) from SourceIPs; check if these hosts run kerberoast tooling (Rubeus) or abnormal admin activity.",
+    "[NEXT] Validate the service account: SPN ownership, privilege level, password age, AES-only config. If confirmed: rotate password + enforce AES, consider gMSA.",
+    "[IR] If HIGH: treat as active credential access. Contain: isolate requester endpoints, reset exposed credentials, review lateral movement."
+)
+| project
+    Severity,
+    FirstSeen, LastSeen,
+    ServiceAccount,
+    LooksLikeSvc,
+    RequestCount, BaselineDailyAvg, SpikeRatio,
+    RC4Count,
+    DistinctRequesters, DistinctSourceIPs,
+    RequestingUsers, SourceIPs, DCs,
+    HuntingDirectives
+| order by Severity desc, SpikeRatio desc, RequestCount desc, LastSeen desc
