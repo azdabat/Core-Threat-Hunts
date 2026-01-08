@@ -1,0 +1,88 @@
+// ============================================================================
+// CORE_KERBEROASTING_UNIFIED_Sentinel_MDE (Chained)
+// Author: Ala Dabat
+// Audience: L2.5 / L3 Threat Hunters
+// Platform: Microsoft Sentinel (SecurityEvent + MDE tables via Microsoft Defender connector)
+// Data: SecurityEvent (4769) + DeviceProcessEvents + DeviceNetworkEvents
+// MITRE: T1558.003 (Kerberoasting)
+// Version: 2026-01-08
+// ============================================================================
+
+let lookback = 24h;
+let baseline = 7d;
+let window = 1h;
+
+let BaselineTGS =
+SecurityEvent
+| where TimeGenerated between (ago(baseline)..ago(lookback))
+| where EventID == 4769
+| extend ServiceAccount = tostring(EventData.ServiceName)
+| summarize BaselineDailyAvg = todouble(count()) / 7.0 by ServiceAccount;
+
+let TGS =
+SecurityEvent
+| where TimeGenerated >= ago(lookback)
+| where EventID == 4769
+| extend
+    ServiceAccount = tostring(EventData.ServiceName),
+    TicketEncType  = tostring(EventData.TicketEncryptionType),
+    RequestingUser = tostring(EventData.TargetUserName),
+    ClientIP       = tostring(EventData.IpAddress)
+| summarize
+    TGSRequests=count(),
+    RC4Count=countif(TicketEncType=="0x17"),
+    Requesters=make_set(RequestingUser, 15),
+    SourceIPs=make_set(ClientIP, 15),
+    DistinctRequesters=dcount(RequestingUser),
+    DistinctIPs=dcount(ClientIP),
+    FirstSeen=min(TimeGenerated),
+    LastSeen=max(TimeGenerated)
+  by ServiceAccount, bin(TimeGenerated, window)
+| join kind=leftouter (BaselineTGS) on ServiceAccount
+| extend BaselineDailyAvg = coalesce(BaselineDailyAvg, 1.0)
+| extend SpikeRatio = todouble(TGSRequests) / BaselineDailyAvg
+| where RC4Count >= 5 or (TGSRequests >= 20 and SpikeRatio >= 3.0)
+| extend TgsScore =
+    0
+    + iif(RC4Count >= 5, 50, 0)
+    + iif(SpikeRatio >= 3.0, 30, 0)
+    + iif(DistinctIPs >= 3 or DistinctRequesters >= 3, 10, 0);
+
+let KerbToolNames = dynamic(["rubeus.exe","kekeo.exe","mimikatz.exe"]);
+let KerbCmdTokens = dynamic(["kerberoast","asreproast","getuserspns","/format:hashcat","tgtdeleg"]);
+
+let Endpoint =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Proc=tolower(FileName), Cmd=tolower(ProcessCommandLine)
+| where Proc has_any (KerbToolNames) or Cmd has_any (KerbCmdTokens)
+| summarize ToolingHits=count(), ToolingSamples=make_set(Cmd, 10)
+  by DeviceName, AccountName, bin(Timestamp, window);
+
+let Kerb88 =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 88
+| summarize Kerb88Connections=count(), Kerb88Targets=dcount(RemoteIP), Kerb88IPs=make_set(RemoteIP, 10)
+  by DeviceName, AccountName, bin(Timestamp, window);
+
+TGS
+| extend TimeBucket = bin(FirstSeen, window)
+| join kind=leftouter (Endpoint) on $left.TimeGenerated == $right.Timestamp
+| join kind=leftouter (Kerb88) on $left.TimeGenerated == $right.Timestamp
+| extend ToolingHits = coalesce(ToolingHits, 0), Kerb88Connections = coalesce(Kerb88Connections, 0)
+| extend EndpointScore =
+    0
+    + iif(ToolingHits > 0, 30, 0)
+    + iif(Kerb88Connections >= 50, 15, 0)
+| extend FinalScore = TgsScore + EndpointScore
+| extend Severity = case(FinalScore >= 90, "HIGH", "MEDIUM")
+| extend HuntingDirectives = pack_array(
+    strcat("[SUMMARY] Kerberoast chain | Service=", ServiceAccount, " | Score=", tostring(FinalScore), " | RC4=", tostring(RC4Count), " | Spike=", round(SpikeRatio, 2)),
+    "[NEXT] Identify requester endpoints from SourceIPs (DC-side) and validate if they match DeviceName/AccountName observed on endpoint side.",
+    "[NEXT] If ToolingHits>0: confirm process tree and containment. If only DC-side spike: investigate source hosts and schedule.",
+    "[IR] Rotate affected service account creds, enforce AES-only where feasible, and review SPN scope/privileges."
+)
+| project TimeGenerated, Severity, FinalScore, ServiceAccount, TGSRequests, BaselineDailyAvg, SpikeRatio, RC4Count, DistinctRequesters, DistinctIPs,
+          Requesters, SourceIPs, ToolingHits, ToolingSamples, Kerb88Connections, Kerb88Targets, Kerb88IPs, HuntingDirectives
+| order by FinalScore desc, TimeGenerated desc
