@@ -1,0 +1,59 @@
+// ============================================================================
+// 1. THE SCHEMA BRIDGE (Virtualizing DeviceProcessEvents)
+// TRIED AND TESTED IN ADX DOCKER
+// ============================================================================
+let DeviceProcessEvents = 
+    RawEvents
+    | where EventID == 4688 or EventID == 1
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend FileName = tostring(split(ProcessName, "\\")[-1])
+    | extend ProcessCommandLine = CommandLine
+    // Handle Parent Process parsing safely
+    | extend InitiatingProcessFileName = tostring(split(ParentProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001"
+    | project Timestamp, DeviceName, DeviceId, FileName, ProcessCommandLine, InitiatingProcessFileName;
+
+// ============================================================================
+// 2. THE HUNTING RULE (Ingress Tool Transfer)
+// ============================================================================
+let lookback = 365d; // Extended lookback to ensure 2026 logs are caught
+let TargetProcs = dynamic(["certutil.exe","bitsadmin.exe","curl.exe","wget.exe","ftp.exe","tftp.exe","powershell.exe"]);
+let SuspiciousParents = dynamic(["cmd.exe","winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs = dynamic(["\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"]);
+
+DeviceProcessEvents
+// | where Timestamp > ago(lookback) // Commented out to force-include all loaded data
+| where FileName in~ (TargetProcs)
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "-urlcache","-split","-f","decode","encode",
+    "/transfer","/addfile","/setnotifycmdline","/resume",
+    " -o "," --output "," -OutFile ","--remote-name",
+    "invoke-webrequest","iwr","invoke-restmethod","irm","downloadstring","new-object net.webclient"
+)
+| extend
+    HasNet = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)",
+    HasScript = ProcessCommandLine has_any ("downloadstring","iex","-enc","frombase64string"),
+    BadDLLPath = ProcessCommandLine has ".dll" and ProcessCommandLine has_any (SuspiciousDirs),
+    WeirdExport = bool(false),
+    BadParent = InitiatingProcessFileName in~ (SuspiciousParents),
+    IsDownloader = bool(false), // Initialize
+    IsPersistence = bool(false)
+| extend IsDownloader = HasNet // Update based on regex
+| extend RiskScore =
+    0
+    + iif(HasNet or IsDownloader, 60, 0)
+    + iif(HasScript, 50, 0)
+    + iif(BadDLLPath, 30, 0)
+    + iif(WeirdExport, 20, 0)
+    + iif(BadParent, 20, 0)
+    + iif(IsPersistence, 40, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    HasNet or IsDownloader, "CRITICAL: Ingress tool transfer via LOLBIN downloader",
+    HasScript, "HIGH: Download + immediate execution pattern (cradle/encoded/script)",
+    BadParent, "MEDIUM: Downloader spawned by suspicious parent",
+    "Suspicious downloader activity"
+)
+| project Timestamp, DeviceName, FileName, RiskScore, Hunter_Directive, ProcessCommandLine
+| order by RiskScore desc
