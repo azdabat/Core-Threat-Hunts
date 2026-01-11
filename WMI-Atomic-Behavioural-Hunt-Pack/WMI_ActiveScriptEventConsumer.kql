@@ -115,10 +115,10 @@ DeviceNetworkEvents
 // ----------------------------
 union SigA, SigB, SigC, SigD
 | summarize
-    DLLLoadScore = maxif(Score, Signal=="ScriptEngineDLLLoad"),
-    RegScore     = maxif(Score, Signal=="WBEMRegistryModification"),
-    RuntimeScore = maxif(Score, Signal=="ScrconsEmbeddingRuntime"),
-    NetScore     = maxif(Score, Signal=="ScrconsNetworkHTTP"),
+    DLLLoadScore = maxif(Score, Signal=="ScriptEngineDLLLoad"), // Max score = 40
+    RegScore     = maxif(Score, Signal=="WBEMRegistryModification"), //max score = 60
+    RuntimeScore = maxif(Score, Signal=="ScrconsEmbeddingRuntime"), // max score = 60
+    NetScore     = maxif(Score, Signal=="ScrconsNetworkHTTP"), // 20
     Signals      = make_set(Signal, 10),
     Evidences    = make_set(Evidence, 25),
     FirstSeen    = min(Timestamp),
