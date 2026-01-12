@@ -1,5 +1,6 @@
 // WSL Privilege Escalation & Persistence Hunt
 // Author: Ala Dabat
+// WORK IN PROGRESS 
 // Detects WSL-based privilege escalation, persistence, and host escape techniques.
 // Focus: suspicious WSL command lines, dangerous mounts, root-level actions, and critical file changes.
 
