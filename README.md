@@ -5,6 +5,8 @@
 **Platform:** Microsoft Sentinel • Microsoft Defender for Endpoint  
 **Focus:** Behaviour-led detection, adversary modelling, IR workflow, risk scoring, MITRE coverage, sample data demonstration.
 
+NOTE: THESE ARE COMPLETE ATTACK CHAINS! FOR REGULAR L1, L2 THREAT HUNTING THESE RULES MAY NEED TO REMOVE ENGINEERING COMPONENTS FOR QUICK AND EASY THREAT HUNTING PLAYBOOKS!
+
 ---
 
 <p align="center">
@@ -27,7 +29,8 @@ This repository contains two layers of detection logic:
    - High-fidelity correlation rules  
    - Scoring engines, kill chain classification  
    - MITRE-aligned, enriched, multi-signal analytics  
-   - For L2/L3 SOC and IR teams  
+   - For L2/L3 SOC and IR teams
+     
 
 Both follow the same **structured methodology**, shown below.
 
