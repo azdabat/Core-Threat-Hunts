@@ -1,0 +1,228 @@
+// ============================================================
+// UNIT TEST HARNESS — SilverFox/ValleyRat BYOVD Correlation
+// Ala Dabat
+// Pre-ADX Telemetry Testing
+//Laying the foundations
+// No ingestion required. Simulated telemetry via datatable().
+// ============================================================
+
+let Now = now();
+let Lookback = 24h;
+
+let SideloadDropWindow = 6h;
+let DropServiceWindow  = 2h;
+let ServiceKernelWindow = 2h;
+
+let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\","\\AppData\\"]);
+let ModuleExtRegex = @"\.(dll|ocx|cpl|dat|bin|tmp)$";
+let DriverExtRegex = @"\.(sys|drv|dat|bin|tmp|ax)$";
+
+// -------------------------
+// MOCK TABLES (minimal cols your query actually uses)
+// -------------------------
+
+let DeviceImageLoadEvents = datatable(
+    Timestamp:datetime,
+    DeviceId:string,
+    InitiatingProcessFolderPath:string,
+    FolderPath:string,
+    InitiatingProcessSignatureStatus:string,
+    FileName:string,
+    SignatureStatus:string,
+    Signer:string,
+    InitiatingProcessSigner:string,
+    InitiatingProcessFileName:string,
+    InitiatingProcessId:long
+)
+[
+    // Scenario A: signed loader from writable path loads unsigned module (sideload)
+    Now - 30m, "DEV-A", "C:\\Users\\Public\\", "C:\\Users\\Public\\", "Signed", "version.dll", "Unsigned", "", "Microsoft Corporation", "legitloader.exe", 4242,
+
+    // Scenario B: signed loader from writable path loads module, then driver load happens from System32\drivers
+    Now - 2h,  "DEV-B", "C:\\ProgramData\\", "C:\\ProgramData\\", "Signed", "userenv.dll", "Unsigned", "", "VMware, Inc.", "vmwaretool.exe", 5151,
+
+    // Scenario C: benign signed module load (no chain)
+    Now - 1h,  "DEV-C", "C:\\ProgramData\\", "C:\\ProgramData\\", "Signed", "legit.ocx", "Signed", "Microsoft Corporation", "Microsoft Corporation", "msiexec.exe", 6000
+];
+
+let DeviceFileEvents = datatable(
+    Timestamp:datetime,
+    DeviceId:string,
+    ActionType:string,
+    FolderPath:string,
+    FileName:string,
+    InitiatingProcessId:long,
+    InitiatingProcessFileName:string,
+    InitiatingProcessCommandLine:string
+)
+[
+    // Scenario A: driver staged BEFORE sideload (this is the brittleness you fixed)
+    Now - 5h,  "DEV-A", "FileCreated",  "C:\\Users\\Public\\", "wdflt.dat", 1111, "powershell.exe", "powershell -enc ...",
+    // later modified close to execution
+    Now - 40m, "DEV-A", "FileModified", "C:\\Users\\Public\\", "wdflt.dat", 1111, "powershell.exe", "powershell -enc ...",
+
+    // Scenario B: driver staged in writable, but ultimately loaded from System32\drivers
+    Now - 3h,  "DEV-B", "FileCreated",  "C:\\ProgramData\\", "zemana.bin", 2222, "cmd.exe", "cmd /c copy zemana.bin C:\\Windows\\System32\\drivers\\zemana.sys",
+
+    // Scenario C: benign file activity only
+    Now - 50m, "DEV-C", "FileCreated",  "C:\\ProgramData\\", "chrome.tmp", 3333, "GoogleUpdate.exe", "GoogleUpdate.exe /install"
+];
+
+let DeviceRegistryEvents = datatable(
+    Timestamp:datetime,
+    DeviceId:string,
+    RegistryKey:string,
+    RegistryValueName:string,
+    RegistryValueData:string,
+    InitiatingProcessId:long
+)
+[
+    // Scenario A: service ImagePath points to writable staged driver-like artifact
+    Now - 20m, "DEV-A", "HKLM\\System\\CurrentControlSet\\Services\\WDFLT", "ImagePath", "C:\\Users\\Public\\wdflt.dat", 1111,
+
+    // Scenario B: service ImagePath points to System32\drivers (non-writable)
+    Now - 90m, "DEV-B", "HKLM\\System\\CurrentControlSet\\Services\\Zemana", "ImagePath", "C:\\Windows\\System32\\drivers\\zemana.sys", 2222
+];
+
+let DeviceProcessEvents = datatable(
+    Timestamp:datetime,
+    DeviceId:string,
+    FileName:string,
+    ProcessCommandLine:string,
+    ProcessId:long
+)
+[
+    // Optional process-based service install evidence (not strictly required if registry exists)
+    Now - 18m, "DEV-A", "sc.exe", "sc create WDFLT binpath= C:\\Users\\Public\\wdflt.dat type= kernel start= demand", 7777,
+    Now - 85m, "DEV-B", "sc.exe", "sc start Zemana", 8888
+];
+
+let DeviceEvents = datatable(
+    Timestamp:datetime,
+    DeviceId:string,
+    ActionType:string,
+    FolderPath:string,
+    FileName:string
+)
+[
+    // Scenario A: kernel load from writable path (easy case)
+    Now - 10m, "DEV-A", "DriverLoadEvent", "C:\\Users\\Public\\", "wdflt.sys",
+
+    // Scenario B: kernel load from System32\drivers (your fix should catch; old version would miss if path-gated)
+    Now - 70m, "DEV-B", "DriverLoadEvent", "C:\\Windows\\System32\\drivers\\", "zemana.sys"
+];
+
+// -------------------------
+//  FIXED LOGIC (symmetric windows + no hard path gate on kernel load)
+// -------------------------
+
+let SideloadEvents = materialize(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(Lookback)
+    | where InitiatingProcessFolderPath has_any (WritablePaths)
+    | where FolderPath == InitiatingProcessFolderPath
+    | where InitiatingProcessSignatureStatus == "Signed"
+    | where FileName matches regex ModuleExtRegex
+    | where (SignatureStatus != "Signed" or Signer != InitiatingProcessSigner)
+    | project
+        DeviceId,
+        SideloadTime = Timestamp,
+        LoaderName   = InitiatingProcessFileName,
+        LoaderPath   = InitiatingProcessFolderPath,
+        LoaderSigner = tostring(InitiatingProcessSigner),
+        LoadedModule = FileName,
+        LoadedModulePath = FolderPath,
+        LoadedSigner = tostring(Signer),
+        LoadedSigStatus = tostring(SignatureStatus)
+);
+
+let DriverDrops = materialize(
+    DeviceFileEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+    | where FileName matches regex DriverExtRegex
+    | project
+        DeviceId,
+        DropTime = Timestamp,
+        DriverFile = FileName,
+        DriverFolder = FolderPath,
+        DropperProc = InitiatingProcessFileName,
+        DropperCmd  = InitiatingProcessCommandLine,
+        IsWritableDrop = iif(FolderPath has_any (WritablePaths), true, false)
+);
+
+let ServiceRegistry = materialize(
+    DeviceRegistryEvents
+    | where Timestamp > ago(Lookback)
+    | where RegistryKey has @"System\CurrentControlSet\Services"
+    | where RegistryValueName == "ImagePath"
+    | where RegistryValueData matches regex @"\.(sys|drv|dat|bin|tmp|dll)$"
+    | project
+        DeviceId,
+        ServiceTime = Timestamp,
+        ServiceIndicator = RegistryKey,
+        ServiceImagePath = RegistryValueData,
+        Method = "Registry/API",
+        IsWritableSvcPath = iif(RegistryValueData has_any (WritablePaths), true, false)
+);
+
+let ServiceProcess = materialize(
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ ("sc.exe","pnputil.exe","powershell.exe","pwsh.exe","wmic.exe","rundll32.exe","reg.exe")
+    | where isnotempty(ProcessCommandLine)
+    | where (
+        (FileName =~ "sc.exe" and ProcessCommandLine has_any ("create","start") and ProcessCommandLine matches regex @"\.(sys|dat|bin|tmp|drv)\b")
+        or ((FileName in~ ("powershell.exe","pwsh.exe")) and ProcessCommandLine has_any ("New-Service","CreateService","NtLoadDriver","Start-Service"))
+        or (FileName =~ "wmic.exe" and ProcessCommandLine has_any ("service","create"))
+        or (FileName =~ "pnputil.exe" and ProcessCommandLine has_any ("/add-driver","/install"))
+        or (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("setupapi.dll","InstallHinfSection"))
+        or (FileName =~ "reg.exe" and ProcessCommandLine has_any ("add","HKLM\\SYSTEM\\CurrentControlSet\\Services"))
+    )
+    | project
+        DeviceId,
+        ServiceTime = Timestamp,
+        ServiceIndicator = ProcessCommandLine,
+        ServiceImagePath = "",
+        Method = "Process",
+        IsWritableSvcPath = iif(ProcessCommandLine has_any (WritablePaths), true, false)
+);
+
+let DriverServiceCreates = materialize(union ServiceRegistry, ServiceProcess);
+
+let KernelDriverLoads = materialize(
+    DeviceEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType == "DriverLoadEvent"
+    | project
+        DeviceId,
+        KernelLoadTime = Timestamp,
+        KernelDriverName = FileName,
+        KernelDriverPath = FolderPath,
+        IsWritableKernelPath = iif(FolderPath has_any (WritablePaths), true, false)
+);
+
+// Correlate (symmetric windows)
+SideloadEvents
+| join kind=inner hint.strategy=broadcast (DriverDrops) on DeviceId
+| where DropTime between (SideloadTime - SideloadDropWindow .. SideloadTime + SideloadDropWindow)
+| join kind=inner hint.strategy=broadcast (DriverServiceCreates) on DeviceId
+| where ServiceTime between (DropTime - DropServiceWindow .. DropTime + DropServiceWindow)
+| join kind=inner hint.strategy=broadcast (KernelDriverLoads) on DeviceId
+| where KernelLoadTime between (ServiceTime - ServiceKernelWindow .. ServiceTime + ServiceKernelWindow)
+| summarize
+    FirstSeen = min(SideloadTime),
+    LastSeen  = max(KernelLoadTime),
+    LoaderName = any(LoaderName),
+    LoaderPath = any(LoaderPath),
+    LoaderSigner = any(LoaderSigner),
+    LoadedModules = make_set(LoadedModule, 10),
+    DriverFiles = make_set(DriverFile, 10),
+    DriverFolders = make_set(DriverFolder, 10),
+    ServiceMethods = make_set(Method, 5),
+    KernelDrivers = make_set(KernelDriverName, 10),
+    KernelPaths = make_set(KernelDriverPath, 10),
+    WritableEvidence = any(IsWritableDrop) or any(IsWritableSvcPath) or any(IsWritableKernelPath)
+  by DeviceId
+| extend Severity = iif(WritableEvidence, "CRITICAL", "HIGH")
+| order by LastSeen desc
