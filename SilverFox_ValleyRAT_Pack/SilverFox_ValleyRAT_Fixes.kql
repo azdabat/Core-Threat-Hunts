@@ -1,0 +1,140 @@
+//Author: Ala Dabat
+// WORK IN PROGRESS, FIXES ARE DONE IN INTERATIONS LAB TESTING AND SIMULATED DATA
+//Stops missing “stage first, execute later”
+//Stops missing kernel loads that land in non-writable “normal” paths
+//Reduces compute via materialize + slim projections
+//Maintains behavioural thesis intact
+
+
+let Lookback = 24h;
+
+// Symmetric windows (less brittle)
+let SideloadDropWindow = 6h;
+let DropServiceWindow  = 2h;
+let ServiceKernelWindow = 2h;
+
+let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\","\\AppData\\"]);
+let ModuleExtRegex = @"\.(dll|ocx|cpl|dat|bin|tmp)$";
+let DriverExtRegex = @"\.(sys|drv|dat|bin|tmp|ax)$";
+
+// 1) SIDELOAD signal (keep as-is, but understand it won't "prove" byte-flip)
+let SideloadEvents = materialize(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(Lookback)
+    | where InitiatingProcessFolderPath has_any (WritablePaths)
+    | where FolderPath == InitiatingProcessFolderPath
+    | where InitiatingProcessSignatureStatus == "Signed"
+    | where FileName matches regex ModuleExtRegex
+    | where (SignatureStatus != "Signed" or Signer != InitiatingProcessSigner)
+    | project
+        DeviceId,
+        SideloadTime = Timestamp,
+        LoaderName   = InitiatingProcessFileName,
+        LoaderPath   = InitiatingProcessFolderPath,
+        LoaderSigner = tostring(InitiatingProcessSigner),
+        LoadedModule = FileName,
+        LoadedModulePath = FolderPath,
+        LoadedSigner = tostring(Signer),
+        LoadedSigStatus = tostring(SignatureStatus)
+);
+
+// 2) DRIVER-LIKE file activity (staging can be before or after)
+let DriverDrops = materialize(
+    DeviceFileEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+    | where FileName matches regex DriverExtRegex
+    | project
+        DeviceId,
+        DropTime = Timestamp,
+        DriverFile = FileName,
+        DriverFolder = FolderPath,
+        DropperProc = InitiatingProcessFileName,
+        DropperCmd  = InitiatingProcessCommandLine,
+        IsWritableDrop = iif(FolderPath has_any (WritablePaths), true, false)
+);
+
+// 3) SERVICE creation signals
+let ServiceRegistry = materialize(
+    DeviceRegistryEvents
+    | where Timestamp > ago(Lookback)
+    | where RegistryKey has @"System\CurrentControlSet\Services"
+    | where RegistryValueName == "ImagePath"
+    | where RegistryValueData matches regex @"\.(sys|drv|dat|bin|tmp|dll)$"
+    | project
+        DeviceId,
+        ServiceTime = Timestamp,
+        ServiceIndicator = RegistryKey,
+        ServiceImagePath = RegistryValueData,
+        Method = "Registry/API",
+        IsWritableSvcPath = iif(RegistryValueData has_any (WritablePaths), true, false)
+);
+
+let ServiceProcess = materialize(
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ ("sc.exe","pnputil.exe","powershell.exe","pwsh.exe","wmic.exe","rundll32.exe","reg.exe")
+    | where isnotempty(ProcessCommandLine)
+    | where (
+        (FileName =~ "sc.exe" and ProcessCommandLine has_any ("create","start") and ProcessCommandLine matches regex @"\.(sys|dat|bin|tmp|drv)\b")
+        or ((FileName in~ ("powershell.exe","pwsh.exe")) and ProcessCommandLine has_any ("New-Service","CreateService","NtLoadDriver","Start-Service"))
+        or (FileName =~ "wmic.exe" and ProcessCommandLine has_any ("service","create"))
+        or (FileName =~ "pnputil.exe" and ProcessCommandLine has_any ("/add-driver","/install"))
+        or (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("setupapi.dll","InstallHinfSection"))
+        or (FileName =~ "reg.exe" and ProcessCommandLine has_any ("add","HKLM\\SYSTEM\\CurrentControlSet\\Services"))
+    )
+    | project
+        DeviceId,
+        ServiceTime = Timestamp,
+        ServiceIndicator = ProcessCommandLine,
+        ServiceImagePath = "",
+        Method = "Process",
+        IsWritableSvcPath = iif(ProcessCommandLine has_any (WritablePaths), true, false)
+);
+
+let DriverServiceCreates = materialize(union ServiceRegistry, ServiceProcess);
+
+// 4) KERNEL LOAD ground truth (DO NOT hard-require writable paths)
+let KernelDriverLoads = materialize(
+    DeviceEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType == "DriverLoadEvent"
+    | project
+        DeviceId,
+        KernelLoadTime = Timestamp,
+        KernelDriverName = FileName,
+        KernelDriverPath = FolderPath,
+        IsWritableKernelPath = iif(FolderPath has_any (WritablePaths), true, false)
+);
+
+// 5) Correlate with symmetric windows (less brittle)
+SideloadEvents
+| join kind=inner hint.strategy=broadcast (DriverDrops) on DeviceId
+| where DropTime between (SideloadTime - SideloadDropWindow .. SideloadTime + SideloadDropWindow)
+| join kind=inner hint.strategy=broadcast (DriverServiceCreates) on DeviceId
+| where ServiceTime between (DropTime - DropServiceWindow .. DropTime + DropServiceWindow)
+| join kind=inner hint.strategy=broadcast (KernelDriverLoads) on DeviceId
+| where KernelLoadTime between (ServiceTime - ServiceKernelWindow .. ServiceTime + ServiceKernelWindow)
+| summarize
+    FirstSeen = min(SideloadTime),
+    LastSeen  = max(KernelLoadTime),
+    LoaderName = any(LoaderName),
+    LoaderPath = any(LoaderPath),
+    LoaderSigner = any(LoaderSigner),
+    LoadedModules = make_set(LoadedModule, 10),
+    LoadedSigStatus = make_set(LoadedSigStatus, 5),
+    LoadedSigners = make_set(LoadedSigner, 10),
+    DriverFiles = make_set(DriverFile, 10),
+    DriverFolders = make_set(DriverFolder, 10),
+    ServiceMethods = make_set(Method, 5),
+    ServiceIndicators = make_set(ServiceIndicator, 10),
+    KernelDrivers = make_set(KernelDriverName, 10),
+    KernelPaths = make_set(KernelDriverPath, 10),
+    WritableEvidence = any(IsWritableDrop) or any(IsWritableSvcPath) or any(IsWritableKernelPath),
+    SampleDropperProcs = make_set(DropperProc, 10),
+    SampleDropperCmds  = make_set(DropperCmd, 5)
+  by DeviceId
+| extend RiskScore = iif(WritableEvidence, 95, 85)
+| extend Severity  = iif(WritableEvidence, "CRITICAL", "HIGH")
+| project-away WritableEvidence
+| order by LastSeen desc;
