@@ -1,0 +1,101 @@
+// ============================================================================
+// Rule Name: HTTPS C2 Jitter Beacon Hunt (Low CPU) — v2
+// Author: Ala Dabat
+// Purpose:
+//   Detect probable HTTPS beaconing by looking for:
+//     - repeated connections to same RemoteIP:443
+//     - small payloads
+//     - semi-regular timing + jitter (CV / coefficient of variation)
+// Platform: MDE Advanced Hunting
+// Table: DeviceNetworkEvents
+// MITRE: TA0011 Command and Control, TA0005 Defense Evasion
+//
+// v2 Fixes
+//   - Correct interval computation using partition (prevents cross-entity prev() bleed)
+//   - Summarize by DeviceId+RemoteIP+Process (prevents process-mixing)
+//   - Add interval bounds to prevent long idle gaps skewing stdev
+// ============================================================================
+
+let lookback = 24h;
+let min_connections = 20;
+let max_payload_bytes = 50000;
+
+// optional: keep as a weighting dimension instead of hard filter
+let BrowserLike = dynamic(["chrome.exe","msedge.exe","firefox.exe","brave.exe","opera.exe"]);
+let CommonCloudAgents = dynamic(["teams.exe","onedrive.exe","msedgewebview2.exe"]);
+
+let Net =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 443
+| where Protocol =~ "Tcp"
+| where isnotempty(RemoteIP)
+| extend Proc = tolower(InitiatingProcessFileName)
+| extend TotalBytes = tolong(coalesce(SentBytes,0)) + tolong(coalesce(ReceivedBytes,0))
+| where TotalBytes <= max_payload_bytes
+| project Timestamp, DeviceId, DeviceName, RemoteIP,
+          Proc,
+          InitiatingProcessCommandLine,
+          InitiatingProcessParentFileName,
+          TotalBytes;
+
+Net
+| partition hint.strategy=native by DeviceId, RemoteIP, Proc (
+    sort by Timestamp asc
+    | serialize
+    | extend PrevTime = prev(Timestamp)
+    | extend IntervalSec = datetime_diff("second", Timestamp, PrevTime)
+    | where isnotnull(PrevTime) and IntervalSec > 0
+    // interval sanity: ignore extreme gaps that distort jitter stats
+    | where IntervalSec between (5 .. 6*60*60)
+    | summarize
+        ConnectionCount   = count(),
+        AvgIntervalSec    = avg(IntervalSec),
+        MinIntervalSec    = min(IntervalSec),
+        MaxIntervalSec    = max(IntervalSec),
+        StdDevIntervalSec = stdev(IntervalSec),
+        AvgBytes          = avg(TotalBytes),
+        FirstSeen         = min(Timestamp),
+        LastSeen          = max(Timestamp),
+        SampleCommand     = any(InitiatingProcessCommandLine),
+        SampleParent      = any(InitiatingProcessParentFileName)
+      by DeviceId, DeviceName, RemoteIP, Proc
+)
+| where ConnectionCount >= min_connections
+| extend JitterRatio = iif(AvgIntervalSec > 0 and isnotnull(StdDevIntervalSec), StdDevIntervalSec / AvgIntervalSec, 0.0)
+| extend
+    IsBrowserLike = iff(Proc in (BrowserLike), 1, 0),
+    IsCommonCloud = iff(Proc in (CommonCloudAgents), 1, 0)
+| extend
+    BeaconScore =
+          iif(AvgIntervalSec between (10 .. 3600), 20, 0)
+        + iif(JitterRatio between (0.02 .. 0.50), 20, 0)
+        + iif(AvgBytes <= 5000, 10, 0)
+        + iif(ConnectionCount >= 40, 10, 0)
+        // reduce score for common benign categories instead of filtering them away
+        + iif(IsBrowserLike == 1, -15, 0)
+        + iif(IsCommonCloud == 1, -10, 0)
+| extend Severity = case(
+    BeaconScore >= 45, "HIGH",
+    BeaconScore >= 30, "MEDIUM",
+    BeaconScore >= 20, "LOW",
+    "INFO"
+)
+| project
+    Severity,
+    BeaconScore,
+    DeviceName,
+    RemoteIP,
+    Proc,
+    ConnectionCount,
+    AvgIntervalSec,
+    StdDevIntervalSec,
+    JitterRatio,
+    AvgBytes,
+    SampleParent,
+    SampleCommand,
+    FirstSeen,
+    LastSeen,
+    KillChain = "TA0011 Command & Control"
+| where Severity != "INFO"
+| order by BeaconScore desc, ConnectionCount desc, LastSeen desc
