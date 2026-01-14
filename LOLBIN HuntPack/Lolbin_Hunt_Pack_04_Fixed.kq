@@ -1,0 +1,101 @@
+// ============================================================================
+// 1. THE SCHEMA BRIDGE (Virtualizing DeviceProcessEvents)
+// TRIED AND TESTED IN ADX DOCKER
+// ============================================================================
+let DeviceProcessEvents = 
+    RawEvents
+    | where EventID == 4688 or EventID == 1
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend FileName = tostring(split(ProcessName, "\\")[-1])
+    | extend ProcessCommandLine = CommandLine
+    | extend InitiatingProcessFileName = tostring(split(ParentProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001" // Lab Simulation Data
+    | project Timestamp, DeviceName, DeviceId, FileName, ProcessCommandLine, InitiatingProcessFileName;
+
+// ============================================================================
+// 2. THE HUNTING RULE (Ingress Tool Transfer - Composite L2)
+// ============================================================================
+let lookback = 365d; 
+let Threshold = 60; // Raised to 60 to prevent "Single Signal" PowerShell alerts
+
+// Split Targets into "High Noise" and "Low Noise" for scoring context
+let CriticalLOLBins = dynamic(["certutil.exe","bitsadmin.exe","curl.exe","wget.exe","ftp.exe","tftp.exe"]);
+let ShellProcs      = dynamic(["powershell.exe", "pwsh.exe", "cmd.exe"]);
+
+let SuspiciousParents = dynamic(["winword.exe","excel.exe","outlook.exe","wscript.exe","cscript.exe","mshta.exe"]);
+let SuspiciousDirs    = dynamic(["\\Users\\Public","\\Windows\\Temp","\\Temp","\\Downloads","\\AppData\\Local\\Temp"]);
+
+DeviceProcessEvents
+// | where Timestamp > ago(lookback) 
+| where FileName in~ (CriticalLOLBins) or FileName in~ (ShellProcs)
+
+// ----------------------------------------------------------------------------
+// 3. NOISE SUPPRESSION (The Allowlist)
+// ----------------------------------------------------------------------------
+| where not(ProcessCommandLine has_any (
+    "ccmcache",                       // SCCM/MECM Activity
+    "Program Files",                  // Legitimate Software Updates
+    "windows/system32/mpcmdrun.exe",  // Microsoft Defender Updates
+    "AmazonSSMAgent",                 // AWS SSM Agent
+    "AzureADConnect"                  // Azure AD Sync
+))
+// Specific CertUtil suppression for system verifications
+| where not(FileName =~ "certutil.exe" and ProcessCommandLine has_any ("-verify", "-dump", "-error"))
+
+// ----------------------------------------------------------------------------
+// 4. SIGNAL EXTRACTION
+// ----------------------------------------------------------------------------
+| extend
+    // A: Does it look like a network call? (Regex)
+    HasNetRegex = ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})",
+    
+    // B: Does it use specific 'Ingress' flags? (Intent)
+    HasIngressFlags = ProcessCommandLine has_any (
+        "-urlcache","-split","/transfer","/addfile","--remote-name", "downloadfile",
+        "invoke-webrequest","iwr","invoke-restmethod","irm","downloadstring","new-object net.webclient"
+    ),
+    
+    // C: Does it look like a script/encoded command?
+    HasScript = ProcessCommandLine has_any ("-enc","frombase64string","iex","invoke-expression"),
+    
+    // D: Contextual Bad Signals
+    BadParent  = InitiatingProcessFileName in~ (SuspiciousParents),
+    BadDir     = ProcessCommandLine has_any (SuspiciousDirs)
+
+// ----------------------------------------------------------------------------
+// 5. SCORING LOGIC (The RBA Engine)
+// ----------------------------------------------------------------------------
+| extend RiskScore = 0
+    // SCENARIO 1: Critical LOLBin (CertUtil/Curl)
+    // If CertUtil has Flags OR Net, it gets massive points. It is rarely benign in user context.
+    + iif(FileName in~ (CriticalLOLBins) and (HasNetRegex or HasIngressFlags), 60, 0)
+    
+    // SCENARIO 2: PowerShell (The Volume Trap Fix)
+    // PowerShell ONLY gets points if it has specific download flags. 
+    // Just having "http" isn't enough (could be admin script).
+    + iif(FileName in~ (ShellProcs) and HasIngressFlags, 40, 0)
+    + iif(FileName in~ (ShellProcs) and HasScript, 30, 0)
+
+    // SCENARIO 3: Context Boosters (Add to any scenario)
+    + iif(HasNetRegex, 20, 0)      // Boost score if raw URL found
+    + iif(BadParent, 30, 0)        // Massive boost if spawned by Office
+    + iif(BadDir, 10, 0)           // Slight boost for Temp folders
+
+// ----------------------------------------------------------------------------
+// 6. OUTPUT & DIRECTIVES
+// ----------------------------------------------------------------------------
+| where RiskScore >= Threshold
+| extend Hunter_Directive = case(
+    // Critical: Office spawning a downloader
+    BadParent and (HasIngressFlags or HasNetRegex), "CRITICAL: Office Product spawned Ingress Tool (Potential Phishing/Macro)",
+    
+    // High: LOLBin usage
+    FileName in~ (CriticalLOLBins), "HIGH: Native Windows Binary used for File Transfer (LOTL)",
+    
+    // Medium: PowerShell Download
+    FileName in~ (ShellProcs) and HasScript and HasNetRegex, "MEDIUM: PowerShell Obfuscated Download Pattern",
+    
+    "Suspicious Ingress Activity"
+)
+| project Timestamp, DeviceName, FileName, RiskScore, Hunter_Directive, ProcessCommandLine, InitiatingProcessFileName
+| order by RiskScore desc
