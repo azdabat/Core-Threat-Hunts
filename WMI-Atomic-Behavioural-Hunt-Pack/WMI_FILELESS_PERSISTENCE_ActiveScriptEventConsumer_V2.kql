@@ -1,0 +1,179 @@
+// ============================================================================
+// WMI_FILELESS_PERSISTENCE_ActiveScriptEventConsumer — v2 (State-aware + Cost-hardened)
+// Author: Ala Dabat
+// Version: 2026-01-xx (v2)
+//
+// GOAL
+//   Detect “process-less” WMI persistence where ActiveScriptEventConsumer runs
+//   VBScript/JScript in-memory inside scrcons.exe (-Embedding), often with registry/network IO.
+//   No child process required → classic 4688 chain fails.
+//
+// v2 Architecture Fixes
+//   1) Cold vs Hot windows:
+//      - Cold (30d): WBEM/CIMOM registry modifications (state)
+//      - Hot (48h): scrcons substrate DLL load / -Embedding / network
+//      -> Join on DeviceId to correlate install (cold) with execution (hot)
+//
+//   2) Cost hardening:
+//      - DeviceImageLoadEvents lookback reduced (48h) + scrcons prefilter
+//      - Registry is the long lookback table (lower volume)
+//      - Aggregation uses maxif per signal (no score inflation)
+//
+// TABLES
+//   Required: DeviceRegistryEvents, DeviceImageLoadEvents
+//   Optional: DeviceProcessEvents, DeviceNetworkEvents
+// ============================================================================
+
+let hotLookback  = 48h;   // expensive tables live here
+let coldLookback = 30d;   // state table lookback (registry is cheaper than image loads)
+let window       = 4h;
+let threshold    = 80;
+
+// Weights (distinct signals only; capped by maxif)
+let W_ScriptEngineLoad = 40;   // substrate required
+let W_ScrconsEmbedding = 20;   // runtime hint
+let W_WbemRegistryMod  = 60;   // state / artifact
+let W_ScrconsNetwork   = 60;   // high fidelity
+
+let ScriptEngines = dynamic(["vbscript.dll","jscript.dll","scrobj.dll"]);
+
+let WbemRegistryKeyHints = dynamic([
+  "\\software\\microsoft\\wbem\\cimom\\securedhostproviders",
+  "\\software\\microsoft\\wbem\\cimom",
+  "\\system\\currentcontrolset\\services\\winmgmt"
+]);
+
+// ----------------------------
+// COLD STATE: registry modifications (30d)
+// Keep it tuned: avoid OS chatter via svchost where possible.
+// ----------------------------
+let ColdState_Reg =
+DeviceRegistryEvents
+| where Timestamp >= ago(coldLookback)
+| extend Key = tolower(RegistryKey)
+| extend InitProc = tolower(InitiatingProcessFileName)
+| where Key has_any (WbemRegistryKeyHints)
+| where ActionType in~ ("RegistryValueSet","RegistryKeyCreated","RegistryValueDeleted","RegistryKeyDeleted")
+| where isempty(InitProc) or InitProc != "svchost.exe"
+| extend Account = coalesce(InitiatingProcessAccountName, AccountName)
+| project RegTime=Timestamp, DeviceId, DeviceName, Account,
+          Signal="WBEMRegistryModification",
+          Score=W_WbemRegistryMod,
+          Evidence=strcat("Reg ", ActionType, " :: ", RegistryKey,
+                          iff(isnotempty(RegistryValueName), strcat(" \\ ", RegistryValueName), ""),
+                          iff(isnotempty(InitiatingProcessFileName), strcat(" by ", InitiatingProcessFileName), ""));
+
+// Optional: only keep the latest state per DeviceId(+Account) to reduce join volume
+let ColdState_Reg_Latest =
+ColdState_Reg
+| summarize RegLastSeen=max(RegTime), RegEvidences=make_set(Evidence, 10) by DeviceId, DeviceName, Account;
+
+// ----------------------------
+// HOT SIGNALS: last 48h (cost-hardened)
+// ----------------------------
+
+// A) scrcons.exe loads script engines (substrate)
+let Hot_SigA =
+DeviceImageLoadEvents
+| where Timestamp >= ago(hotLookback)
+| extend InitProc = tolower(InitiatingProcessFileName)
+| extend DllName  = tolower(FileName)
+| where InitProc == "scrcons.exe"
+| where DllName has_any (ScriptEngines)
+| extend TimeBucket = bin(Timestamp, window)
+| extend Account = coalesce(InitiatingProcessAccountName, AccountName)
+| project Timestamp, TimeBucket, DeviceId, DeviceName, Account,
+          Signal="ScriptEngineDLLLoad",
+          Score=W_ScriptEngineLoad,
+          Evidence=strcat("scrcons.exe loaded ", FileName, " (", FolderPath, ")");
+
+// C) scrcons.exe -Embedding runtime
+let Hot_SigC =
+DeviceProcessEvents
+| where Timestamp >= ago(hotLookback)
+| extend Proc = tolower(FileName)
+| extend Cmd  = tolower(ProcessCommandLine)
+| where Proc == "scrcons.exe"
+| where Cmd has "-embedding"
+| extend TimeBucket = bin(Timestamp, window)
+| extend Account = coalesce(AccountName, InitiatingProcessAccountName)
+| project Timestamp, TimeBucket, DeviceId, DeviceName, Account,
+          Signal="ScrconsEmbeddingRuntime",
+          Score=W_ScrconsEmbedding,
+          Evidence=strcat("scrcons.exe runtime :: ", ProcessCommandLine);
+
+// D) scrcons.exe network activity (rare, high signal)
+let Hot_SigD =
+DeviceNetworkEvents
+| where Timestamp >= ago(hotLookback)
+| extend Proc = tolower(InitiatingProcessFileName)
+| where Proc == "scrcons.exe"
+| where RemotePort in (80,443) or RemoteUrl has_any ("http://","https://")
+| extend TimeBucket = bin(Timestamp, window)
+| extend Account = coalesce(InitiatingProcessAccountName, AccountName)
+| project Timestamp, TimeBucket, DeviceId, DeviceName, Account,
+          Signal="ScrconsNetworkHTTP",
+          Score=W_ScrconsNetwork,
+          Evidence=strcat("scrcons network :: ", tostring(RemoteUrl), " -> ", tostring(RemoteIP), ":", tostring(RemotePort));
+
+// ----------------------------
+// HOT aggregation (distinct-signal capping)
+// ----------------------------
+let HotAgg =
+union Hot_SigA, Hot_SigC, Hot_SigD
+| summarize
+    DLLLoadScore = maxif(Score, Signal=="ScriptEngineDLLLoad"),      // max 40
+    RuntimeScore = maxif(Score, Signal=="ScrconsEmbeddingRuntime"),  // max 20
+    NetScore     = maxif(Score, Signal=="ScrconsNetworkHTTP"),       // max 60
+    Signals      = make_set(Signal, 10),
+    Evidences    = make_set(Evidence, 25),
+    FirstSeen    = min(Timestamp),
+    LastSeen     = max(Timestamp),
+    EventCount   = count()
+  by TimeBucket, DeviceId, DeviceName, Account
+| extend
+    DLLLoadScore = coalesce(DLLLoadScore, 0),
+    RuntimeScore = coalesce(RuntimeScore, 0),
+    NetScore     = coalesce(NetScore, 0);
+
+// ----------------------------
+// STATE JOIN: bring in cold registry context even if it happened days ago
+//   - This fixes the TimeBucket flaw for true persistence.
+//   - We DO NOT require same TimeBucket for registry.
+// ----------------------------
+HotAgg
+| join kind=leftouter (ColdState_Reg_Latest) on DeviceId, DeviceName, Account
+| extend
+    RegScore = iff(isnotempty(RegLastSeen), W_WbemRegistryMod, 0),
+    TotalScore = DLLLoadScore + RegScore + RuntimeScore + NetScore
+| where TotalScore >= threshold
+| extend Severity =
+    case(
+        NetScore > 0 and DLLLoadScore > 0, "High",
+        RegScore > 0 and DLLLoadScore > 0, "High",
+        TotalScore >= 120, "High",
+        "Medium"
+    )
+| extend ChainSummary = strcat(
+    "DLLLoad=", tostring(DLLLoadScore), "; ",
+    "Runtime=", tostring(RuntimeScore), "; ",
+    "RegistryState=", tostring(RegScore), "; ",
+    "Network=", tostring(NetScore),
+    iff(isnotempty(RegLastSeen), strcat(" | RegLastSeen=", tostring(RegLastSeen)), "")
+)
+| extend HuntingDirectives = strcat(
+    "1) Confirm substrate: scrcons.exe loaded vbscript/jscript/scrobj (DLLLoadScore>0).\n",
+    "2) If Network>0: treat as high-confidence fileless C2/exfil. Review RemoteUrl/RemoteIP in Evidences.\n",
+    "3) If RegistryState>0: correlate to earlier WBEM/CIMOM modifications (RegLastSeen). Validate initiator legitimacy.\n",
+    "4) Pivot setup: hunt DeviceProcessEvents for wmic.exe /namespace root\\subscription OR PowerShell Set-WmiInstance/Register-WmiEvent around RegLastSeen.\n",
+    "5) Persistence confirmation: enumerate root\\subscription Filter/Consumer/Binding on the host.\n"
+)
+| project
+    TimeBucket, Severity, TotalScore,
+    DeviceName, DeviceId, Account,
+    ChainSummary,
+    Signals, Evidences,
+    RegLastSeen, RegEvidences,
+    FirstSeen, LastSeen, EventCount,
+    HuntingDirectives
+| order by TotalScore desc, LastSeen desc
