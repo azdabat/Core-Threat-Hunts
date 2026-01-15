@@ -6,6 +6,7 @@
 **Focus:** Behaviour-led detection, adversary modelling, IR workflow, risk scoring, MITRE coverage, sample data demonstration.
 
 NOTE: THESE ARE COMPLETE ATTACK CHAINS! FOR REGULAR L1, L2 THREAT HUNTING THESE RULES MAY NEED TO REMOVE ENGINEERING COMPONENTS AND BE DIVIDED INTO SMALLER CATEGORIZED HUNTS FOR QUICK AND EASY THREAT HUNTING PLAYBOOKS!
+See: https://github.com/azdabat/Composite-Threat-Hunting-Rules for L2 Threat Hunting philosophy and hunting rules. 
 
 ---
 
