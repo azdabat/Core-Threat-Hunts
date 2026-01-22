@@ -5,8 +5,16 @@
 **Platform:** Microsoft Sentinel • Microsoft Defender for Endpoint  
 **Focus:** Behaviour-led detection, adversary modelling, IR workflow, risk scoring, MITRE coverage, sample data demonstration.
 
-NOTE: THESE ARE COMPLETE ATTACK CHAINS! FOR REGULAR L1, L2 THREAT HUNTING THESE RULES MAY NEED TO REMOVE ENGINEERING COMPONENTS AND BE DIVIDED INTO SMALLER CATEGORIZED HUNTS FOR QUICK AND EASY THREAT HUNTING PLAYBOOKS! The L3 rules exist to model the attack ecosystem. I deliberately don’t make them production-safe. Anything that goes operational is reduced into a composite with a single baseline truth and bounded context.
-See: https://github.com/azdabat/Composite-Threat-Hunting-Rules for L2 Threat Hunting philosophy and hunting rules. 
+> [!IMPORTANT]
+> **L3 Ecosystem Modeling vs. Operational Alerts**
+>
+> These rules represent **Complete Attack Chains (L3)** designed to model the full "Attack Ecosystem." They prioritize maximum visibility and context aggregation over alert volume constraints.
+>
+> **Operational Guidance:**
+> * **Do not deploy these raw** into a high-volume production environment without tuning.
+> * **Decomposition Required:** For standard L1/L2 threat hunting, these logical structures should be **decomposed**—stripping away complex engineering components to focus on a "Single Baseline Truth" with bounded context.
+>
+> *For operational, production-ready hunting playbooks tailored for L2 analysts, please refer to my [Composite Threat Hunting Rules](https://github.com/azdabat/Composite-Threat-Hunting-Rules) repository.*
 
 ---
 
