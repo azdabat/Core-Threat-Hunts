@@ -17,7 +17,7 @@
 //   - Explicit noise suppression for scanners / admin tooling
 //   - <5% FP after minimal tenant tuning
 //
-// FIXES APPLIED (Gemini Audit)
+// FIXES APPLIED 
 //   ✔ Fork-n-Run regex hardened (optional \\.\ prefix)
 //   ✔ Service creation correlation works via:
 //       - SecurityEvent 7045 (Sentinel)
