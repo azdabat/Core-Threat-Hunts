@@ -11,7 +11,7 @@
 > These rules represent **Complete Attack Chains (L3)** designed to model the full "Attack Ecosystem." They prioritize maximum visibility and context aggregation over alert volume constraints.
 >
 > **Operational Guidance:**
-> * **Do not deploy these raw** into a high-volume production environment without tuning.
+> * **Do not deploy these raw** into a high-volume production environment without tuning. These are POC and sources of attack methadologies and differenct attack ecosystems. They are NOT a finished product.
 > * **Decomposition Required:** For standard L1/L2 threat hunting, these logical structures should be **decomposed**—stripping away complex engineering components to focus on a "Single Baseline Truth" with bounded context. "Splitting" the rule does not mean losing the big picture. We use Correlated Incidents in the SIEM to stitch these separate alerts together into a single Attack Story. The Detection Rule is the sensor; the Incident is the narrative.
 >
 > *For operational, production-ready hunting playbooks tailored for L2 analysts, please refer to my [Composite Threat Hunting Rules](https://github.com/azdabat/Composite-Threat-Hunting-Rules) repository. This is where the real work lives*
