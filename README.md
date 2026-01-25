@@ -1,5 +1,5 @@
 # Detection Engineering & Threat Hunting Framework  
-**Author:** Ala Dabat -=This is a framework and a methadology I myself have created from hard earned trial and error. </br>
+**Author:** Ala Dabat -This is a framework and a methadology I myself have created from hard earned trial and error. </br>
 **Version:** 2025  
 **Scope:** Core Threat Hunts + Advanced Engineering Hunts  
 **Platform:** Microsoft Sentinel • Microsoft Defender for Endpoint  
