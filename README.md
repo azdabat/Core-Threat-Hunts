@@ -24,6 +24,164 @@
 
 ---
 
+## 📌 Cousin Rules & Attack Ecosystem Coverage
+
+Part of this framework’s power is the **Cousin Rule Concept**:
+
+> When a high−fidelity composite is created for one execution surface in an attack ecosystem, its *cousin* is the adjacent execution surface that shares the same adversary goal but lives in a different **noise domain**.  
+> Cousin rules are **separate but paired** — they do not mix truth anchors with noisy signals that dilute fidelity.
+
+### Definition
+
+**Cousin Rules:**  
+For any given detection composite, a cousin rule is the *paired counterpart* in the same attacker ecosystem that:
+
+- Represents a **different execution/persistence surface**
+- Shares the same **attack intent**
+- Requires **stricter noise gating**
+- Is structured as a **twin detection module**
+- Improves **ecosystem coverage** without breaking rule fidelity
+
+This table maps your composites to ecosystems and their cousins, with MITRE technique groupings.
+
+---
+
+## 🗂 Ecosystem Table — Composites + Cousins (Roadmap)
+
+| Ecosystem | Primary Composite | MITRE Technique | Cousin Composite (Planned/POC) | MITRE | Notes |
+|-----------|------------------|------------------|-------------------------------|-------|-------|
+| **Registry Persistence** | `Registry_Persistence_Background_Service_TaskCache` | T1543.003, T1053.005 | *Registry Persistence (Alternate Anchors)* | T1543, T1053 | e.g., HKEY_CLUSTER_SERVICE, COM task persistence |
+| | `Registry_Persistence_Hijack_Interception` | T1546.* (IFEO/COM/AppInit) | *Registry Hijack Cousins* | T1546.* | e.g., Winlogon handler, shell open interception |
+| | `Registry_Persistence_Userland_Autoruns` | T1547.001/014/004 | *Userland Autoruns Cousin* | T1547.* | e.g., Policies RunOnce, ActiveSetup deep variants |
+| **Scheduled Task Execution** | *(covered by TaskCache + Registry pers.)* | T1053.005 | `ScheduledTask_Execution_TwinRule` | T1053.005 | svchost/taskeng based exec (no schtasks.exe) |
+| **Service Execution** | `SMB_Service_Execution` | T1021.002 / T1543.003 | `Service_Exec_ScheduleTask_Cousin` | T1053.005 | svchost scheduler execution surface |
+| **Lateral Movement** | `SMB_Service_Lateral` | T1021.002 | `WMI_RemoteExec_Cousin` | T1021.006 | remote process via WMI |
+| |  |  | `WinRM_Exec_Cousin` | T1021.004 | PowerShell/WinRM lateral |
+| **Execution (LOLBins/Proxy)** | `TrustedParent_LOLBin_InMemoryInjection_Chain` | T1218 / T1055 | `TaskExec_LOLBin_Injection_Cousin` | T1218/T1055 | LOLBin launched from Scheduled Task surface |
+| **Credential Access** | *(existing rule needed)* | T1003 | `LSASS_Access_Cousin` | T1003.001 | DCSync / NTLM Harvest twin |
+| **Identity Abuse (OAuth/Token)** | *(MITRE coverage from threat model SOP)* | T1621 / T1078.004 | `Identity_ConsentGrant_Cousin` | T1621 | Token replay vs lateral token misuse |
+| **Persistence (File/Driver)** | *(POC/Research)* | T1547 / T1543 | `Driver_Persistence_Cousin` | T1543.008 | KMDF/Driver load surface |
+
+---
+
+## 🧠 Framework Logic Behind Cousin Pairing
+
+The cousin concept is not just “another rule.” It is based on these principles:
+
+### 1. **Different Noise Domain**
+Each cousin lives in a parallel surface that has a *different operational noise profile*.
+
+Example:
+- `services.exe` service exec rule — low noise → can be aggressive  
+- `svchost.exe` scheduled task exec — high noise → needs strict anchors
+
+Both cover lateral movement, but the host process and noise pattern differ.
+
+---
+
+### 2. **Separate Truth Anchors**
+Never mix truth anchors across cousins.
+
+Your Service rule anchors on:
+```
+services.exe spawning an uncommon child (baseline truth)
+```
+Your Scheduled Task cousin anchors on:
+```
+Explicit task create/exec signals
+AND/OR Task XML drops/TaskCache registry writes
+```
+
+These are logically adjacent, but not the same anchor.
+
+---
+
+### 3. **Composite Isolation**
+Coupling them in one rule breaks:
+- noise suppression
+- operational fidelity
+- analyst clarity
+
+Keeping them **separate maintains precision**.
+
+---
+
+### 4. **Ecosystem Continuity**
+Every primary composite should answer four questions:
+
+1. **What is the attack surface?**  
+2. **What is the minimum truth anchor?**  
+3. **What adjacent surfaces share intent?**  
+4. **What cousin composites must exist to cover those surfaces?**
+
+This ensures coverage without noise dilution.
+
+---
+
+##  Roadmap Example — From Primary to Cousin
+
+###  Registry Persistence Ecosystem
+- Primary: Background/Service/TaskCache writes  
+- Cousin 1: Registry interception (IFEO/COM/AppInit)  
+- Cousin 2: Extended run keys (Policies/Explorer/ActiveSetup)  
+- Cousin 3: Shell/Handler persistence
+
+###  Lateral Movement Ecosystem
+- Primary: SMB service execution  
+- Cousin 1: Scheduled Task execution  
+- Cousin 2: WMI remote execution  
+- Cousin 3: WinRM remote execution  
+(*add based on telemetry available*)
+
+###  Execution / Injection Ecosystem
+- Primary: Trusted parent → LOLBin → injection  
+- Cousin 1: Task-spawned LOLBin → injection  
+- Cousin 2: PSExec/Impacket injection path
+
+### Identity Ecosystem
+- Primary: Consent grants (persistence)  
+- Cousin 1: Token replay events  
+- Cousin 2: Conditional Access bypass indicators
+
+---
+
+##  How to Use these Tables
+
+When you build a composite rule:
+1. Locate the ecosystem (e.g., Persistence, Lateral, Execution)
+2. Identify primary rule anchor
+3. Populate known cousins in the same ecosystem
+4. For each cousin:
+   - Define a distinct **Minimum Truth** anchor
+   - Add **Reinforcement signals**
+   - Enforce **Noise suppression**
+   - Produce a **HunterDirective**
+5. Test cousin rule in ADX / lab
+6. Document in GitHub with screenshots
+
+---
+
+##  Why This Section Matters
+
+- Avoids **unstructured rule proliferation**
+- Ensures **systematic coverage**
+- Helps you **plan a roadmap**
+- Provides clarity for future reviewers
+- Builds a **repeatable ecosystem matrix**
+
+---
+
+## How to Expand
+
+You can later add columns for:
+
+- Risk Score ranges  
+- Known false positives suppressed  
+- Required telemetry  
+- Prevalence thresholds
+
+---
+
 # 1. Overview
 
 This repository contains two layers of detection logic:
@@ -36,7 +194,8 @@ This repository contains two layers of detection logic:
 
 2. **Advanced Detection Engineering Pack**  
    - High-fidelity correlation rules  
-   - Scoring engines, kill chain classification  
+   - Scoring engines, kill chain classification
+   - Monolith brittle rules for composite deconstruction. 
    - MITRE-aligned, enriched, multi-signal analytics  
    - For L2/L3 SOC and IR teams
      
